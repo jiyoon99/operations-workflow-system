@@ -1,4 +1,4 @@
-# Halfbook Management System
+# Operations Workflow System
 
 > 중고 PC 유통사의 반복 운영 업무를 하나의 흐름으로 묶은 사내 업무 관리 시스템
 
@@ -6,7 +6,7 @@
 
 ## 한 줄 소개
 
-Halfbook Management System은 중고 노트북/PC 유통 과정에서 발생하는 **매입, 자산 관리, 주문 수집, QC, 송장 발급, A/S, 정산** 업무를 통합한 Flask 기반 사내 운영 시스템입니다.
+Operations Workflow System은 중고 노트북/PC 유통 과정에서 발생하는 **매입, 자산 관리, 주문 수집, QC, 송장 발급, A/S, 정산** 업무를 통합한 Flask 기반 사내 운영 시스템입니다.
 
 기존에는 엑셀, 쇼핑몰 관리자, 택배 시스템, 별도 QC 프로그램에 흩어져 있던 업무를 한 화면에서 추적할 수 있도록 설계했습니다.
 
@@ -136,6 +136,10 @@ Windows PC에서 바로 실행할 수 있도록 batch 파일과 watchdog 서버�
 - 운영 데이터 보호를 위해 GitHub 공개용 소스와 실제 DB/백업/엑셀 파일을 분리했습니다.
 - 테스트 DB에서 앱을 직접 실행해 README 화면 캡처를 생성했습니다.
 - 화면, API, DB, 외부 연동, 운영 스크립트까지 한 프로젝트 안에서 구현했습니다.
+
+## 이름에 대해
+
+공개용 프로젝트명은 **Operations Workflow System**으로 정리했습니다. README의 화면 캡처 안에 보이는 `HMS` 표기는 실제 운영 앱에 남아 있는 내부 코드명/브랜드명입니다.
 
 ## 프로젝트 구조
 
