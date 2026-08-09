@@ -1,0 +1,23 @@
+﻿{
+    "mall":  "토스쇼핑 (Toss Shopping)",
+    "api_available":  "yes",
+    "auth_method":  "OAuth2 Client Credentials 방식. POST https://oauth2.cert.toss.im/token 에 grant_type=client_credentials, client_id(어드민 발급 oauth_client_id), client_secret(secret key), scope=toss-shopping-fep:write(고정)를 x-www-form-urlencoded로 전송해 access_token(JWT)을 받고, 이후 API 호출 시 Bearer 토큰으로 사용. API 서버 base URL: 운영 https://shopping-fep.toss.im, 테스트 https://shopping-fep-alpha.toss.im. Direct API 키 발급 시 호출 서버 IP를 등록해야 함(사실상 IP 제한 있음).",
+    "application_process":  "토스셀러 어드민 좌측 메뉴 [쇼핑 \u003e 연동 관리]에서 셀프서비스로 키 발급. 두 가지 경로: (1) 제휴 통합솔루션 키 — 플레이오토·사방넷·샵링커·EC모니터·이지어드민·이지싱크·샵플링·셀픽·발주모아·가비아커머스 지원, (2) Direct API 키 — 업체명과 API 호출 서버 IP 주소를 입력하면 Access Key/Secret Key 발급. 별도 심사·승인 대기 기간은 문서에 명시 없음(셀프 발급으로 보임). 단, 토스페이 청약(입점 온보딩)이 완료되기 전에는 연동 키 발급 불가. 테스트 환경 접근은 별도로 Google Form에 서버 Outbound IP와 담당자 정보를 제출해 승인받아야 하며, 승인 시 테스트 앱 다운로드 링크·본인인증 번호·테스트 상점 초대 링크를 이메일로 수신.",
+    "order_collection":  "GET /api/v3/shopping-fep/orders/v2 (Bearer 인증). 파라미터: startDate/endDate 필수(yyyy-MM-dd, 조회 범위 최대 31일), status 필터 선택(PAID, CANCELED_PAYMENT, PREPARING_PRODUCT, DELIVERING, DELIVERED, CONFIRMED_ORDER), nextCursor 커서 페이징(limit 기본 20·최대 50), partnerName 선택. 응답에 주문자/수령인, 배송지, 상품·옵션, 수량, 가격(판매가/정상가), 할인(토스쇼핑/토스페이), 포인트, 배송비, 배송 추적정보 포함. 웹훅/실시간 푸시는 미제공 — 주기적 폴링(예: 10분 배치)으로 PAID 상태 주문을 수집하는 방식이 공식 권장. 호출 한도: 셀러당 API별 읽기 초당 50회(버킷 100)·쓰기 초당 30회, 셀러×API×IP 단위 적용, 초과 시 HTTP 200 + errorCode=TOO_MANY_REQUEST 반환.",
+    "shipping_upload":  "PUT /api/v3/shopping-fep/orders/products/delivery (Bearer 인증). 필수 필드: orderProductId(int64, 주문상품 ID), deliveryCompany(택배사 코드 — 별도 택배사 정보 조회 API에서 확인, CJ대한통운·우체국·한진·롯데·로젠 등 48~50개 이상 지원), trackingNumber(송장번호, 하이픈 자동 제거·기본 숫자만, 일부 택배사만 영문 허용). 선택: partnerName. PREPARING_PRODUCT(상품준비중) 상태에서 송장 등록 시 자동으로 DELIVERING(배송중) 전환, DELIVERING 상태에서는 배송정보 수정만 가능. 진행 중인 취소 요청이 있는 주문상품은 DELIVERING 전환 불가. 송장 유효성(가송장 여부)은 API에서 검증하지 않음. 교환/반품용 송장 등록은 이 API로는 미지원(클레임 API의 재배송/수거 단계에서 처리). \u0027직접전달\u0027 옵션은 송장번호 검증 생략, 배송완료는 엑셀 업로드나 어드민 수동 처리.",
+    "claims_api":  "있음. 조회: GET /api/v3/shopping-fep/claims — type(CANCEL/EXCHANGE/RETURN), status(REQUESTED/REVOKED_REQUEST, type과 함께 모두 지정하거나 모두 생략), fromRequestDate/toRequestDate(기본 7일·최대 7일), size(기본 20·최대 100), nextToken 페이징. 처리: 판매자 직접취소 POST /order-products/{orderProductId}/seller-cancel, 취소 승인/거절 POST /claims/{claimId}/cancel/approval·rejection(거절 시 배송사·송장번호 필수), 교환 approval·rejection·collection(수거완료)·collection-rejection·delivery(재배송)·completion, 반품 approval·rejection·collection·collection-rejection·completion. 주의: 클레임 7영업일 미처리 시 자동 승인+환불 처리됨. 참고로 FAQ 검색 스니펫에는 \u0027판매자 취소/취소 승인·거부는 API 미제공\u0027이라는 구버전으로 보이는 서술이 있었으나, 최신 API 레퍼런스(api-2/claim)에는 해당 엔드포인트가 모두 문서화되어 있음 — 연동 시 최신 레퍼런스 기준으로 확인 권장.",
+    "docs_urls":  [
+                      "https://shopping-docs.toss.im/dev",
+                      "https://shopping-docs.toss.im/dev/api-intro",
+                      "https://shopping-docs.toss.im/dev/api-2/auth",
+                      "https://shopping-docs.toss.im/dev/api-2/order",
+                      "https://shopping-docs.toss.im/dev/api-2/delivery",
+                      "https://shopping-docs.toss.im/dev/api-2/claim",
+                      "https://shopping-docs.toss.im/dev/api-1/token",
+                      "https://shopping-docs.toss.im/dev/api-1/test",
+                      "https://shopping-docs.toss.im/dev/faq",
+                      "https://shopping-docs.toss.im/support/solution-api"
+                  ],
+    "caveats":  "1) 토스페이 청약(입점 온보딩) 완료 전에는 연동 키 발급 불가. 2) Direct API 키는 호출 서버 IP 등록 필요 — 고정 IP 없는 환경이면 IP 변경 시 어드민에서 수정해야 함. 3) 웹훅 미제공 — 폴링 기반 설계 필수. 4) 조회 기간 제한: 주문 최대 31일, 클레임 최대 7일. 5) Rate limit: 읽기 50/s(버킷 100)·쓰기 30/s, 초과 시 HTTP 200 + TOO_MANY_REQUEST(HTTP 상태코드가 아닌 body errorCode로 판별해야 함 주의). 6) 클레임 7영업일 미처리 시 자동 승인+환불. 7) 교환/반품 송장 등록은 배송 API 미지원. 8) 테스트(샌드박스) 환경 있음(shopping-fep-alpha.toss.im + 전용 테스트 앱)이나 Google Form 신청·승인 필요. 9) API 사용 자체 비용은 문서상 언급 없음(무료로 보이나 unknown). 10) 택배사 자동 연동 없음 — 택배 접수는 판매자가 별도 수행. 11) 개발 문의 채널은 Discord. 12) 문서가 api-1(가이드)·api-2(레퍼런스)로 이원화되어 있고 2026년에도 배송 정책 변경(2026.03.03 Phase1, 2026.04.04 희망일/착불 추가) 등 변경이 잦으므로 변경이력 페이지 모니터링 권장.",
+    "recommendation":  "난이도: 중하(비교적 쉬움). 표준 OAuth2 Client Credentials + REST/JSON 구조로 국내 오픈마켓 중 문서 품질과 셀프서비스 키 발급 편의성이 좋은 편이며, 스마트스토어 커머스API 대비 심사 절차가 가볍다. 권장 접근: (1) 토스셀러 어드민 [쇼핑 \u003e 연동 관리]에서 Direct API 키 발급(고정 IP 등록), (2) 토큰 발급 → GET /orders/v2 10분 주기 폴링으로 PAID 주문 수집 → PUT /orders/products/delivery로 송장 전송 → GET /claims 7일 윈도 폴링으로 취소/반품/교환 감지 순으로 구현, (3) 라이브 투입 전 Google Form으로 테스트 환경(alpha) 접근을 신청해 검증. 이미 플레이오토·사방넷·이지어드민 등을 쓰고 있다면 제휴 솔루션 키로 무개발 연동도 가능하나, 자체 시스템(RMS류)에 직접 붙이는 경우 직연동이 수수료·제어 면에서 유리. 주의 포인트는 웹훅 부재(폴링 설계), TOO_MANY_REQUEST가 HTTP 200으로 오는 점, 클레임 7영업일 자동 승인 데드라인 세 가지다."
+}

@@ -1,0 +1,20 @@
+﻿{
+    "mall":  "테무 (Temu)",
+    "api_available":  "yes",
+    "auth_method":  "app_key + app_secret + access_token + MD5 서명 방식. 파트너(개발자) 등록으로 app_key/app_secret을 받고, 셀러가 셀러센터에서 앱을 승인하면 access_token 발급(토큰 생성 API: bg.open.accesstoken.create). 모든 호출은 POST 단일 게이트웨이(https://openapi-b-global.temu.com/openapi/router)로 보내며, 파라미터 정렬 후 app_secret을 앞뒤로 붙여 MD5 해시한 sign 파라미터를 첨부. 마켓(지역)별로 토큰이 별도이며 지역별 파트너 포털(partner.temu.com=글로벌, partner-us, partner-eu)이 분리되어 있음. 한국 로컬(K-셀러)용 게이트웨이가 글로벌과 동일한지는 unknown.",
+    "application_process":  "(1) 테무 셀러 입점(한국은 2024~2025년 로컬투로컬 프로그램으로 국내 셀러 개방, 2025년 5월부터 모집 전면 개방) → (2) 파트너 플랫폼(partner.temu.com)에서 개발자/파트너 등록 및 앱 생성으로 app_key/app_secret 발급 → (3) 셀러센터의 \u0027Apps and Services → App store\u0027(또는 Service Marketplace → Authorization Management)에서 앱 승인·API 토큰 생성. 발송/추적(fulfillment+tracking) 권한은 별도로 부여한 뒤 토큰을 재발급해야 함. 승인 대기 기간은 공개 정보 없음(unknown). 문서 포털은 JS 렌더링 SPA라 브라우저 접속(경우에 따라 파트너 로그인) 필요.",
+    "order_collection":  "공식 주문 API 존재, V2로 업데이트됨. 주문 목록 조회: bg.order.list.v2.get (partner.temu.com 문서에 페이지 확인). 수취인 개인정보(주소·연락처)는 암호화되어 별도 복호화 API bg.order.decryptshippinginfo.get을 권한 승인 후 호출해야 함(PII 별도 권한). 서드파티 연동 문서(Base.com) 기준 PENDING(결제 확정 전) 상태 주문은 수집 대상에서 제외됨. 조회 가능 상태값 전체 목록·조회 기간 제한은 문서 로그인 장벽으로 미확인(unknown). 호출 한도: app_key당 초기 약 20 QPS(문서에 Rate Limiting Rules 섹션 존재, API별 상이 가능).",
+    "shipping_upload":  "공식 발송(송장 전송) API 존재 — Order V2에 \u0027주문 조회 + 주문 발송(shipment)\u0027이 포함되어 있고, 플레이오토·사방넷이 이 API로 \u0027송장 전송/발송 처리\u0027를 실서비스 중. 다만 정확한 메서드명(bg.logistics.shipment.* 계열로 추정)은 공개 페이지에서 미확인(unknown). 셀러센터에서 fulfillment/tracking 권한을 별도 부여해야 하며, 테무가 인식하는 택배사(캐리어) 코드로 등록해야 함 — 미지원 택배사로 송장을 올리면 추적 불가로 사기(fraud) 분류 위험이 있다는 서드파티 경고 있음. 한국 로컬 셀러의 국내 택배사(CJ대한통운 등) 코드 지원 목록은 문서에서 직접 확인 필요.",
+    "claims_api":  "존재하는 것으로 판단됨(상세 unknown). 플레이오토 공식 보도자료(2025.2)에 테무 API 연동으로 \u0027주문과 클레임 수집, 송장 전송\u0027을 지원한다고 명시 → 취소/반품 등 클레임 조회 API가 열려 있음을 시사. 다만 after-sales 계열 정확한 메서드명·처리(승인/거부) 가능 범위는 공개 페이지에서 확인 불가.",
+    "docs_urls":  [
+                      "https://partner.temu.com/documentation?menu_code=38e79b35d2cb463d85619c1c786dd303\u0026sub_menu_code=8311de2b2d434e4d805e88413ab815d8",
+                      "https://partner.temu.com/documentation?menu_code=fb16b05f7a904765aac4af3a24b87d4a\u0026sub_menu_code=554fd46b45ee49269cbdd6d4008a5dc1",
+                      "https://partner-us.temu.com/documentation?menu_code=38e79b35d2cb463d85619c1c786dd303",
+                      "https://partner-eu.temu.com/documentation?menu_code=85762c6ccc5a4dbc8c023ea5e10c6dc0",
+                      "https://www.postman.com/temu-open/temu-open-platform/overview",
+                      "https://api2cart.com/api-technology/temu-api/",
+                      "https://base.com/en-EN/help/knowledgebase/temu-integration-setup/"
+                  ],
+    "caveats":  "1) 문서 포털이 JS 렌더링이라 크롤링·자동 열람 불가, 브라우저로 직접 확인 필요(일부는 파트너 로그인 뒤에 있음). 2) 마켓(국가)별 토큰·포털이 분리 — 한국 로컬 셀러용 문서 범위는 별도 확인 필요. 3) 수취인 PII는 암호화 → 복호화 API 별도 권한, 컴플라이언스 요구 가능. 4) 발송/추적은 별도 권한 + 토큰 재발급 필요, 미지원 택배사 송장은 사기 분류 위험. 5) 호출 한도 초기 약 20 QPS/app_key. 6) 발송 지연 시 페널티 정책 있음. 7) 문서에 \u0027Sandbox Test Shops\u0027 섹션이 있어 샌드박스(테스트 상점) 제공되는 것으로 보이나 세부는 unknown. 8) API 사용 비용은 확인된 바 없음(무료로 추정, unknown). 9) 승인 대기 기간 unknown.",
+    "recommendation":  "난이도: 중~중상. API 구조 자체(단일 POST 게이트웨이 + MD5 서명 + 메서드명 방식)는 알리익스프레스/타오바오 계열과 유사해 구현 난이도는 높지 않으나, 실제 장벽은 (a) 파트너 등록·앱 승인 절차, (b) JS 렌더링 문서 포털(스펙 확인에 파트너 로그인 필요), (c) 한국 로컬 셀러용 API 범위·국내 택배사 코드 지원 여부 확인임. 권장 접근: [1순위] 주문량이 적거나 빨리 가동해야 하면 이미 테무 공식 연동을 마친 국내 통합솔루션 경유 — 플레이오토(2025.2 연동 오픈, 상품등록·주문/클레임 수집·송장 전송 지원) 또는 사방넷(2025년 오픈, 테무 입점 셀러 월 3만원 프로모션·가입비 면제). 직접 개발 없이 즉시 사용 가능. [2순위] 직접 연동 시: 테무 셀러센터 \u0027Apps and Services\u0027에서 토큰 발급 경로를 먼저 확인하고, partner.temu.com 문서에서 bg.order.list.v2.get / 발송 API / after-sales API 스펙을 브라우저로 열람 후 진행. RMS처럼 로컬 Python 시스템이면 서명·라우터 호출 모듈은 1~2일 수준이나, 승인 절차와 한국 로컬 스펙 확인이 선행되어야 하므로 전체 리드타임은 수 주 예상. 조회 기간 제한·클레임 처리 API 상세 등 unknown 항목은 파트너 로그인 후 문서에서 확정할 것."
+}

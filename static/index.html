@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HMS — 하프북 관리 시스템</title>
+<link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+<!-- 로그인 / 최초 설정 -->
+<div id="auth-screen" class="auth-screen hidden">
+  <div class="auth-card">
+    <div class="auth-brand">HMS</div>
+    <div class="auth-sub">하프북 관리 시스템</div>
+
+    <form id="login-form" class="auth-form hidden" autocomplete="off">
+      <label>아이디<input type="text" id="login-username" required autocomplete="username"></label>
+      <label>비밀번호<input type="password" id="login-password" required autocomplete="current-password"></label>
+      <button type="submit" class="btn btn-primary btn-block">로그인</button>
+      <p class="auth-hint">계정이 필요하면 관리자에게 문의하세요.</p>
+    </form>
+
+    <form id="setup-form" class="auth-form hidden" autocomplete="off">
+      <p class="auth-note">최초 실행입니다. <b>관리자 계정</b>을 만들어 주세요.<br>이 계정으로 사용자 생성과 권한 설정을 하게 됩니다.</p>
+      <label>관리자 아이디<input type="text" id="setup-username" required minlength="3"></label>
+      <label>표시 이름<input type="text" id="setup-displayname" placeholder="예: 대표"></label>
+      <label>비밀번호 (8자 이상)<input type="password" id="setup-password" required minlength="8"></label>
+      <label>비밀번호 확인<input type="password" id="setup-password2" required minlength="8"></label>
+      <button type="submit" class="btn btn-primary btn-block">관리자 계정 생성</button>
+    </form>
+  </div>
+</div>
+
+<!-- 앱 쉘 -->
+<div id="app" class="app hidden">
+  <!-- 좁은 화면(≤1024px)에서만 보이는 상단 바. PC에서는 CSS가 숨긴다. -->
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false">☰</button>
+    <span class="tb-brand">HMS</span>
+    <span class="tb-title"></span>
+    <span class="tb-spacer"></span>
+  </header>
+  <div class="nav-backdrop" aria-hidden="true"></div>
+  <aside class="sidebar">
+    <div class="brand">HMS<span>하프북 관리 시스템</span></div>
+    <nav id="nav">
+      <a href="#" data-view="dashboard" class="active">대시보드</a>
+      <a href="#" data-view="purchase">매입</a>
+      <a href="#" data-view="orders">주문관리</a>
+      <a href="#" data-view="setup">셋팅</a>
+      <a href="#" data-view="shipping">배송 / 송장</a>
+      <a href="#" data-view="as">A/S</a>
+      <a href="#" data-view="reports">리포트</a>
+      <a href="#" data-view="settings">설정</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="user-chip">
+        <div class="user-name" id="chip-name">-</div>
+        <div class="user-role" id="chip-role">-</div>
+      </div>
+      <div class="foot-actions">
+        <button id="theme-toggle" class="btn btn-ghost btn-sm" title="다크 모드">◐</button>
+        <button id="logout-btn" class="btn btn-ghost btn-sm">로그아웃</button>
+      </div>
+    </div>
+  </aside>
+  <main id="main"></main>
+</div>
+
+<div id="toasts"></div>
+<script src="/static/js/autocomplete.js"></script>
+<script src="/static/js/purchase.js"></script>
+<script src="/static/js/orders.js"></script>
+<script src="/static/js/setup.js"></script>
+<script src="/static/js/shipping.js"></script>
+<script src="/static/js/as.js"></script>
+<script src="/static/js/reports.js"></script>
+<script src="/static/js/app.js"></script>
+<script src="/static/js/responsive.js"></script>
+</body>
+</html>

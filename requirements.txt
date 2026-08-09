@@ -1,0 +1,7 @@
+flask
+waitress
+reportlab
+pillow
+pypdf
+bcrypt>=4.0
+requests

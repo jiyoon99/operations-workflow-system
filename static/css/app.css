@@ -1,0 +1,730 @@
+/* HMS — HALFBOOK 디자인 토큰(에메랄드) 기반. 다크모드는 [data-theme="dark"] */
+:root {
+  --primary: #059669;
+  --primary-deep: #006948;
+  --primary-soft: rgba(5, 150, 105, 0.10);
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --border: #e2e8f0;
+  --text: #0f172a;
+  --text-dim: #64748b;
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.10);
+  --blue: #2563eb;
+  --blue-soft: rgba(37, 99, 235, 0.10);
+  --slate-soft: rgba(100, 116, 139, 0.12);
+  --radius: 10px;
+  --sidebar-w: 240px;
+  font-size: 15px;
+}
+[data-theme="dark"] {
+  --bg: #0b1220;
+  --surface: #101a2c;
+  --border: #1e2a3f;
+  --text: #e6edf6;
+  --text-dim: #8fa0b8;
+  --primary-soft: rgba(5, 150, 105, 0.18);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  font-family: "Pretendard", "Inter", "Malgun Gothic", "맑은 고딕", system-ui, sans-serif;
+  background: var(--bg); color: var(--text);
+}
+.hidden { display: none !important; }
+button { font: inherit; cursor: pointer; }
+input, select, textarea { font: inherit; color: inherit; }
+
+/* ---------- 로그인 ---------- */
+.auth-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }
+.auth-card {
+  width: 380px; max-width: 100%; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 16px; padding: 36px 32px;
+}
+.auth-brand { font-size: 34px; font-weight: 800; letter-spacing: 2px; color: var(--primary); text-align: center; }
+.auth-sub { text-align: center; color: var(--text-dim); margin: 4px 0 24px; }
+.auth-form label { display: block; margin-bottom: 14px; font-size: 13px; color: var(--text-dim); }
+.auth-form input {
+  display: block; width: 100%; margin-top: 5px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+}
+.auth-form input:focus { outline: 2px solid var(--primary); border-color: transparent; }
+.auth-hint, .auth-note { font-size: 13px; color: var(--text-dim); text-align: center; line-height: 1.6; }
+.auth-note { text-align: left; background: var(--primary-soft); padding: 10px 12px; border-radius: 8px; }
+
+/* ---------- 버튼 ---------- */
+.btn {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  border-radius: 8px; padding: 8px 14px; font-size: 14px;
+}
+.btn:hover { border-color: var(--primary); }
+.btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
+.btn-primary:hover { background: var(--primary-deep); border-color: var(--primary-deep); }
+.btn-danger { background: var(--danger-soft); border-color: transparent; color: var(--danger); }
+.btn-ghost { background: transparent; border-color: transparent; color: var(--text-dim); }
+.btn-ghost:hover { color: var(--text); border-color: var(--border); }
+.btn-sm { padding: 4px 10px; font-size: 13px; }
+.btn-block { width: 100%; padding: 11px; margin-top: 6px; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ---------- 쉘 ---------- */
+.app { display: flex; min-height: 100vh; }
+.sidebar {
+  width: var(--sidebar-w); flex: 0 0 var(--sidebar-w);
+  background: var(--surface); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+}
+.brand { font-size: 24px; font-weight: 800; letter-spacing: 1px; color: var(--primary); padding: 22px 20px 14px; }
+.brand span { display: block; font-size: 12px; font-weight: 500; letter-spacing: 0; color: var(--text-dim); margin-top: 2px; }
+#nav { flex: 1; padding: 8px 12px; }
+#nav a {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px; margin-bottom: 2px;
+  border-radius: 8px; color: var(--text); text-decoration: none; font-size: 14px;
+}
+#nav a:hover { background: var(--slate-soft); }
+#nav a.active { background: var(--primary-soft); color: var(--primary); font-weight: 700; }
+#nav a em { margin-left: auto; font-style: normal; font-size: 11px; color: var(--text-dim); background: var(--slate-soft); border-radius: 999px; padding: 2px 8px; }
+.sidebar-foot { border-top: 1px solid var(--border); padding: 14px 16px; }
+.user-chip .user-name { font-weight: 700; }
+.user-chip .user-role { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+.foot-actions { display: flex; gap: 6px; margin-top: 10px; }
+
+main { flex: 1; padding: 28px 32px; min-width: 0; }
+.page-title { font-size: 22px; font-weight: 800; margin: 0 0 4px; }
+.page-desc { color: var(--text-dim); margin: 0 0 22px; font-size: 14px; }
+
+/* ---------- 카드/placeholder ---------- */
+.card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 22px; margin-bottom: 18px;
+}
+.card h3 { margin: 0 0 12px; font-size: 16px; }
+.placeholder { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+.placeholder .ph-badge {
+  display: inline-block; background: var(--primary-soft); color: var(--primary);
+  border-radius: 999px; padding: 4px 14px; font-weight: 700; margin-bottom: 12px; font-size: 13px;
+}
+.kpi-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 20px; }
+.kpi {
+  background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--primary);
+  border-radius: var(--radius); padding: 14px 16px;
+}
+.kpi .kpi-label { font-size: 12px; color: var(--text-dim); }
+.kpi .kpi-value { font-size: 20px; font-weight: 800; margin-top: 4px; }
+.kpi .kpi-sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+/* ---------- 탭 ---------- */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 18px; flex-wrap: wrap; }
+.tabs button {
+  border: none; background: none; padding: 10px 14px; color: var(--text-dim);
+  border-bottom: 2px solid transparent; font-size: 14px;
+}
+.tabs button.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 700; }
+
+/* 보기 전환(하위 탭) — 상위 탭과 확실히 달라 보여야 '어디에 있는지'를 안 잃는다.
+   알약형 버튼 묶음. 상위 탭은 밑줄, 여기는 배경으로 구분한다. */
+.subtabs {
+  display: flex; gap: 4px; flex-wrap: wrap; margin: -6px 0 16px;
+  background: var(--slate-soft); border-radius: 10px; padding: 4px;
+}
+.subtabs button {
+  border: none; background: none; padding: 7px 13px; border-radius: 8px;
+  color: var(--text-dim); font-size: 13.5px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.subtabs button:hover { color: var(--text); }
+.subtabs button.active {
+  background: var(--surface); color: var(--primary); font-weight: 700;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+}
+/* 치워야 할 대수 — 0이면 JS가 숨긴다(빈 동그라미가 남으면 일이 있는 줄 안다) */
+.subtab-badge {
+  background: var(--danger); color: #fff; border-radius: 999px;
+  padding: 1px 7px; font-size: 11px; font-weight: 700; line-height: 1.6;
+}
+.subtab-badge:empty { display: none; }
+
+/* ---------- 테이블 ---------- */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th { font-size: 12px; color: var(--text-dim); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
+tr:hover td { background: var(--slate-soft); }
+.chip { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+.chip-green { background: var(--primary-soft); color: var(--primary); }
+.chip-slate { background: var(--slate-soft); color: var(--text-dim); }
+.chip-red { background: var(--danger-soft); color: var(--danger); }
+.chip-blue { background: var(--blue-soft); color: var(--blue); }
+
+/* ---------- 폼/편집 패널 ---------- */
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px 16px; align-items: end; }
+.form-grid label, .form-col label { display: block; font-size: 13px; color: var(--text-dim); }
+/* select·date·number까지 같은 규격으로 — 타입별로 빠뜨리면 그 칸만 폭·높이가 어긋난다 */
+.form-grid input:not([type=checkbox]):not([type=radio]),
+.form-grid select,
+.form-grid textarea,
+.form-col input {
+  display: block; width: 100%; margin-top: 4px; padding: 8px 10px; height: 38px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+  font: inherit; color: inherit; box-sizing: border-box;
+}
+.form-grid textarea { height: auto; }
+.form-grid input:focus, .form-grid select:focus { outline: 2px solid var(--primary); border-color: transparent; }
+.form-grid .check-line input { display: inline-block; width: 16px; height: 16px; margin-top: 0; }
+.check-line { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); padding: 4px 0; }
+.check-line input { accent-color: var(--primary); width: 16px; height: 16px; }
+.menu-perms { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.menu-perm-card { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--bg); }
+.menu-perm-card .menu-head { font-size: 15px; }
+.menu-perm-card .menu-desc { font-size: 12px; margin: 2px 0 8px 24px; }
+.menu-sub { margin-left: 24px; padding-top: 6px; border-top: 1px dashed var(--border); }
+.menu-sub .check-line { font-size: 13px; }
+.perm-group { margin-bottom: 12px; }
+.perm-group .pg-title { font-size: 12px; font-weight: 700; color: var(--text-dim); margin-bottom: 4px; }
+.perm-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 2px 14px; }
+.editor-actions { display: flex; gap: 8px; margin-top: 16px; }
+.inline-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.inline-row input { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.muted { color: var(--text-dim); font-size: 13px; }
+
+/* ---------- 업무 화면 공통 ---------- */
+select { padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: inherit; }
+.chip-violet { background: rgba(124, 58, 237, 0.12); color: #8b5cf6; }
+/* 셋팅 화면의 옵션 칩 — 옵션이 여럿일 때 색으로 구분해 눈에 들어오게 한다
+   (대표 요청 2026-07-31: 글자로만 이어 붙이면 무엇을 챙길지 안 보인다). */
+.chip-amber { background: rgba(245, 158, 11, 0.14); color: #d97706; }
+.chip-teal { background: rgba(13, 148, 136, 0.13); color: #0d9488; }
+.chip-pink { background: rgba(219, 39, 119, 0.12); color: #db2777; }
+.stage-th, .stage-cell { text-align: center; }
+.stage-cell input { width: 18px; height: 18px; accent-color: var(--primary); }
+/* 담당자와 체크 시각 — 대표 요청(2026-08-05) "언제 몇시에 누가 체크했는지".
+   ★칸 폭을 86px로 넓혀 한국 이름(3~4자)이 안 잘리게 했다.
+     행 높이(62px)는 그대로 — 체크박스 18 + 이름 13 + 시각 12 로 맞춘다. */
+.stage-by {
+  font-size: 11px; color: var(--text); font-weight: 600; line-height: 1.15;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center;
+}
+.stage-at {
+  font-size: 9.5px; color: var(--text-dim); line-height: 1.15;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.stage-cell { text-align: center; }
+.stage-cell .check-line { padding: 0; }
+.stage-cell.stage-locked .stage-by { color: var(--danger); font-weight: 700; }
+.stage-locked { color: var(--danger); font-weight: 700; }
+.timeline .tl-item { border-left: 2px solid var(--border); padding: 2px 0 12px 14px; margin-left: 6px; position: relative; }
+.timeline .tl-item::before { content: ""; position: absolute; left: -5px; top: 6px; width: 8px; height: 8px; border-radius: 50%; background: var(--primary); }
+.tl-time { font-size: 12px; color: var(--text-dim); }
+.tl-detail { font-size: 12px; overflow-wrap: anywhere; }
+
+/* ---------- 자동완성 ---------- */
+.ac-wrap { position: relative; }
+.ac-list {
+  position: absolute; left: 0; right: 0; top: 100%; z-index: 50;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.14); max-height: 260px; overflow-y: auto; margin-top: 2px;
+}
+.ac-item { padding: 7px 10px; font-size: 14px; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+.ac-item:hover, .ac-item.active { background: var(--primary-soft); }
+.ac-item .ac-tag { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+.ac-item mark { background: transparent; color: var(--primary); font-weight: 700; padding: 0; }
+.ac-empty { padding: 8px 10px; font-size: 13px; color: var(--text-dim); }
+
+/* ---------- 토스트 ---------- */
+#toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 999; }
+.toast {
+  background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--primary);
+  border-radius: 8px; padding: 10px 16px; min-width: 220px; max-width: 360px;
+  box-shadow: 0 4px 14px rgba(0,0,0,.12); font-size: 14px; animation: slidein .18s ease-out;
+}
+.toast.err { border-left-color: var(--danger); }
+@keyframes slidein { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* ================================================================
+   반응형 — PC / 태블릿 / 폰
+   ----------------------------------------------------------------
+   경계선
+     > 1024px  PC      : 사이드바 고정. 지금까지의 화면 그대로 둔다.
+     ≤ 1024px  태블릿  : 사이드바를 서랍으로 감추고 상단 바를 띄운다.
+     ≤ 820px   폰·태블릿 세로 : 표를 카드로 바꿔 옆으로 밀지 않게 한다.
+
+   왜 1024인가: 예전 경계가 760px이라 아이패드 세로(768)가 'PC'로 잡혀
+   사이드바에 240px를 뺏기고, 본문 513px 안에 895px짜리 주문표가 들어갔다.
+   실제로 재 보고 고친 값이다(2026-07-29).
+
+   ★PC 화면은 이 아래 규칙에 전혀 닿지 않는다 — 매일 쓰는 화면이 바뀌면 안 된다.
+   ================================================================ */
+
+/* 일괄 작업바 — 화면 아래에 붙어 따라다닌다.
+   목록 위에만 그리면 아래쪽 주문을 체크했을 때 버튼 7개가 화면 밖에 있어 안 보인다. */
+/* ★position:sticky는 '원래 자리'를 기준으로 붙는다. 이 바는 표 '위'에 있어서
+   bottom:0으로 걸어도 아래에 고정되지 않았고, 40번째 줄을 체크하면 버튼 9개가
+   화면 위쪽 밖으로 사라졌다(2026-07-29 전수조사). 화면에 고정(fixed)으로 바꾼다. */
+.bulk-dock {
+  position: fixed; left: var(--sidebar-w); right: 0; bottom: 0; z-index: 120;
+  background: var(--surface); border-top: 1px solid var(--border);
+  padding: 0 32px;
+  box-shadow: 0 -6px 18px rgba(0, 0, 0, .12);
+}
+.bulk-dock .inline-row { margin: 8px 0; }
+/* 바에 가려 마지막 줄을 못 보는 일이 없게 본문 아래를 띄운다 */
+body.has-bulkbar main { padding-bottom: 96px; }
+@media (max-width: 1024px) {
+  .bulk-dock { left: 0; padding: 0 16px; }   /* 좁은 화면은 사이드바가 서랍이라 전체 폭 */
+}
+@media (max-width: 480px) { .bulk-dock { padding: 0 12px; } }
+
+/* ---------- 상세 팝업(모달) ----------
+   [상세]·[매칭]을 누르면 목록 위에 떠서 보인다. 예전처럼 페이지 맨 아래에 그리면
+   긴 목록에서 눌러도 아무 일도 없는 것처럼 보이고, 스크롤로 데려가면 목록을 잃는다. */
+.modal-back {
+  position: fixed; inset: 0; z-index: 300;
+  background: rgba(15, 23, 42, .45);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 32px 16px; overflow-y: auto;
+  animation: modalin .14s ease-out;
+}
+@keyframes modalin { from { opacity: 0; } to { opacity: 1; } }
+.in-modal {
+  width: 100%; max-width: 900px; margin: auto;
+}
+/* 패널 안의 카드가 곧 팝업 본체다 — 화면보다 길면 안에서만 스크롤한다 */
+.in-modal > .card {
+  margin: 0; max-height: calc(100vh - 64px); overflow-y: auto;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .28);
+}
+.in-modal > .card + .card { margin-top: 14px; }
+
+/* ★팝업으로 뜬 것은 무조건 바탕색을 갖는다.
+   수기 주문·엑셀 가져오기처럼 .card 없이 점선 div로만 그린 패널이 있어
+   뒤쪽 목록이 그대로 비쳐 글자가 안 읽혔다(대표 지적 2026-07-31).
+   개별 화면을 하나씩 고치면 새 팝업을 만들 때 또 빠지므로 여기서 한 번에 보장한다.
+   .card 는 위 규칙이 이미 처리하므로 :not(.card) 로 겹치지 않게 한다. */
+.in-modal > *:not(.card) {
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+  padding: 20px 22px !important;
+  margin: 0 !important;
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, .28);
+}
+/* ★안쪽 점선은 건드리지 않는다. 바깥 상자의 점선은 위 !important 가 이미 실선으로
+   덮으므로, 여기서 'div[style*=dashed] 전부 없애기' 같은 규칙을 더하면 주문 상세·A/S의
+   정상적인 구분선(app.js:679, as.js:278, orders.js:814, purchase.js:87)까지 사라진다. */
+body.modal-open { overflow: hidden; }          /* 뒤쪽 목록은 스크롤 잠금 */
+
+@media (max-width: 820px) {
+  .modal-back { padding: 12px 10px; }
+  .in-modal > .card,
+  .in-modal > *:not(.card) { max-height: calc(100vh - 24px); }
+}
+
+/* 상단 바 — PC에서는 숨어 있다 */
+.topbar { display: none; }
+.nav-backdrop { display: none; }
+
+@media (max-width: 1024px) {
+  .topbar {
+    display: flex; align-items: center; gap: 10px;
+    position: sticky; top: 0; z-index: 150;
+    height: 54px; padding: 0 12px;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+  }
+  .topbar .tb-title { font-weight: 800; font-size: 16px; }
+  .topbar .tb-brand { color: var(--primary); font-weight: 800; letter-spacing: 1px; }
+  .topbar .tb-spacer { flex: 1; }
+  .menu-toggle {
+    width: 42px; height: 42px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); color: var(--text); font-size: 19px; line-height: 1;
+  }
+
+  .app { flex-direction: column; }
+
+  /* 사이드바 = 왼쪽에서 밀려 나오는 서랍 */
+  .sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0;
+    width: 270px; max-width: 84vw; flex: none; height: 100vh;
+    z-index: 200; transform: translateX(-100%);
+    transition: transform .22s ease-out;
+    box-shadow: 0 0 32px rgba(0, 0, 0, .18);
+    overflow-y: auto;
+  }
+  body.nav-open .sidebar { transform: none; }
+  .nav-backdrop {
+    display: block; position: fixed; inset: 0; z-index: 190;
+    background: rgba(15, 23, 42, .42);
+    opacity: 0; pointer-events: none; transition: opacity .22s;
+  }
+  body.nav-open .nav-backdrop { opacity: 1; pointer-events: auto; }
+  body.nav-open { overflow: hidden; }          /* 서랍 열린 동안 뒷면 스크롤 잠금 */
+
+  main { padding: 18px 16px 40px; }
+
+  /* 손가락으로 누르는 화면 — 작은 표적을 키운다(측정: 셋팅 화면 38개가 32px 미만) */
+  .btn { min-height: 38px; }
+  .btn-sm { min-height: 34px; padding: 6px 12px; }
+  .tabs button { min-height: 42px; }
+  .stage-cell input, .check-line input, .form-grid .check-line input {
+    width: 22px; height: 22px;
+  }
+  #nav a { padding: 13px 12px; font-size: 15px; }
+
+  /* iOS는 글자 16px 미만인 칸을 누르면 화면을 확대해 버린다 */
+  .form-grid input:not([type=checkbox]):not([type=radio]),
+  .form-grid select, .form-grid textarea, .form-col input,
+  .inline-row input, .auth-form input, select {
+    font-size: 16px;
+  }
+  .form-grid input:not([type=checkbox]):not([type=radio]),
+  .form-grid select, .form-col input { height: 44px; }
+
+  .table-wrap { -webkit-overflow-scrolling: touch; }
+}
+
+/* ---------- 표 → 카드 (폰·태블릿 세로) ----------
+   표를 옆으로 미는 것은 창고에서 한 손으로 못 쓴다. 한 줄을 카드 한 장으로 세운다.
+   칸 이름은 responsive.js가 표 머리글에서 읽어 data-label로 붙여 준다
+   (화면을 그리는 JS 8개를 고치지 않으려고 이렇게 했다). */
+@media (max-width: 820px) {
+  table.resp-card { border: 0; display: block; width: 100%; }
+  table.resp-card thead { display: none; }
+  /* ★tfoot(합계 줄)도 반드시 함께 세운다. tbody만 카드로 만들면 tfoot이 표 폭을
+     그대로 유지해서, 매출대장에서 화면이 262px 옆으로 밀렸다(2026-07-29 확인). */
+  table.resp-card tbody,
+  table.resp-card tfoot { display: block; width: 100%; }
+  table.resp-card tbody tr,
+  table.resp-card tfoot tr {
+    display: block; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 14px; margin-bottom: 10px;
+  }
+  table.resp-card tfoot tr { border-color: var(--primary); font-weight: 700; }
+  table.resp-card tbody tr:hover td { background: none; }
+  table.resp-card tbody td,
+  table.resp-card tfoot td {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 4px 12px;
+    border: 0; padding: 5px 0; text-align: right; font-size: 14px;
+    /* 긴 주문번호·상품명이 카드 밖으로 삐져나오지 않게 */
+    min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+    /* ★줄바꿈을 켠다. 한 줄로 두면 한 칸에 값이 둘 이상일 때(상품명 + 옵션 문구)
+       뒤엣것이 옆으로 밀려 잘린다 — 셋팅 담당자가 봐야 할 옵션이 안 보였다. */
+    flex-wrap: wrap;
+  }
+  table.resp-card td > * { max-width: 100%; overflow-wrap: anywhere; }
+  /* 값이 여러 조각이면 이름표 다음 줄에 오른쪽 정렬로 쌓는다 */
+  table.resp-card td > .muted,
+  table.resp-card td > div { flex: 1 1 100%; text-align: right; }
+  table.resp-card tbody td::before,
+  table.resp-card tfoot td::before {
+    content: attr(data-label);
+    flex: 0 0 auto; max-width: 40%;
+    color: var(--text-dim); font-size: 12px; font-weight: 600;
+    text-align: left; padding-top: 2px; white-space: normal;
+  }
+  /* 머리글이 빈 칸(체크박스·버튼 열)은 이름표 없이, 값만 넓게 */
+  table.resp-card td[data-label=""]::before,
+  table.resp-card td:not([data-label])::before { content: none; }
+  table.resp-card td[data-label=""],
+  table.resp-card td:not([data-label]) { justify-content: flex-end; }
+  table.resp-card td:empty { display: none; }
+  /* 카드 안에서 버튼이 줄바꿈되게 — 3개 이상 붙는 열이 있다 */
+  table.resp-card td > .btn { margin: 2px 0 2px 4px; }
+  table.resp-card tbody tr td:first-child { padding-top: 0; }
+
+  .kpi-row { grid-template-columns: repeat(auto-fit, minmax(142px, 1fr)); gap: 10px; }
+  .kpi { padding: 12px 13px; }
+  .kpi .kpi-value { font-size: 18px; }
+  .card { padding: 16px 14px; }
+  .page-title { font-size: 19px; }
+  #toasts { left: 12px; right: 12px; bottom: 12px; }
+  .toast { max-width: none; }
+  .inline-row { gap: 6px; }
+  .inline-row input, .inline-row select { flex: 1 1 160px; min-width: 0; }
+  /* 좁은 화면에서 고정 폭 지정이 칸을 넘기지 않게 */
+  #main [style*="min-width"] { min-width: 0 !important; }
+}
+
+@media (max-width: 480px) {
+  main { padding: 14px 12px 40px; }
+  .kpi-row { grid-template-columns: 1fr 1fr; }
+  .editor-actions { flex-wrap: wrap; }
+  .editor-actions .btn { flex: 1 1 auto; }
+}
+
+/* ---------- 셋팅 작업보드 (QC 작업 목록) ----------
+   대표 결정(2026-08-03): 모든 행을 같은 높이로. 내용이 길다고 행이 두꺼워지면 안 된다.
+   원인 실측 — 옵션 글자 수가 중앙 38자에서 최대 137자까지 벌어진다(상품명은 57자로 편차 작음).
+
+   그래서 상품 칸을 '딱 2줄'로 고정한다.
+     1줄 = 수량 · 제품코드 · 재고 · 상품명
+     2줄 = 스펙 · 옵션 · 메모
+   넘치는 글자는 …으로 접고 마우스를 올리면(title) 전부 보인다.
+   행 높이가 같아야 목록을 훑을 때 눈이 흔들리지 않는다. */
+/* ★고정 레이아웃 — 안 쓰면 내용(nowrap)이 칸 폭을 밀어 표가 화면의 두 배(3187px)가 된다.
+   fixed면 아래에 적은 폭이 그대로 지켜지고, 남는 자리는 폭을 안 준 '상품' 칸이 가져간다. */
+.setup-table { table-layout: fixed; width: 100%; }
+/* 칸 폭은 colgroup으로 정한다. 폭을 안 준 두 번째 칸(상품)이 남는 자리를 전부 가져간다. */
+/* ★단계 칸을 넓히면 그만큼 상품 칸이 줄어 옵션 칩이 접히고 행이 다시 들쭉날쭉해진다
+   (2026-08-05 실측 62~114px). 다른 칸에서 나눠 덜어 상품 칸 손실을 최소로 잡는다.
+   ★2026-08-05 대표: "가로로 너무 빽빽하다" — 재고 칩·상세 버튼이 채널 칸으로 내려가며
+     행이 세로로 늘었으므로, 그 높이를 살려 각 칸에 숨통을 텄다.
+     수취인은 배송 메시지를 함께 받으므로 크게 넓힌다(주소는 [상세 보기]에만). */
+.setup-table .col-chan { width: 176px; }
+.setup-table .col-recipient { width: 152px; }
+.setup-table .col-assets { width: 206px; }   /* 자산번호 + 스캔칸이 잘렸다(실측 169>152) */
+.setup-table .col-stage { width: 80px; }   /* 46px일 때 담당자 이름이 잘렸다 */
+.setup-table .col-status { width: 108px; }
+/* 표에서 tr의 height는 '최소 높이'로 동작한다 — 옵션이 많으면 그만큼 커지고,
+   짧은 주문은 62px로 가지런히 맞는다. */
+.setup-rows-fixed tr { height: 76px; }
+.setup-rows-fixed td { overflow: hidden; padding: 11px 13px; vertical-align: top; }
+/* 여러 줄이 쌓이는 칸만 위 정렬 — 체크·입력 칸은 가운데가 눈에 편하다 */
+.setup-rows-fixed td.stage-cell,
+.setup-rows-fixed td.setup-assets,
+.setup-rows-fixed td.setup-status { vertical-align: middle; }
+.setup-rows-fixed td.setup-prod { overflow: visible; }
+
+.setup-prod { /* 폭을 주지 않는다 — fixed 레이아웃에서 남는 자리를 전부 가져간다 */ }
+/* 한 줄 = 가로로 나열하고 절대 접지 않는다. 남는 것은 마지막 요소가 …으로 삼킨다 */
+.prod-line {
+  display: flex; align-items: center; gap: 6px;
+  white-space: nowrap; overflow: hidden; line-height: 1.35;
+}
+.prod-line + .prod-line { margin-top: 3px; }
+/* 1줄(수량·코드·메모)은 짧다 — 상품명은 다음 줄에서 칸 전체를 쓴다 */
+.prod-meta { gap: 8px; }
+.prod-line > * { flex: 0 0 auto; }
+.prod-qty { font-size: clamp(13px, 0.95vw, 16px); font-weight: 800; }
+.prod-code { font-size: clamp(11.5px, 0.72vw, 13px); font-weight: 700; color: var(--primary); }
+/* 상품명·스펙은 남는 자리를 나눠 갖고, 모자라면 자기 안에서 … 처리한다 */
+.prod-title, .prod-spec {
+  flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* 상품명은 마케팅 문구가 길어 한 줄로는 절반이 잘린다(실측 50건 중 31건).
+   ★대표 2026-08-05: "제목이 길어 가로로 넓어지니 두 칸으로 넘겨줘도 된다" —
+     세 줄까지 편다(2줄로도 6건이 잘렸다). 그래도 넘치면 …, 마우스를 올리면 전부. */
+.prod-title {
+  font-size: clamp(12px, 0.85vw, 15px); font-weight: 700; width: 100%;
+  white-space: normal; display: -webkit-box; -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical; line-height: 1.35;
+}
+/* 스펙(CPU·RAM·SSD)은 셋팅할 때 실제로 보는 값이라 한 줄에 접으면 쓸모가 준다 —
+   실측 50건 중 43건이 잘렸다. 상품명과 같이 두 줄까지 편다. */
+.prod-spec {
+  font-size: clamp(10.5px, 0.66vw, 12px); color: var(--text-dim); flex-shrink: 2;
+  white-space: normal; display: -webkit-box; -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical; line-height: 1.4;
+}
+.setup-prod .chip { font-size: clamp(10px, 0.62vw, 12px); }
+/* 옵션 — 필수 정보라 절대 자르지 않는다(대표 지시 2026-08-03).
+   자체 줄을 쓰고, 자리가 모자라면 다음 줄로 넘긴다. 그만큼 행이 커져도 된다. */
+.setup-opts {
+  display: flex; flex-wrap: wrap; gap: 3px; align-items: center;
+  margin-top: 2px; white-space: normal;
+}
+.setup-opts .chip {
+  flex: 0 1 auto; max-width: 100%; margin: 0 !important;
+  white-space: normal; overflow-wrap: anywhere; line-height: 1.35;
+}
+/* 상품명 링크 — 누르면 그 쇼핑몰의 상품이 열린다 */
+a.prod-title { color: inherit; text-decoration: none; cursor: pointer; }
+a.prod-title:hover { color: var(--primary); text-decoration: underline; }
+/* 수취인 — 누르면 성함·연락처·주소가 뜬다 */
+.link-btn {
+  border: 0; background: none; padding: 0; color: var(--text);
+  font: inherit; text-align: left; cursor: pointer;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.link-btn:hover { color: var(--primary); text-decoration: underline; }
+
+/* 채널 / 주문 — 가로 한 줄 */
+.setup-chan { white-space: nowrap; overflow: hidden; line-height: 1.5; }
+.setup-chan .chan-no { font-size: clamp(11px, 0.66vw, 12px); color: var(--text-dim); margin-left: 6px; }
+/* 나머지 칸도 한 줄로 — '제작 대기'가 두 줄로 접히던 문제 */
+.setup-assets { }
+.setup-recipient { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.5; }
+/* 배송 메시지 — 작업 전에 봐야 하므로 목록에 둔다. 두 줄까지 펴고, 더 길면 마우스를 올려서 본다 */
+.recv-msg {
+  margin-top: 4px; font-size: 11.5px; color: var(--text-dim); max-width: 100%;
+  overflow: hidden; white-space: normal; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.setup-status { white-space: nowrap; }
+.setup-status .chip { white-space: nowrap; }
+
+@media (max-width: 1600px) {
+  .setup-table .col-chan { width: 182px; }
+  .setup-table .col-recipient { width: 140px; }
+  .setup-table .col-assets { width: 198px; }
+  .setup-table .col-stage { width: 78px; }
+  .setup-table .col-status { width: 108px; }
+}
+@media (max-width: 1360px) {
+  .setup-table .col-chan { width: 162px; }
+  .setup-table .col-recipient { width: 112px; }
+  .setup-table .col-assets { width: 186px; }
+  .setup-table .col-stage { width: 70px; }
+  .setup-table .col-status { width: 98px; }
+}
+
+/* 자산 매칭 칸 — 한 줄. 수량만큼 칸을 늘어놓지 않고 '지금 찍을 칸' 하나만 둔다 */
+.as-slots {
+  display: flex; gap: 4px; align-items: center;
+  white-space: nowrap; overflow: hidden;
+}
+.as-item { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+/* 버튼 여백이 크면 그 행만 한 뼘 두꺼워진다 — 한 줄 높이로 맞춘다 */
+.as-slots .btn-sm { padding: 1px 5px; line-height: 1.3; }
+.as-slots .as-slot { height: 24px; }
+.as-slots .chip { padding: 1px 8px; }
+.as-item .chip { margin: 0; }
+.as-err {
+  display: block; margin-top: 2px; font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+
+/* ---------- 매입 전표 등록 폼 ----------
+   대표 지적(2026-08-04): 자산 담기 쪽에 구획이 없어 어디까지가 한 덩어리인지 헷갈린다.
+   → 1) 전표 정보 2) 자산 담기 3) 담긴 자산 세 단계로 테두리를 나누고 번호를 붙인다. */
+.slip-form {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 16px 18px; margin: 8px 0;
+}
+.slip-form .sf-title { margin-bottom: 14px; }
+.sf-step {
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 12px; background: var(--bg);
+}
+.sf-step-head {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 0 10px; font-size: 15px; font-weight: 700;
+}
+/* 단계 번호 — 순서가 한눈에 보이게 */
+.sf-no {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--primary); color: #fff; font-size: 12px; font-weight: 800;
+}
+.sf-actions { margin-top: 4px; }
+/* 사양 묶음 — 접었다 펼 수 있게. 같은 모델을 연달아 담을 땐 값이 남아 그대로 따라간다 */
+.sf-spec { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }
+.sf-spec > summary { cursor: pointer; font-weight: 700; font-size: 14px; }
+/* 제품코드 자동완성 목록 — 입력칸 바로 아래에 뜬다 */
+.code-list {
+  display: none; position: absolute; z-index: 45; left: 0; right: 0; top: 100%;
+  max-height: 280px; overflow: auto; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .18); min-width: 260px;
+}
+.code-item { padding: 7px 10px; cursor: pointer; border-bottom: 1px solid var(--border); }
+.code-item:last-child { border-bottom: none; }
+.code-item:hover, .code-item.on { background: var(--slate-soft); }
+.code-item .chip { margin-left: 6px; font-size: 11px; }
+
+/* 긴 목록 페이지 넘김 — 표 바로 아래 오른쪽에 붙는다.
+   ★한 쪽에 다 들어가면 JS가 아예 안 그린다(빈 막대가 남지 않게). */
+.pager {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 6px; margin-top: 10px; flex-wrap: wrap;
+}
+.pager button { min-width: 34px; padding: 5px 9px; font-size: 13px; }
+.pager button:disabled { opacity: .35; cursor: default; }
+.pager-at { font-size: 13px; margin: 0 4px; }
+
+/* 자산 상세 맨 위 — 이 자산이 어느 매입 전표로 들어왔는지.
+   흐린 글씨로 아래에 묻어 두면 아무도 못 찾는다(2026-08-04 대표 지적). */
+.slip-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 10px 0 4px; padding: 9px 12px; font-size: 13.5px;
+  background: var(--slate-soft); border-radius: 10px;
+  border-left: 3px solid var(--primary);
+}
+.slip-bar .slip-open { font-size: 15px; font-weight: 800; }
+.slip-bar-none { border-left-color: var(--border); color: var(--text-dim); }
+
+/* 중복 의심 자산 — 접어 두는 경고 카드 */
+.dup-card > summary {
+  cursor: pointer; font-size: 15px; list-style: none;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.dup-card > summary::-webkit-details-marker { display: none; }
+.dup-card > summary::before { content: "▶"; font-size: 11px; color: var(--text-dim); }
+.dup-card[open] > summary::before { content: "▼"; }
+/* 자산 합계 ↔ 전표 매입금액 대조 */
+#sa-sum { font-size: 14px; }
+/* 시리얼 연속 스캔 — 담은 줄 아래에 붙는다 */
+.sn-scan {
+  margin-top: 10px; padding: 10px 12px;
+  border: 1px solid var(--primary); border-radius: 10px;
+  background: var(--primary-soft);
+}
+.sn-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.sn-list .chip { margin: 0; }
+
+/* 챙길 옵션 칩 — 누르면 체크된다.
+   ★2026-08-03 표를 한 줄로 압축하며 체크박스를 없앴더니, 서버의 '체크해야 제작완료'
+     가드에 걸려 쿠팡·카카오 주문이 통째로 막혔다. 칩 자체를 버튼으로 되돌린 것. */
+.prep-chip { border: none; cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; }
+.prep-chip:disabled { cursor: default; opacity: .7; }
+.prep-chip:not(:disabled):hover { filter: brightness(.93); }
+
+/* 셋팅 행 상세 — QC 프로그램(192.168.0.185:3000)과 같은 4칸 구성
+   (대표 요청 2026-08-05): 상품 정보 / 결제 정보 / 구매자·배송지 / 처리 이력. */
+.setup-chan .chan-stock { margin-top: 5px; display: flex; gap: 5px; flex-wrap: wrap; }
+.setup-chan .chan-stock:empty { display: none; }
+.setup-chan .chan-more { margin-top: 6px; padding: 3px 10px; font-size: 11.5px; }
+.setup-detail > td { background: var(--bg); padding: 14px 16px; }
+.setup-detail:hover > td { background: var(--bg); }
+.dt-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.dt-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px; font-size: 13px;
+}
+.dt-head {
+  font-size: 12px; color: var(--text-dim); font-weight: 700; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 6px; justify-content: space-between;
+}
+.dt-line { display: flex; gap: 8px; padding: 3px 0; align-items: flex-start; }
+.dt-k { color: var(--text-dim); font-size: 12px; min-width: 62px; flex: 0 0 62px; }
+.dt-v { flex: 1; word-break: break-word; }
+/* 처리 이력 — 끝난 단계는 색이 찬 점, 아직인 단계는 빈 점 */
+.dt-step { display: flex; gap: 8px; padding: 5px 0; align-items: flex-start; }
+.dt-step .dt-dot {
+  width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; flex: 0 0 9px;
+  border: 2px solid var(--border); background: transparent;
+}
+.dt-step.on .dt-dot { background: var(--primary); border-color: var(--primary); }
+.dt-step.on b { color: var(--primary); }
+
+/* 알림 카드 — '조치가 필요하다'를 알리되 작업을 막지는 않는다 */
+.warn-card { border-left: 4px solid var(--amber, #d97706); }
+
+/* 같은 주문이 두 줄인 것 — 출고 처리가 아니라 정리 대상이라 눈에 띄게 구분한다 */
+.dup-warn {
+  margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--red, #dc2626); background: var(--red-soft, rgba(220, 38, 38, 0.06));
+}
+
+/* 단계 카드 — 눌러서 그 단계만 골라 본다(대표 2026-08-05: "왜 누를 수 없나") */
+.kpi-btn {
+  cursor: pointer; text-align: left; font: inherit;
+  border: 1px solid var(--border); background: var(--surface);
+  transition: border-color .12s, box-shadow .12s;
+}
+.kpi-btn:hover { border-color: var(--primary); }
+.kpi-btn.on { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+.kpi-btn.on .kpi-label { color: var(--primary); font-weight: 700; }
+.kpi-log .kpi-value { font-size: 16px; color: var(--text-dim); }
+
+/* QC에서는 이미 출고된 건 — 작업하기 전에 눈에 띄어야 한다 */
+.chip-amber { background: var(--amber-soft, rgba(217, 119, 6, 0.12)); color: var(--amber, #b45309); }
+.qc-shipped-chip { display: block; margin-top: 3px; font-size: 11px; cursor: help; }
+
+/* 출고 마감 담당자 — 상태 칩 아래 한 줄 */
+.ship-done { margin-top: 3px; font-size: 11px; color: var(--text-dim); line-height: 1.3; }
+.ship-done b { color: var(--text); font-weight: 700; }
+.ship-done span { font-size: 10px; font-variant-numeric: tabular-nums; }

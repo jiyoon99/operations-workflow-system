@@ -1,0 +1,35 @@
+# Python / local runtime
+venv/
+venv.broken-*/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Runtime data and logs
+data/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+
+# Local exports and business documents
+tms-export/
+*.xlsx
+*.xls
+*.csv
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
