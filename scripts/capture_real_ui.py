@@ -175,6 +175,9 @@ def main():
         edge_capture_with_login("portfolio-real-dashboard.png", "dashboard", cookie)
         edge_capture_with_login("portfolio-real-purchase.png", "purchase", cookie)
         edge_capture_with_login("portfolio-real-orders.png", "orders", cookie)
+        edge_capture_with_login("portfolio-real-shipping.png", "shipping", cookie)
+        edge_capture_with_login("portfolio-real-as.png", "as", cookie)
+        edge_capture_with_login("portfolio-real-reports.png", "reports", cookie)
         edge_capture_with_login("portfolio-real-settings.png", "settings", cookie)
     finally:
         proc.terminate()
