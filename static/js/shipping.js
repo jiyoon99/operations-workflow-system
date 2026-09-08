@@ -1,4 +1,4 @@
-/* HMS 배송/송장 — QC 완료 주문의 송장 선출력(자산번호 인쇄) + 출고 확인 + 송장 목록 */
+/* OWS 배송/송장 — QC 완료 주문의 송장 선출력(자산번호 인쇄) + 출고 확인 + 송장 목록 */
 "use strict";
 
 /* 회수한 물건을 되돌릴 상태 — 화면에서 골라 쓰도록 한글 라벨을 붙여 둔다 */
@@ -36,21 +36,127 @@ function waybillCellHtml(o, activeWb, canShip) {
         ? `<button class="btn btn-ghost btn-sm" data-reissue="${o.id}" data-wid="${activeWb.wid}"
              title="기존 송장을 취소하고 새로 발급합니다">재발급</button>` : ""}`;
   }
-  if (!canShip) return '<span class="muted">-</span>';
+  // ★송장 발급은 셋팅/QC 한 곳에서만 한다(대표 2026-08-24: "기존 주문 건에 대해서
+  //   송장 뽑는 기능은 QC 셋팅쪽 탭에서 진행되어야 함"). 발급 경로가 두 곳이면
+  //   같은 주문에 두 사람이 동시에 눌러 중복 발급이 난다.
+  //   여기서는 '왜 아직 송장이 없는지'만 알리고 셋팅으로 보낸다.
   const blockers = waybillBlockers(o);
-  if (blockers.length) {
-    return `<button class="btn btn-sm" disabled>송장 발급·출력</button>
-      <div class="chip chip-red" style="margin-top:4px; white-space:normal;">${escapeHtml(blockers.join(" · "))}</div>
-      <div class="muted" style="font-size:11px;">주문관리 ▸ 해당 주문 ▸ [상세]에서 채울 수 있습니다</div>`;
+  return `<span class="chip chip-slate">송장 없음</span>
+    ${blockers.length
+      ? `<div class="chip chip-red" style="margin-top:4px; white-space:normal;">${escapeHtml(blockers.join(" · "))}</div>`
+      : ""}
+    <div class="muted" style="font-size:11px; margin-top:4px;">
+      발급은 <b>셋팅</b> 탭에서 합니다${blockers.length ? " — 위 사항을 먼저 채우세요" : ""}.</div>
+    ${canSeeMenu("setup") ? `<button class="btn btn-ghost btn-sm" data-gosetup="${o.id}"
+        style="margin-top:4px;" title="셋팅 작업보드로 이동합니다">셋팅에서 발급 →</button>` : ""}`;
+}
+
+/* 여러 송장(다매)이면 병합 PDF로, 한 장이면 단건 PDF로 연다 */
+async function openIssuedPdf(res) {
+  if ((res.qty || 1) > 1 && (res.wids || []).length > 1) {
+    try {
+      const r = await fetch("/api/waybills/print", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wids: res.wids }),
+      });
+      if (!r.ok) throw new Error("병합 인쇄 실패 — 송장 목록에서 개별 인쇄하세요.");
+      window.open(URL.createObjectURL(await r.blob()), "_blank");
+      return;
+    } catch (err) { toast(err.message, true); }
   }
-  // 📦 한 송장으로 여러 상자가 나가는 경우가 있다(대표 2026-07-30) — 발급 전에 지정한다
-  return `<div class="inline-row" style="gap:4px;">
-    <input type="number" class="wb-box" data-oid="${o.id}" min="1" max="10" value="1"
-           title="상자 수 — 2개 이상이면 송장에 「박스 N개」로 찍힙니다"
-           style="width:52px; padding:4px 6px; border:1px solid var(--border);
-                  border-radius:8px; background:var(--bg); font-size:12px;">
-    <button class="btn btn-sm btn-primary" data-issue="${o.id}">송장 발급·출력</button>
-  </div>`;
+  window.open(`/api/waybills/${res.wid}/pdf`, "_blank");
+}
+
+/* 🆕 송장 신규 등록 — 주문·A/S 없이 송장을 직접 만든다(RMS 송장관리 이식, 대표 2026-09-03).
+   ·출고: 우리가 보낸다 — 송장번호가 바로 나온다
+   ·회수: 고객에게서 받아 온다 — 번호는 기사가 집화할 때 CJ가 만든다(수거 희망일 지정 가능)
+   ·예약: CJ를 부르지 않고 기록만 남긴다 — 나중에 실제 접수로 올린다 */
+function openManualWaybill() {
+  const host = document.createElement("div");
+  host.innerHTML = `
+    <div class="card" style="max-width:560px;">
+      <h3>🆕 송장 신규 등록</h3>
+      <p class="muted" style="font-size:12px;margin-top:-4px;">
+        주문·A/S 건이 없는 발송에 씁니다(견본 발송, 부품만 보내기, 반품 회수 등).</p>
+      <div class="form-row">
+        <label>종류</label>
+        <select id="mw-type">
+          <option value="forward">🚚 출고 — 우리가 보냅니다</option>
+          <option value="recall">↩️ 회수 — 고객에게서 받아 옵니다</option>
+        </select>
+      </div>
+      <div class="form-row"><label>받는 분 <b style="color:var(--danger)">*</b></label>
+        <input type="text" id="mw-name" data-autofocus placeholder="성함 또는 상호"></div>
+      <div class="form-row"><label>연락처</label>
+        <input type="text" id="mw-tel" placeholder="010-0000-0000"></div>
+      <div class="form-row"><label>우편번호</label>
+        <span class="inline-row" style="gap:6px;">
+          <input type="text" id="mw-zip" style="max-width:110px;" placeholder="00000">
+          <button class="btn btn-sm" id="mw-addr-find">🔍 주소 검색</button></span></div>
+      <div class="form-row"><label>주소 <b style="color:var(--danger)">*</b></label>
+        <input type="text" id="mw-addr" placeholder="도로명 주소"></div>
+      <div class="form-row"><label>상세주소</label>
+        <input type="text" id="mw-addr2" placeholder="동·호수 등"></div>
+      <div class="form-row"><label>품목</label>
+        <input type="text" id="mw-items" placeholder="예: 노트북 어댑터 1개"></div>
+      <div class="form-row"><label>상자 수</label>
+        <input type="number" id="mw-box" value="1" min="1" max="10" style="max-width:90px;"></div>
+      <div class="form-row" id="mw-pick-row" style="display:none;">
+        <label>수거 희망일</label>
+        <input type="date" id="mw-pickup" style="max-width:170px;">
+        <span class="muted" style="font-size:12px;"> 기사에게 전달됩니다</span></div>
+      <div class="form-row"><label>메모</label>
+        <input type="text" id="mw-memo" maxlength="60" placeholder="기사에게 보이는 문구(60자)"></div>
+      <label class="check-line" style="margin-top:6px;">
+        <input type="checkbox" id="mw-reserve">
+        <span>예약만 하기 — <b>CJ에 접수하지 않고</b> 기록만 남깁니다(나중에 접수)</span></label>
+      <div class="inline-row" style="margin-top:12px;">
+        <button class="btn btn-primary" id="mw-save">등록</button>
+        <button class="btn" id="mw-cancel">닫기</button>
+      </div>
+    </div>`;
+  openModalWith(host);
+  const $$$ = (id) => host.querySelector(id);
+  // 회수일 때만 수거 희망일 칸을 보여 준다(출고에는 쓰지 않는 값이다)
+  $$$("#mw-type").addEventListener("change", (e) => {
+    $$$("#mw-pick-row").style.display = e.target.value === "recall" ? "" : "none";
+  });
+  // attachAddrSearch 는 '선택자 문자열'을 받는다(요소가 아니다)
+  attachAddrSearch($$$("#mw-addr-find"),
+                   { zip: "#mw-zip", addr: "#mw-addr", detail: "#mw-addr2" });
+  $$$("#mw-cancel").addEventListener("click", () => closeModal());
+  $$$("#mw-save").addEventListener("click", async () => {
+    const btn = $$$("#mw-save");
+    const body = {
+      type: $$$("#mw-type").value,
+      recipient: $$$("#mw-name").value.trim(),
+      phone: $$$("#mw-tel").value.trim(),
+      postalCode: $$$("#mw-zip").value.trim(),
+      address: $$$("#mw-addr").value.trim(),
+      addressDetail: $$$("#mw-addr2").value.trim(),
+      items: $$$("#mw-items").value.trim(),
+      boxQty: Number($$$("#mw-box").value) || 1,
+      pickupDate: $$$("#mw-pickup") ? $$$("#mw-pickup").value : "",
+      memo: $$$("#mw-memo").value.trim(),
+      reserve: $$$("#mw-reserve").checked,
+    };
+    if (!body.recipient || !body.address) {
+      toast("받는 분과 주소는 반드시 입력해야 합니다.", true);
+      return;
+    }
+    if (!body.reserve && !confirm(
+        body.type === "recall"
+          ? "CJ대한통운에 회수(반품)를 접수합니다 — 기사가 방문합니다.\n계속할까요?"
+          : "CJ대한통운에 출고를 접수하고 송장번호를 받습니다.\n계속할까요?")) return;
+    btn.disabled = true;
+    try {
+      const r = await api("/api/waybills/manual", { method: "POST", body });
+      toast(r.message || "등록했습니다.");
+      closeModal();
+      renderShippingView($("#main") || document.querySelector("main"));
+    } catch (e) { toast(e.message, true); }
+    finally { btn.disabled = false; }
+  });
 }
 
 function renderShippingView(main) {
@@ -59,37 +165,164 @@ function renderShippingView(main) {
     main.innerHTML = `<h1 class="page-title">배송 / 송장</h1><div class="card placeholder"><p>배송 메뉴 접근 권한이 없습니다.</p></div>`;
     return;
   }
-  if (!state.shipTab) state.shipTab = "ready";
+  // ★8/31 재편(대표 "현황판처럼 메인으로") — 옛 탭 이름(북마크·대시보드 바로가기 'ready')은
+  //   새 탭으로 별칭 매핑한다: 신규건+송장 목록 = [현황], 회수/반품 = [신규 접수].
+  if (state.shipTab === "ready" || state.shipTab === "waybills") state.shipTab = "status";
+  else if (state.shipTab === "recall") state.shipTab = "intake";
+  if (!state.shipTab) state.shipTab = "status";
   main.innerHTML = `
     <h1 class="page-title">배송 / 송장</h1>
-    <p class="page-desc">QC 완료 → <b>송장 먼저 출력</b>(상품명에 쇼핑몰·제품코드·자산번호·옵션 인쇄) → 포장 → 출고 확인</p>
-    <div class="tabs">
-      <button data-stab="ready" class="${state.shipTab === "ready" ? "active" : ""}">송장 발급 대기 / 출고</button>
-      <button data-stab="waybills" class="${state.shipTab === "waybills" ? "active" : ""}">송장 목록</button>
-      <button data-stab="recall" class="${state.shipTab === "recall" ? "active" : ""}">회수 / 반품</button>
+    <p class="page-desc"><b>송장 발급은 셋팅 탭에서</b> 합니다 —
+      여기서는 오늘 나간 송장·배송 흐름을 한눈에 보고, 포장·출고 확인과 회수 접수를 합니다.</p>
+    <div class="kpi-row" id="ship-board"></div>
+    <div id="ship-board-detail"></div>
+    <div class="tabs" style="align-items:center;">
+      <button data-stab="status" class="${state.shipTab === "status" ? "active" : ""}">현황 (포장 · 출고 · 송장 조회)</button>
+      <button data-stab="intake" class="${state.shipTab === "intake" ? "active" : ""}">신규 접수 (회수 · 반품)</button>
+      <span style="flex:1"></span>
+      ${hasPerm("orders.ship") || hasPerm("waybills.manage")
+        ? `<button class="btn btn-sm btn-primary" id="wb-new"
+             title="주문·A/S 없이 송장을 직접 만듭니다 — 견본 발송, 부품만 보내기, 반품 회수 등">🆕 신규 등록</button>`
+        : ""}
     </div>
     <div id="stab-body"></div>`;
+  const nb = $("#wb-new", main);
+  if (nb) nb.addEventListener("click", () => openManualWaybill());
   $$("button[data-stab]", main).forEach((b) => b.addEventListener("click", () => {
     state.shipTab = b.dataset.stab;
     clearPollers();          // 탭 전환 시 이전 폴러 정리 (누적 방지)
     ++state.renderSeq;
     renderShippingView(main);
   }));
+  loadShipBoard();
+  renderShipBoardDetail();          // 카드를 눌러 열어 둔 근거 내역은 화면 갱신에도 유지
   const body = $("#stab-body");
-  if (state.shipTab === "ready") {
-    renderShipReady(body);
+  if (state.shipTab === "status") {
+    body.innerHTML = `<div id="ship-ready-sec"></div><div id="ship-wb-sec" style="margin-top:18px;"></div>`;
+    renderShipReady($("#ship-ready-sec"));
+    renderWaybillList($("#ship-wb-sec"));
     // 폴러는 화면당 1회만 등록한다. renderShipReady 안에서 등록하면
     // 폴러가 다시 renderShipReady를 부르며 인터벌이 기하급수로 늘어난다.
     addPoller(() => {
-      if (!isEditingInput() && state.view === "shipping" && state.shipTab === "ready") {
-        renderShipReady($("#stab-body"));
+      if (!isEditingInput() && state.view === "shipping" && state.shipTab === "status") {
+        renderShipReady($("#ship-ready-sec"));
+        loadShipBoard();
       }
     }, 15000);
-  } else if (state.shipTab === "waybills") {
-    renderWaybillList(body);
   } else {
     renderRecallList(body);
   }
+}
+
+/* 현황판 카드 — 오늘 발행/출고·배송중·회수·발급 걸림·몰 미전송(2026-08-31 대표).
+   숫자는 서버가 센다(/api/waybills/board — 보관 포함 등 잣대 통일). */
+async function loadShipBoard() {
+  const host = $("#ship-board");
+  if (!host) return;
+  let b = null, pushCnt = null;
+  try { b = await api("/api/waybills/board"); } catch (_e) {}
+  try { pushCnt = (await api("/api/orders/invoice-push/pending")).length; } catch (_e) {}
+  if (!$("#ship-board")) return;
+  if (!b) { host.innerHTML = ""; return; }
+  // pending 이 10분 넘게 남아 있으면 CJ 응답 유실 — 빨갛게 알린다
+  let pendWarn = false;
+  if (b.pending && b.pendingOldest) {
+    const ageMin = (Date.now() - new Date(b.pendingOldest).getTime()) / 60000;
+    pendWarn = ageMin > 10;
+  }
+  // ★카드는 전부 누를 수 있다(2026-08-31 대표) — 누르면 그 숫자의 근거 내역이 바로 밑에
+  //   열린다(같은 조건을 서버가 그대로 되돌려 준다). 다시 누르면 닫힌다.
+  const on = (k) => state.shipBoardDetail === k
+    ? " outline:2px solid var(--accent, #2563eb);" : "";
+  const card = (k, label, value, sub, extraStyle) => `
+    <div class="kpi" data-bd="${k}" title="누르면 이 숫자의 근거 내역이 아래에 열립니다"
+         style="cursor:pointer;${extraStyle || ""}${on(k)}">
+      <div class="kpi-label">${label}</div>
+      <div class="kpi-value">${value}<span class="muted" style="font-size:13px;">건</span></div>
+      ${sub || ""}</div>`;
+  host.innerHTML =
+    card("issuedToday", "오늘 발행 송장", b.issuedToday,
+         b.testToday ? `<div class="muted" style="font-size:12px;">테스트 ${b.testToday}건 별도</div>` : "")
+    + card("shippedToday", "오늘 출고 확인", b.shippedToday,
+           `<div class="muted" style="font-size:12px;">보관 처리분 포함</div>`)
+    + card("inTransit", "배송중", b.inTransit,
+           `<div class="muted" style="font-size:12px;">발행됐고 아직 배송완료 아님</div>`)
+    + card("recallActive", "회수 진행", b.recallActive,
+           `<div class="muted" style="font-size:12px;">접수~수거 중</div>`,
+           "border-left-color:var(--violet, #7c3aed);")
+    + `${b.pending ? `<div class="kpi" style="border-left-color:${pendWarn ? "var(--danger)" : "var(--border)"};">
+      <div class="kpi-label">발급 진행 중</div>
+      <div class="kpi-value" ${pendWarn ? 'style="color:var(--danger);"' : ""}>${b.pending}건</div>
+      ${pendWarn ? `<div class="muted" style="font-size:12px; color:var(--danger);">10분 넘게 걸려 있음 — CJ 응답 확인 필요</div>` : ""}</div>` : ""}
+    ${pushCnt ? `<div class="kpi" style="border-left-color:var(--blue);"><div class="kpi-label">몰에 송장 미전송</div>
+      <div class="kpi-value">${pushCnt}건</div>
+      <div class="muted" style="font-size:12px;">[현황] 탭 아래 배너에서 보내기</div></div>` : ""}`;
+  $$("[data-bd]", host).forEach((el) => el.addEventListener("click", () => {
+    state.shipBoardDetail = state.shipBoardDetail === el.dataset.bd ? "" : el.dataset.bd;
+    loadShipBoard();
+    renderShipBoardDetail();
+  }));
+}
+
+/* 카드 클릭 근거 내역(2026-08-31 대표) — 카드를 만든 조건 그대로 서버(?detail=)가 준다 */
+const BD_TITLES = {
+  issuedToday: "오늘 발행 송장", shippedToday: "오늘 출고 확인",
+  inTransit: "배송중", recallActive: "회수 진행",
+};
+
+async function renderShipBoardDetail() {
+  const host = $("#ship-board-detail");
+  if (!host) return;
+  const key = state.shipBoardDetail;
+  if (!key) { host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="card"><p class="muted">불러오는 중…</p></div>`;
+  let d;
+  try { d = await api("/api/waybills/board?detail=" + encodeURIComponent(key)); }
+  catch (err) { host.innerHTML = `<div class="card"><p class="muted">${escapeHtml(err.message)}</p></div>`; return; }
+  if (!$("#ship-board-detail") || state.shipBoardDetail !== key) return;
+  const stLabel = { issued: "발행", test: "테스트", canceled: "취소",
+                    delivered: "배송완료", pending: "발급 중" };
+  const head = `<div class="inline-row">
+      <h3 style="margin:0; flex:1;">${BD_TITLES[key] || key} <span class="muted" style="font-size:13px; font-weight:400;">${d.rows.length}건</span></h3>
+      <button class="btn btn-sm" id="bd-close">닫기</button></div>`;
+  if (key === "shippedToday") {
+    host.innerHTML = `<div class="card">${head}
+      <div class="table-wrap"><table>
+        <thead><tr><th>주문번호</th><th>채널</th><th>수취인</th><th>상품</th><th>출고 확인</th><th></th></tr></thead>
+        <tbody>${d.rows.map((r) => `<tr>
+          <td><b>${escapeHtml(r.orderNo || "#" + r.orderId)}</b></td>
+          <td>${escapeHtml(r.channel)}</td>
+          <td>${escapeHtml(r.recipient)}</td>
+          <td style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(r.productName)}">${escapeHtml(r.productName)}</td>
+          <td>${escapeHtml(r.by)}<span class="muted" style="font-size:12px;"> · ${escapeHtml((r.at || "").replace("T", " ").slice(5, 16))}</span></td>
+          <td>${r.archived ? '<span class="chip chip-slate">보관됨</span>' : ""}</td>
+        </tr>`).join("") || `<tr><td colspan="6" class="muted">해당 건이 없습니다.</td></tr>`}</tbody>
+      </table></div></div>`;
+  } else {
+    host.innerHTML = `<div class="card">${head}
+      <div class="table-wrap"><table>
+        <thead><tr><th>송장 ID</th><th>송장번호</th><th>수취인</th><th>상품명(라벨)</th><th>상태</th><th>배송 단계</th><th>발행</th></tr></thead>
+        <tbody>${d.rows.map((r) => `<tr>
+          <td>${escapeHtml(r.wid)}</td>
+          <td><button class="link-btn" data-wbpop="${escapeHtml(r.wid)}" style="font-weight:700;"
+                title="누르면 실시간 추적·메모 팝업이 열립니다">${escapeHtml(r.invoiceNo || "ℹ 정보/메모")}</button></td>
+          <td>${escapeHtml(r.recipient)}</td>
+          <td style="max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(r.items)}">${escapeHtml(r.items)}</td>
+          <td>${escapeHtml(stLabel[r.status] || r.status)}</td>
+          <td>${escapeHtml(r.stage || "-")}${key === "recallActive" && r.scheduledDate ? `<div class="muted" style="font-size:12px;">수거 희망 ${escapeHtml(r.scheduledDate)}</div>` : ""}</td>
+          <td class="muted" style="font-size:12px;">${escapeHtml((r.createdAt || "").replace("T", " ").slice(5, 16))}</td>
+        </tr>`).join("") || `<tr><td colspan="7" class="muted">해당 건이 없습니다.</td></tr>`}</tbody>
+      </table></div></div>`;
+    $$("button[data-wbpop]", host).forEach((btn) => btn.addEventListener("click", () => {
+      openWaybillPopup(btn.dataset.wbpop);
+    }));
+  }
+  const close = $("#bd-close");
+  if (close) close.addEventListener("click", () => {
+    state.shipBoardDetail = "";
+    renderShipBoardDetail();
+    loadShipBoard();
+  });
 }
 
 /* ---------------- 회수 / 반품 ---------------- */
@@ -302,12 +535,11 @@ async function renderShipReady(body) {
   };
   body.innerHTML = `
     <div class="kpi-row">
-      <div class="kpi"><div class="kpi-label">송장 발급 대기 (QC 완료)</div><div class="kpi-value">${waiting.filter((o) => !o.waybills.some((w) => w.type !== "recall" && w.status !== "canceled")).length}</div></div>
+      <div class="kpi"><div class="kpi-label">송장 대기 (셋팅에서 발급)</div><div class="kpi-value">${waiting.filter((o) => !o.waybills.some((w) => w.type !== "recall" && w.status !== "canceled")).length}</div></div>
       <div class="kpi"><div class="kpi-label">포장 대기 (송장 출력됨)</div><div class="kpi-value">${waiting.filter((o) => o.waybills.some((w) => w.type !== "recall" && w.status !== "canceled")).length}</div></div>
-      <div class="kpi"><div class="kpi-label">오늘 출고 확인</div><div class="kpi-value">${shipped.filter((o) => (o.shippingAt || "").slice(0, 10) === ymd()).length}</div></div>
     </div>
     <div class="card">
-      <h3>진행 중 (QC 완료 주문)</h3>
+      <h3>신규건 <span class="muted" style="font-weight:400; font-size:13px;">— 셋팅에서 송장이 나온 건을 포장하고 출고 확인합니다</span></h3>
       <div class="table-wrap"><table>
         <thead><tr><th>채널 / 주문</th><th>상품</th><th>수취인</th><th>자산번호</th><th>송장</th><th class="stage-th">출고 확인</th></tr></thead>
         <tbody>${pgW.rows.map(rowHtml).join("") || `<tr><td colspan="6" class="muted">QC 완료된 대기 주문이 없습니다. (셋팅 탭에서 제작·검수를 완료하면 여기에 나타납니다)</td></tr>`}</tbody>
@@ -333,21 +565,9 @@ async function renderShipReady(body) {
   wirePager(body, "shipPickup", () => renderShipReady(body));
   wirePager(body, "shipDone", () => renderShipReady(body));
 
-  const boxOf = (oid) => {
-    const el = $(`.wb-box[data-oid="${oid}"]`, body);
-    return Math.max(1, Math.min(Number(el ? el.value : 1) || 1, 10));
-  };
-  $$("button[data-issue]", body).forEach((b) => b.addEventListener("click", async () => {
-    b.disabled = true;
-    try {
-      const res = await api(`/api/orders/${b.dataset.issue}/waybill`,
-                            { method: "POST", body: { boxQty: boxOf(b.dataset.issue) } });
-      toast(res.simulated
-        ? `테스트 송장 발행: ${res.invoiceNo} (CJ 미설정 — 설정>배송/CJ에서 실발행 전환)`
-        : `송장 발행: ${res.invoiceNo}`);
-      window.open(`/api/waybills/${res.wid}/pdf`, "_blank");
-      renderShipReady(body);
-    } catch (err) { toast(err.message, true); b.disabled = false; }
+  // 발급은 셋팅 한 곳에서만 — 여기서는 그 화면으로 보내 준다
+  $$("button[data-gosetup]", body).forEach((b) => b.addEventListener("click", () => {
+    go("setup");
   }));
   // 재발급 = [기존 송장 취소] + [새로 발급]을 한 번에. 예전엔 다른 탭에 가서
   // 손으로 취소한 뒤 돌아와야 했고, 그 경로 안내조차 없었다(2026-07-29 전수조사).
@@ -356,9 +576,24 @@ async function renderShipReady(body) {
                  + "이미 붙여서 내보낸 송장이면 새 번호로 다시 붙여야 합니다.\n\n계속할까요?")) return;
     b.disabled = true;
     try {
-      await api(`/api/waybills/${b.dataset.wid}/cancel`, { method: "POST", body: {} });
+      // ★취소가 실패해도 재발급 길을 막지 않는다 — CJ 쪽에서 이미 취소·집화된 건은
+      //   우리 취소 호출이 거절되는데, 그때 새 발급까지 못 하면 그 주문은 영영 갇힌다.
+      //   (RMS의 skip_cancel 탈출구와 같은 취지. forceLocal=우리 기록만 취소)
+      try {
+        await api(`/api/waybills/${b.dataset.wid}/cancel`, { method: "POST", body: {} });
+      } catch (cerr) {
+        if (!confirm(`기존 송장 취소가 실패했습니다:\n${cerr.message}\n\n`
+            + "CJ에서 이미 취소·집화됐다면 그대로 새 송장을 발급해도 됩니다.\n"
+            + "우리 기록만 취소하고 새로 발급할까요?\n"
+            + "(기존 예약이 CJ에 살아 있으면 이중 집화가 될 수 있습니다)")) {
+          throw cerr;
+        }
+        await api(`/api/waybills/${b.dataset.wid}/cancel`,
+                  { method: "POST", body: { forceLocal: true } });
+      }
       const res = await api(`/api/orders/${b.dataset.reissue}/waybill`,
-                            { method: "POST", body: { boxQty: boxOf(b.dataset.reissue) } });
+                            // 상자 수는 서버가 지난 송장에서 물려받는다(같은 짐을 다시 부친다)
+                            { method: "POST", body: {} });
       toast(`재발급 완료: ${res.invoiceNo || res.wid}`);
       window.open(`/api/waybills/${res.wid}/pdf`, "_blank");
       renderShipReady(body);
@@ -381,16 +616,124 @@ async function renderShipReady(body) {
 
 /* ---------------- 송장 목록 ---------------- */
 
+/* 송장번호 클릭 팝업 — 실시간 추적 타임라인 + 운영 메모 (RMS 이식, 대표 2026-08-10).
+   고객이 송장번호만 들고 전화했을 때 이 팝업 하나로 답한다. */
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => toast("복사했습니다."));
+    return;
+  }
+  // http(비보안) 환경 폴백 — 사내망 OWS는 http라 이 경로를 탄다
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand("copy"); toast("복사했습니다."); }
+  catch { toast("복사에 실패했습니다 — 길게 눌러 직접 복사하세요.", true); }
+  ta.remove();
+}
+
+async function openWaybillPopup(wid) {
+  let host = document.getElementById("wb-popup-host");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "wb-popup-host";
+    document.body.appendChild(host);
+  }
+  host.innerHTML = `<div class="card" style="min-width:340px;"><p class="muted">송장 정보를 여는 중…</p></div>`;
+  openModalWith(host);
+  let d;
+  try { d = await api(`/api/waybills/${encodeURIComponent(wid)}/trace`); }
+  catch (err) {
+    host.innerHTML = `<div class="card"><p class="muted">${escapeHtml(err.message)}</p>
+      <div class="editor-actions"><button class="btn" id="wbp-close">닫기</button></div></div>`;
+    $("#wbp-close").addEventListener("click", () => { host.innerHTML = ""; });
+    return;
+  }
+  const canShip = hasPerm("orders.ship");
+  const inv = d.invoiceNo || "";
+  const digits = inv.replace(/[^0-9]/g, "");
+  const fmtD = (s) => (s && s.length === 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s || "");
+  const fmtT = (s) => (s && s.length >= 4 ? `${s.slice(0, 2)}:${s.slice(2, 4)}` : s || "");
+  const tl = (d.timeline || []).slice().reverse();       // 최신이 위로
+  host.innerHTML = `
+    <div class="card" style="min-width:360px; max-width:600px;">
+      <div class="inline-row">
+        <h3 style="margin:0; flex:1;">🚚 ${inv ? escapeHtml(inv) : escapeHtml(d.wid)}
+          <span class="muted" style="font-size:12px; font-weight:400;">${escapeHtml(d.wid)}</span></h3>
+        <button class="btn btn-ghost btn-sm" id="wbp-close">✕</button>
+      </div>
+      <div class="inline-row" style="gap:6px; flex-wrap:wrap; margin-top:4px;">
+        ${inv ? `<button class="btn btn-sm" id="wbp-copy">📋 번호 복사</button>
+          <a class="btn btn-sm" target="_blank"
+             href="https://trace.cjlogistics.com/next/tracking.html?wblNo=${encodeURIComponent(digits)}">🌐 CJ 웹조회</a>` : ""}
+        ${d.stageName ? `<span class="chip ${d.stageCode === "91" ? "chip-green" : "chip-blue"}">🚚 ${escapeHtml(d.stageName)}</span>` : ""}
+      </div>
+      <p class="muted" style="margin:8px 0 0; font-size:13px;">
+        ${escapeHtml(d.recipient)} · ${escapeHtml(d.phone || "-")}<br>
+        ${escapeHtml(d.address || "-")}<br>
+        ${escapeHtml(d.items || "")}${d.boxQty > 1 ? ` · 박스 ${d.boxQty}개` : ""}
+        ${d.orderId ? ` · 주문 #${d.orderId}` : ""}</p>
+      <h3 style="margin-top:12px; font-size:14px;">배송 이력</h3>
+      ${tl.length ? `<div class="timeline" style="max-height:220px; overflow:auto;">${tl.map((p) => `
+        <div class="tl-item">
+          <div class="tl-time">${escapeHtml(fmtD(p.date))} ${escapeHtml(fmtT(p.time))}</div>
+          <div class="tl-action"><span class="chip ${p.code === "91" ? "chip-green" : "chip-slate"}">${escapeHtml(p.name || p.code)}</span>
+            <span class="muted" style="font-size:12px;">${escapeHtml(p.branch || "")}</span></div>
+        </div>`).join("")}</div>`
+        : `<p class="muted" style="font-size:13px;">${escapeHtml(d.trackError || "추적 이력이 아직 없습니다.")}</p>`}
+      <h3 style="margin-top:12px; font-size:14px;">운영 메모 <span class="muted" style="font-weight:400; font-size:12px;">— 통화 내용·재배송 약속 등</span></h3>
+      <textarea id="wbp-note" style="width:100%; min-height:64px; padding:8px 10px; border:1px solid var(--border);
+        border-radius:8px; background:var(--bg);" ${canShip ? "" : "disabled"}>${escapeHtml(d.note || "")}</textarea>
+      <div class="editor-actions">
+        ${canShip ? `<button class="btn btn-primary btn-sm" id="wbp-notesave">메모 저장</button>` : ""}
+        <button class="btn btn-sm" id="wbp-close2">닫기</button>
+      </div>
+    </div>`;
+  const close = () => { host.innerHTML = ""; };
+  $("#wbp-close").addEventListener("click", close);
+  $("#wbp-close2").addEventListener("click", close);
+  const copyBtn = $("#wbp-copy");
+  if (copyBtn) copyBtn.addEventListener("click", () => copyText(inv));
+  const saveBtn = $("#wbp-notesave");
+  if (saveBtn) saveBtn.addEventListener("click", async () => {
+    saveBtn.disabled = true;
+    try {
+      await api(`/api/waybills/${encodeURIComponent(wid)}/note`,
+                { method: "POST", body: { note: $("#wbp-note").value } });
+      toast("메모를 저장했습니다.");
+    } catch (err) { toast(err.message, true); }
+    saveBtn.disabled = false;
+  });
+}
+
+/* 배송단계 배지 — CJ 추적이 채운 중간 단계(집화완료·간선상차 …)를 보여 준다.
+   ★추적 데몬이 3시간마다 DB에 적어 두는데 예전엔 화면이 그 값을 안 그렸다(2026-08-10).
+     배송완료(91)만 상태로 보이고 중간 과정이 전부 안 보였던 이유다. */
+function wbStageChip(w) {
+  if (!w.stageName) return "";
+  const code = w.stageCode || "";
+  const cls = code === "91" ? "chip-green" : ["03", "82"].includes(code) ? "chip-red" : "chip-blue";
+  const at = (w.stageAt || "").slice(5, 16).replace("T", " ");
+  return `<span class="chip ${cls}" style="font-size:11px;" title="CJ 추적 ${escapeHtml(at)}">🚚 ${escapeHtml(w.stageName)}</span>`;
+}
+
 async function renderWaybillList(body) {
   const seq = state.renderSeq;
   const canShip = hasPerm("orders.ship");
   body.innerHTML = `<p class="muted">불러오는 중…</p>`;
   let rows;
   try {
-    const f = state.wbFilter || (state.wbFilter = { q: "", status: "" });
+    const f = state.wbFilter || (state.wbFilter = { q: "", status: "", type: "", from: "", to: "" });
+    f.type = f.type || ""; f.from = f.from || ""; f.to = f.to || "";
     const p = new URLSearchParams();
     if (f.q) p.set("q", f.q);
     if (f.status) p.set("status", f.status);
+    if (f.type) p.set("type", f.type);
+    if (f.from) p.set("from", f.from);
+    if (f.to) p.set("to", f.to);
     rows = await api("/api/waybills?" + p.toString());
     if (seq !== state.renderSeq) return;
   } catch (err) {
@@ -398,35 +741,52 @@ async function renderWaybillList(body) {
     return;
   }
   const f = state.wbFilter;
+  if (!state.wbPicked) state.wbPicked = new Set();
+  state.wbPicked = new Set([...state.wbPicked].filter((id) => rows.some((w) => w.wid === id)));
   const stChip = { issued: "chip-green", test: "chip-slate", canceled: "chip-red",
                    delivered: "chip-blue", pending: "chip-violet" };
   const stLabel = { issued: "발행", test: "테스트", canceled: "취소",
                     delivered: "배송완료", pending: "발급 중" };
+  // ★as_return 은 DB에 없는 유령 값이었다(A/S 반송은 forward+as_ticket_id) — 필터에서 제거(8/31)
+  const tyLabel = { forward: "출고", recall: "회수" };
   body.innerHTML = `
     <div class="card">
-      <div class="inline-row">
-        <input type="text" id="wf-q" placeholder="송장번호/수취인/상품 검색" value="${escapeHtml(f.q)}" style="min-width:220px;">
-        <select id="wf-status"><option value="">전체</option>
+      <div class="inline-row" style="flex-wrap:wrap;">
+        <input type="text" id="wf-q" placeholder="송장번호/수취인/상품/송장ID" value="${escapeHtml(f.q)}" style="min-width:220px;">
+        <select id="wf-status"><option value="">전체 상태</option>
           ${Object.entries(stLabel).map(([k, l]) => `<option value="${k}" ${f.status === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <select id="wf-type"><option value="">전체 종류</option>
+          ${Object.entries(tyLabel).map(([k, l]) => `<option value="${k}" ${f.type === k ? "selected" : ""}>${l}</option>`).join("")}</select>
+        <input type="date" id="wf-from" value="${escapeHtml(f.from)}" title="발행일 시작">
+        <span class="muted">~</span>
+        <input type="date" id="wf-to" value="${escapeHtml(f.to)}" title="발행일 끝">
         <button class="btn btn-sm btn-primary" id="wf-search">조회</button>
-        <span class="muted">${rows.length}건</span>
+        <span class="muted">${rows.length}건${rows.length >= 300 ? " (최근 300 — 기간을 좁혀 주세요)" : ""}</span>
         <span style="flex:1"></span>
+        ${canShip ? `<button class="btn btn-sm" id="wf-recallno" title="회수 송장번호는 기사가 집화할 때 CJ가 매깁니다.
+CJ에 예약 기준으로 물어봐 비어 있던 회수 번호를 받아옵니다(최근 14일).">📥 회수 송장번호 받기</button>` : ""}
         ${canShip ? `<button class="btn btn-sm" id="wf-track" title="CJ에 지금 배송상태를 물어봅니다(3시간마다 자동 갱신)">📡 배송추적 새로고침</button>` : ""}
       </div>
+      <div id="wf-bulkbar" style="display:none;"></div>
       <div id="wf-push"></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>송장 ID</th><th>송장번호</th><th>수취인</th><th>상품명(라벨)</th><th>상태</th><th>발행</th><th></th></tr></thead>
+        <thead><tr><th style="width:28px;"><input type="checkbox" id="wf-all" title="보이는 송장 전체 선택"></th>
+          <th>송장 ID</th><th>종류</th><th>송장번호</th><th>수취인</th><th>상품명(라벨)</th><th>상태</th><th>발행</th><th></th></tr></thead>
         <tbody>${rows.map((w) => `
           <tr>
+            <td><input type="checkbox" class="wf-pick" data-wid="${escapeHtml(w.wid)}" ${state.wbPicked.has(w.wid) ? "checked" : ""}></td>
             <td>${escapeHtml(w.wid)}</td>
-            <td><b>${escapeHtml(w.invoiceNo)}</b></td>
+            <td>${escapeHtml(tyLabel[w.type] || w.type)}</td>
+            <td><button class="link-btn" data-wbpop="${escapeHtml(w.wid)}"
+                  title="누르면 실시간 추적·메모 팝업이 열립니다"
+                  style="font-weight:700;">${escapeHtml(w.invoiceNo || "ℹ 정보/메모")}</button></td>
             <td>${escapeHtml(w.recipient)}</td>
             <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(w.items)}">${escapeHtml(w.items)}</td>
-            <td><span class="chip ${stChip[w.status] || "chip-slate"}">${stLabel[w.status] || escapeHtml(w.status)}</span></td>
+            <td><span class="chip ${stChip[w.status] || "chip-slate"}">${stLabel[w.status] || escapeHtml(w.status)}</span> ${wbStageChip(w)}</td>
             <td class="muted">${escapeHtml(w.createdBy)}<br>${escapeHtml((w.createdAt || "").slice(5, 16).replace("T", " "))}</td>
             <td>
-              ${w.type === "recall"
-                ? '<span class="muted" title="회수는 기사가 집화할 때 CJ가 번호를 매깁니다">집화 시 번호 부여</span>'
+              ${w.type === "recall" && !w.invoiceNo
+                ? '<span class="muted" title="회수는 기사가 집화할 때 CJ가 번호를 매깁니다 — [📥 회수 송장번호 받기]로 수집됩니다">집화 시 번호 부여</span>'
                 : `<button class="btn btn-sm" data-pdf="${w.wid}">PDF</button>`}
               ${canShip && !["canceled", "delivered"].includes(w.status)
                 ? `<button class="btn btn-ghost btn-sm" data-wbcancel="${w.wid}">취소</button>`
@@ -434,16 +794,92 @@ async function renderWaybillList(body) {
                     ? '<span class="muted" style="font-size:12px;" title="이미 고객에게 도착했습니다. 취소해도 택배사에는 반영되지 않습니다">배송 완료</span>'
                     : "")}
             </td>
-          </tr>`).join("") || `<tr><td colspan="7" class="muted">송장이 없습니다.</td></tr>`}
+          </tr>`).join("") || `<tr><td colspan="9" class="muted">송장이 없습니다.</td></tr>`}
         </tbody></table></div>
     </div>`;
   const doSearch = () => {
     f.q = $("#wf-q").value.trim(); f.status = $("#wf-status").value;
+    f.type = $("#wf-type").value; f.from = $("#wf-from").value; f.to = $("#wf-to").value;
     renderWaybillList(body);
   };
   $("#wf-search").addEventListener("click", doSearch);
+  ["#wf-status", "#wf-type", "#wf-from", "#wf-to"].forEach((sel) => {
+    const el = $(sel, body);
+    if (el) el.addEventListener("change", doSearch);
+  });
   autoSearch("#wf-q", doSearch);
   if (canShip) renderInvoicePush(body);
+
+  // ── 선택 일괄바 — 여러 건 골라 한 번에 인쇄/취소 ──────────────────────
+  const drawBulk = () => {
+    const bar = $("#wf-bulkbar", body);
+    if (!bar) return;
+    const n = state.wbPicked.size;
+    if (!n || !canShip) { bar.style.display = "none"; bar.innerHTML = ""; return; }
+    bar.style.display = "block";
+    bar.innerHTML = `
+      <div class="inline-row" style="background:var(--primary-soft); border-radius:8px; padding:8px 12px; margin:8px 0;">
+        <b>${n}건 선택됨</b>
+        <button class="btn btn-sm" id="wb-bulk-print" title="선택한 송장을 한 PDF로 합쳐 출력합니다(라벨 있는 건만)">🖨 선택 인쇄</button>
+        <button class="btn btn-sm" id="wb-bulk-cancel">⛔ 선택 취소</button>
+        <span style="flex:1"></span>
+        <button class="btn btn-ghost btn-sm" id="wb-bulk-clear">선택 해제</button>
+      </div>`;
+    $("#wb-bulk-clear", bar).addEventListener("click", () => {
+      state.wbPicked.clear();
+      $$(".wf-pick", body).forEach((cb) => { cb.checked = false; });
+      drawBulk();
+    });
+    $("#wb-bulk-print", bar).addEventListener("click", async () => {
+      // 라벨 없는 건(집화 전 회수 등)을 섞어 보내면 전체가 404로 거절된다 — 미리 거른다
+      const all = [...state.wbPicked];
+      const wids = all.filter((id) => (rows.find((x) => x.wid === id) || {}).hasLabel);
+      const skipped = all.length - wids.length;
+      if (!wids.length) { toast("인쇄할 라벨이 있는 송장이 없습니다.", true); return; }
+      if (skipped) toast(`라벨 없는 ${skipped}건은 빼고 인쇄합니다.`);
+      try {
+        const res = await fetch("/api/waybills/print", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ wids }),
+        });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "인쇄 실패");
+        const blob = await res.blob();
+        window.open(URL.createObjectURL(blob), "_blank");
+      } catch (err) { toast(err.message, true); }
+    });
+    $("#wb-bulk-cancel", bar).addEventListener("click", async () => {
+      const wids = [...state.wbPicked].filter((id) => {
+        const w = rows.find((x) => x.wid === id);
+        return w && !["canceled", "delivered"].includes(w.status);
+      });
+      if (!wids.length) { toast("취소할 수 있는 송장이 없습니다.", true); return; }
+      if (!confirm(`선택한 ${wids.length}건을 취소합니다. 계속할까요?`)) return;
+      let ok = 0, fail = 0;
+      for (const id of wids) {
+        try { await api(`/api/waybills/${id}/cancel`, { method: "POST" }); ok++; }
+        catch { fail++; }
+      }
+      toast(`취소 ${ok}건${fail ? ` · 실패 ${fail}건` : ""}`, ok === 0);
+      state.wbPicked.clear();
+      renderWaybillList(body);
+    });
+  };
+  $$(".wf-pick", body).forEach((cb) => cb.addEventListener("change", () => {
+    if (cb.checked) state.wbPicked.add(cb.dataset.wid);
+    else state.wbPicked.delete(cb.dataset.wid);
+    drawBulk();
+  }));
+  const allCb = $("#wf-all", body);
+  if (allCb) allCb.addEventListener("change", () => {
+    $$(".wf-pick", body).forEach((cb) => {
+      cb.checked = allCb.checked;
+      if (allCb.checked) state.wbPicked.add(cb.dataset.wid);
+      else state.wbPicked.delete(cb.dataset.wid);
+    });
+    drawBulk();
+  });
+  drawBulk();
+
   const trackBtn = $("#wf-track");
   if (trackBtn) trackBtn.addEventListener("click", async () => {
     trackBtn.disabled = true;
@@ -459,8 +895,27 @@ async function renderWaybillList(body) {
       trackBtn.textContent = "📡 배송추적 새로고침";
     }
   });
+  // 회수 송장번호 수집 — CJ가 집화 때 채번한 번호를 예약 기준으로 받아온다
+  const recallBtn = $("#wf-recallno");
+  if (recallBtn) recallBtn.addEventListener("click", async () => {
+    recallBtn.disabled = true;
+    recallBtn.textContent = "수집 중…";
+    try {
+      const r = await api("/api/waybills/recall-invoice-sync", { method: "POST", body: { days: 14 } });
+      toast(r.filled || r.staged
+        ? `송장번호 ${r.filled}건 수집 · 배송단계 ${r.staged}건 갱신`
+        : "새로 받아올 번호가 없습니다.");
+      renderWaybillList(body);
+    } catch (err) {
+      toast(err.message, true);
+      recallBtn.disabled = false;
+      recallBtn.textContent = "📥 회수 송장번호 받기";
+    }
+  });
   $$("button[data-pdf]", body).forEach((b) => b.addEventListener("click", () =>
     window.open(`/api/waybills/${b.dataset.pdf}/pdf`, "_blank")));
+  $$("button[data-wbpop]", body).forEach((b) => b.addEventListener("click", () =>
+    openWaybillPopup(b.dataset.wbpop)));
   $$("button[data-wbcancel]", body).forEach((b) => b.addEventListener("click", async () => {
     if (!confirm(`송장 ${b.dataset.wbcancel}을(를) 취소할까요?`)) return;
     try {

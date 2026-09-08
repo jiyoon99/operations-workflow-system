@@ -168,7 +168,7 @@ class St11Adapter(MallAdapter):
             # 헤더명은 소문자 openapikey.
             "openapikey": (self.s.get("api_key") or "").strip(),
             "Accept": "application/xml",
-            "User-Agent": "HMS/1.0",
+            "User-Agent": "OWS/1.0",
         }
 
     def _get(self, path):

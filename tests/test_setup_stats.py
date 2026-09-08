@@ -1,7 +1,7 @@
 """셋팅 실적 — 담당자별 대수(일/주/월/분기/연도) + 날짜별 캘린더.
 
 대표 정의(2026-07-29): "제품을 준비해서 검수완료까지 끝낸 것"을 한 대로 센다.
-원본(NAS 주문워크플로)에 있던 daily-stats·캘린더를 HMS로 이식하면서,
+원본(NAS 주문워크플로)에 있던 daily-stats·캘린더를 OWS로 이식하면서,
 대수 기준과 실적 주인을 명확히 못박는다.
 """
 import shutil
@@ -22,7 +22,7 @@ ADMIN_PW = "admin-pass-1"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-ss-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-ss-"))
         self.db_path = self.tmp / "test.db"
         self.app = create_app(db_path=self.db_path)
         self.app.testing = True
@@ -35,7 +35,7 @@ class Base(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _inspected(self, when, maker="정우석", checker=None, qty=1, assets=0):
+    def _inspected(self, when, maker="프로젝트 담당자", checker=None, qty=1, assets=0):
         """검수완료 주문 하나 만들기 — 검수 시각을 원하는 날짜로 박는다."""
         o = self.client.post("/api/orders", json={
             "recipient": "김하나", "productName": "노트북", "quantity": qty,
@@ -93,10 +93,10 @@ class TestSetupStats(Base):
     def test_credit_goes_to_maker_not_checker(self):
         """실적 주인은 만든 사람. 검수만 한 사람은 따로 표시하고 합계에 더하지 않는다."""
         today = date.today().isoformat()
-        self._inspected(today, maker="정우석", checker="김검수")
+        self._inspected(today, maker="프로젝트 담당자", checker="김검수")
         d = self._stats("day", today)
         by = {s["name"]: s for s in d["staff"]}
-        self.assertEqual(by["정우석"]["units"], 1)
+        self.assertEqual(by["프로젝트 담당자"]["units"], 1)
         self.assertEqual(by["김검수"]["units"], 0, "검수자가 셋팅 실적을 가져갔다")
         self.assertEqual(by["김검수"]["inspected"], 1)
         self.assertEqual(d["total"]["units"], 1, "같은 제품이 두 번 세어졌다")
@@ -121,14 +121,30 @@ class TestSetupStats(Base):
         year = self._stats("year", anchor.isoformat())
         self.assertEqual(year["total"]["units"], 3)          # 2026년 전체(6/30 포함)
 
+    def test_custom_date_range(self):
+        """통합 화면의 시작일·종료일 직접 선택은 두 날짜를 포함해 센다."""
+        self._inspected("2026-07-01", maker="A")
+        self._inspected("2026-07-10", maker="B")
+        self._inspected("2026-07-11", maker="C")
+        r = self.client.get("/api/reports/setup-stats?from=2026-07-01&to=2026-07-10")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        d = r.get_json()
+        self.assertEqual(d["period"]["type"], "custom")
+        self.assertEqual((d["period"]["from"], d["period"]["to"]),
+                         ("2026-07-01", "2026-07-10"))
+        self.assertEqual(d["total"]["units"], 2)
+        self.assertEqual(
+            self.client.get("/api/reports/setup-stats?from=2026-07-10&to=2026-07-01").status_code,
+            400)
+
     def test_calendar_has_per_day_and_staff(self):
-        self._inspected("2026-07-10", maker="정우석")
+        self._inspected("2026-07-10", maker="프로젝트 담당자")
         self._inspected("2026-07-10", maker="김철수")
-        self._inspected("2026-07-11", maker="정우석")
+        self._inspected("2026-07-11", maker="프로젝트 담당자")
         d = self._stats("month", "2026-07-15")
         cal = {c["date"]: c for c in d["calendar"]}
         self.assertEqual(cal["2026-07-10"]["units"], 2)
-        self.assertEqual(cal["2026-07-10"]["byStaff"]["정우석"], 1)
+        self.assertEqual(cal["2026-07-10"]["byStaff"]["프로젝트 담당자"], 1)
         self.assertEqual(cal["2026-07-11"]["units"], 1)
 
     def test_previous_period_comparison(self):
@@ -148,13 +164,13 @@ class TestSetupStats(Base):
         self.assertEqual(self._stats("day", today)["total"]["units"], 0)
 
     def test_day_detail_lists_orders(self):
-        self._inspected("2026-07-10", maker="정우석", qty=2, assets=2)
+        self._inspected("2026-07-10", maker="프로젝트 담당자", qty=2, assets=2)
         r = self.client.get("/api/reports/setup-day?date=2026-07-10")
         self.assertEqual(r.status_code, 200)
         d = r.get_json()
         self.assertEqual(d["units"], 2)
         self.assertEqual(len(d["orders"]), 1)
-        self.assertEqual(d["orders"][0]["productionBy"], "정우석")
+        self.assertEqual(d["orders"][0]["productionBy"], "프로젝트 담당자")
         self.assertEqual(d["orders"][0]["units"], 2)
 
     def test_bad_period_refused(self):
@@ -197,7 +213,7 @@ class TestShippingDateStability(Base):
         o = self._shipped()
         conn = sqlite3.connect(self.db_path)
         conn.execute("UPDATE orders SET shipping_at=?, shipping_by=? WHERE id=?",
-                     ("2026-06-15T10:00:00+09:00", "정우석", o["id"]))
+                     ("2026-06-15T10:00:00+09:00", "프로젝트 담당자", o["id"]))
         conn.commit(); conn.close()
 
         # 검수를 풀면 출고도 함께 풀린다 → 다시 체크
@@ -213,7 +229,7 @@ class TestShippingDateStability(Base):
         conn.close()
         self.assertTrue(at.startswith("2026-06-15"),
                         f"출고일이 오늘로 덮어써졌다: {at} — 지난달 매출이 이번 달로 넘어간다")
-        self.assertEqual(by, "정우석", "출고 담당자가 재체크한 사람으로 바뀌었다")
+        self.assertEqual(by, "프로젝트 담당자", "출고 담당자가 재체크한 사람으로 바뀌었다")
 
     def test_first_shipping_records_now(self):
         """처음 출고할 때는 당연히 지금 시각이 찍혀야 한다."""

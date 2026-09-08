@@ -29,7 +29,7 @@
     resp.content를 UTF-8로 직접 디코딩한다(한글 수취인/주소 깨짐 방지).
  7) 발송처리: ShippingDate는 '호출일 기준 2일 이내'만 허용되고, 주문확인(OrderCheck)이
     선행돼야 한다. 스타배송 주문은 계약 택배사만 가능(CJ대한통운=10013 / 한진 10007 /
-    롯데 10008) — 하프전자는 CJ이므로 기본값 10013.
+    롯데 10008) — 예시 운영사는 CJ이므로 기본값 10013.
  8) 페이징: 규격서상 페이징 파라미터가 명확히 확인되지 않았다. 잘려 들어오는 사고를 막으려
     PageNo를 올려가며 더 읽되, 서버가 파라미터를 무시하고 같은 페이지를 반복하면
     (첫/끝 주문번호+건수 시그니처가 같으면) 즉시 멈춘다. 무한루프 방지.
@@ -61,7 +61,7 @@ COLLECT_STATUSES = (1, 2)
 # 날짜조건: 1=주문일 (결제완료일/발송마감일 등 다른 값이 있으나 신규주문 수집은 주문일 기준)
 DATE_TYPE_ORDER = 1
 
-CJ_COURIER_CODE = "10013"      # CJ대한통운 (하프전자 기본 택배사)
+CJ_COURIER_CODE = "10013"      # CJ대한통운 (예시 운영사 기본 택배사)
 
 PAGE_SIZE = 200                # 서버가 무시할 수 있음 — 페이징 종료 판단용 힌트일 뿐
 MAX_PAGES = 30                 # 안전장치(한 조회창에서 최대 6,000건)
@@ -167,7 +167,7 @@ class EsmAdapter(MallAdapter):
                 "Authorization": f"Bearer {self._jwt()}",
                 "Content-Type": "application/json; charset=utf-8",
                 "Accept": "application/json",
-                "User-Agent": "HMS/1.0",
+                "User-Agent": "OWS/1.0",
             }
             raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
             try:

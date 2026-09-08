@@ -17,6 +17,9 @@ _STR_FIELDS = [
     ("productName", "product_name"),
     ("optionName", "option_name"),
     ("productCode", "product_code"),
+    # 몰이 URL에 쓰는 상품 식별자 — 상품명 링크를 '그 상품(옵션)'으로 보내기 위한 값
+    ("mallProductId", "mall_product_id"),
+    ("mallItemId", "mall_item_id"),
     ("recipient", "recipient"),
     ("phone", "phone"),
     ("postalCode", "postal_code"),
@@ -57,9 +60,10 @@ def insert_import_dict(conn, order: dict, created_by: str) -> int:
         amount = 0
     cur = conn.execute(
         "INSERT INTO orders(channel, order_no, import_key, dedupe_key, content_key, cross_key, "
-        "source_file, ordered_at, product_name, option_name, product_code, quantity, amount, "
+        "source_file, ordered_at, product_name, option_name, product_code, "
+        "mall_product_id, mall_item_id, quantity, amount, "
         "recipient, phone, postal_code, address, delivery_message, memo, raw, created_by, created_at, updated_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             (order.get("channel") or "").strip(),
             (order.get("orderNumber") or "").strip(),
@@ -72,6 +76,8 @@ def insert_import_dict(conn, order: dict, created_by: str) -> int:
             (order.get("productName") or "").strip(),
             (order.get("optionName") or "").strip(),
             (order.get("productCode") or "").strip(),
+            str(order.get("mallProductId") or "").strip(),
+            str(order.get("mallItemId") or "").strip(),
             qty, amount,
             (order.get("recipient") or "").strip(),
             (order.get("phone") or "").strip(),
@@ -100,9 +106,14 @@ def writeback_changed(conn, before_json: dict, after: list):
         now_json = json.dumps(o, ensure_ascii=False, sort_keys=True, default=str)
         if before_json.get(rid) == now_json:
             continue
+        # ★상품명/제품코드/주문일시도 되쓴다(2026-09-01) — 어댑터 키 누락으로 반쪽 저장된
+        #   주문(롯데온 사고)을 재수집이 보강하는데, 여기 UPDATE 에 컬럼이 빠져 있으면
+        #   merge 가 채운 값이 메모리에서만 살다 버려진다. (merge 는 빈 칸만 채우므로
+        #   사람이 고친 값을 덮을 일은 없다)
         conn.execute(
             "UPDATE orders SET phone=?, postal_code=?, address=?, delivery_message=?, "
-            "recipient=?, amount=?, pending_update=?, updated_at=? WHERE id=?",
+            "recipient=?, amount=?, product_name=?, product_code=?, ordered_at=?, "
+            "pending_update=?, updated_at=? WHERE id=?",
             (
                 (o.get("phone") or "").strip(),
                 (o.get("postalCode") or "").strip(),
@@ -110,6 +121,9 @@ def writeback_changed(conn, before_json: dict, after: list):
                 (o.get("deliveryMessage") or "").strip(),
                 (o.get("recipient") or "").strip(),
                 int(float(str(o.get("amount") or 0).replace(",", "") or 0)),
+                (o.get("productName") or "").strip(),
+                (o.get("productCode") or "").strip(),
+                (o.get("orderedAt") or "").strip(),
                 json.dumps(o["pendingShippingUpdate"], ensure_ascii=False)
                 if o.get("pendingShippingUpdate") else None,
                 config.now_iso(), rid,

@@ -1,4 +1,4 @@
-"""HMS Phase 0 테스트 — 인증/전역 게이트/권한/사용자 관리/카테고리/감사로그/백업/설정 마스킹."""
+"""OWS Phase 0 테스트 — 인증/전역 게이트/권한/사용자 관리/카테고리/감사로그/백업/설정 마스킹."""
 import json
 import shutil
 import sqlite3
@@ -19,7 +19,7 @@ USER_PW = "user-pass-12"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-test-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-test-"))
         self.db_path = self.tmp / "test.db"
         self.app = create_app(db_path=self.db_path)
         self.app.testing = True
@@ -81,7 +81,10 @@ class TestAuth(Base):
         for path in ("/api/users", "/api/categories", "/api/audit", "/api/settings", "/api/backups"):
             r = anon.get(path)
             self.assertEqual(r.status_code, 401, path)
-        self.assertEqual(anon.get("/api/health").status_code, 200)
+        health = anon.get("/api/health")
+        self.assertEqual(health.status_code, 200)
+        self.assertTrue(health.get_json()["ok"])
+        self.assertTrue(health.get_json()["database"])
 
     def test_login_lockout(self):
         self.setup_admin()
@@ -98,12 +101,12 @@ class TestAuth(Base):
     def test_session_persists_across_app_restart(self):
         """세션은 DB 영속 — 서버 재시작(새 앱 인스턴스) 후에도 로그인 유지."""
         self.setup_admin()
-        cookie = self.client.get_cookie("hms_session")
+        cookie = self.client.get_cookie("ows_session")
         self.assertIsNotNone(cookie)
         app2 = create_app(db_path=self.db_path)
         app2.testing = True
         c2 = app2.test_client()
-        c2.set_cookie("hms_session", cookie.value)
+        c2.set_cookie("ows_session", cookie.value)
         r = c2.get("/api/auth/me")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json()["username"], "admin")
@@ -264,7 +267,9 @@ class TestCategories(Base):
     def test_seed_and_crud(self):
         self.setup_admin()
         cats = self.client.get("/api/categories").get_json()
-        self.assertEqual([c["name"] for c in cats], ["PC", "태블릿", "모니터", "웨어러블", "기타"])
+        # 카테고리 = TMS 중분류 8종 축(2026-09-03, A5). 첫 항목 노트북이 sort 0 = 기본값
+        self.assertEqual([c["name"] for c in cats],
+                         ["노트북", "데스크탑", "태블릿", "모니터", "미니PC", "일체형PC", "주변기기", "웨어러블"])
         r = self.client.post("/api/categories", json={"name": "프린터"})
         self.assertEqual(r.status_code, 201)
         r = self.client.post("/api/categories", json={"name": "프린터"})  # 중복
@@ -308,16 +313,16 @@ class TestAuditSettingsBackup(Base):
     def test_settings_secret_masking(self):
         self.setup_admin()
         r = self.client.put("/api/settings", json={
-            "cj": {"cust_id": "30516776", "biz_reg_num": "1234567890", "env": "dev"},
+            "cj": {"cust_id": "00000000", "biz_reg_num": "1234567890", "env": "dev"},
         })
         self.assertEqual(r.status_code, 200)
         got = self.client.get("/api/settings").get_json()
-        self.assertEqual(got["cj"]["cust_id"], "30516776")
+        self.assertEqual(got["cj"]["cust_id"], "00000000")
         self.assertEqual(got["cj"]["env"], "dev")
         self.assertEqual(got["cj"]["biz_reg_num"], MASK)
         # 마스크 값을 그대로 되돌려보내면 원본 유지
         r = self.client.put("/api/settings", json={
-            "cj": {"cust_id": "30516776", "biz_reg_num": MASK, "env": "prod"},
+            "cj": {"cust_id": "00000000", "biz_reg_num": MASK, "env": "prod"},
         })
         self.assertEqual(r.status_code, 200)
         row = self.db().execute("SELECT value FROM settings WHERE key='cj'").fetchone()
@@ -328,7 +333,7 @@ class TestAuditSettingsBackup(Base):
     def test_backups(self):
         self.setup_admin()  # 쓰기 발생 → 일별 백업 생성
         bdir = self.db_path.parent / "backups"
-        self.assertTrue(any(bdir.glob("hms-*.db")))
+        self.assertTrue(any(bdir.glob("ows-*.db")))
         r = self.client.post("/api/backups/run")
         self.assertEqual(r.status_code, 200)
         listed = self.client.get("/api/backups").get_json()["backups"]

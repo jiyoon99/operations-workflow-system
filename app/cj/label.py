@@ -8,18 +8,40 @@ import re
 from datetime import datetime
 
 
+def join_items(items: list, line_break: bool = True) -> str:
+    """품목 조각을 상품명 칸 한 덩이로 — 한 곳에서만 만든다.
+
+    ★항목에 br=True 가 있으면 그 앞에서 줄을 바꾼다(대표 2026-08-24: 자산번호를 그 줄에만).
+      렌더러의 wrap_mm 이 줄바꿈 문자를 살린다.
+    ★line_break=False 면 2026-08-24 이전과 똑같이 ' / '로만 잇는다 — 설정에서 되돌리는 길.
+    ★견본 운송장도 이 함수를 쓴다. 두 곳에서 따로 만들면 종이와 화면이 어긋난다.
+    """
+    parts, out = [], ''
+    for it in (items or []):
+        if not it.get('name'):
+            continue
+        one = f"{it.get('name')}{(' x' + str(it.get('qty')) if it.get('qty') else '')}".strip()
+        if line_break and it.get('br') and out:
+            parts.append(out)
+            out = one
+        else:
+            out = f"{out} / {one}" if out else one
+    if out:
+        parts.append(out)
+    return (chr(10) if line_break else ' / ').join(parts)[:120]
+
+
 def _cj2_label(invc: str, rcpt_ymd: str, sender: dict, receiver: dict, items: list,
                refine: dict, frt_dv: str = '03', kind: str = 'ship', remark: str = '',
-               default_item: str = '렌탈 장비') -> dict:
+               default_item: str = '렌탈 장비', line_break: bool = True,
+               item_lines: int = 4) -> dict:
     """운송장 자체출력용 라벨 데이터(1.5인치 표준양식 항목). 주소정제 응답 + 발/착/상품 조합."""
     refine = refine or {}
     clsf = (refine.get('CLSFCD') or '').strip()
     sub  = (refine.get('SUBCLSFCD') or '').strip()
     brannm = (refine.get('CLLDLVBRANNM') or '').strip()
     nick   = (refine.get('CLLDLVEMPNICKNM') or '').strip()
-    item_summary = ' / '.join(
-        f"{(it.get('name') or '')}{(' x' + str(it.get('qty')) if it.get('qty') else '')}".strip()
-        for it in (items or []) if it.get('name'))[:120]
+    item_summary = join_items(items, line_break)
     return {
         'invoice_no': invc, 'rcpt_ymd': re.sub(r'[^0-9]', '', rcpt_ymd or '') or datetime.now().strftime('%Y%m%d'),
         'kind': kind,
@@ -29,13 +51,15 @@ def _cj2_label(invc: str, rcpt_ymd: str, sender: dict, receiver: dict, items: li
         'p2pcd': (refine.get('P2PCD') or '') or '',
         'sender': sender, 'receiver': receiver, 'item_summary': item_summary or default_item,
         'frt_dv': frt_dv, 'frt_dv_nm': {'01': '선불', '02': '착불', '03': '신용'}.get(frt_dv, ''),
+        # ★상품명 칸 줄수 — 설정에서 되돌릴 수 있게 데이터로 넘긴다(2026-08-24)
+        'item_lines': item_lines,
         'remark': (remark or '')[:60],
     }
 
 
 # 자체출력 테스트용 샘플 라벨 (API 없이 레이아웃·인쇄 검수)
 def _cj2_sample_label(sender: dict = None) -> dict:
-    """원본은 설정(cj.sender)에서 보내는분을 읽었음 — HMS에서는 sender dict 인자(없으면 안내 문구)."""
+    """원본은 설정(cj.sender)에서 보내는분을 읽었음 — OWS에서는 sender dict 인자(없으면 안내 문구)."""
     snd = dict(sender or {})
     return {
         'invoice_no': '650000000033', 'rcpt_ymd': datetime.now().strftime('%Y%m%d'), 'kind': 'ship',
@@ -46,5 +70,5 @@ def _cj2_sample_label(sender: dict = None) -> dict:
         'receiver': {'name': '홍길동', 'tel': '010-1234-5678',
                      'addr': '서울특별시 강남구 테헤란로 152', 'addr_detail': '강남파이낸스센터 10층 1001호'},
         'sender': snd if snd.get('name') else
-                  {'name': '하프북', 'tel': '02-0000-0000', 'addr': '(설정 > CJ대한통운에서 출고지 입력)', 'addr_detail': ''},
+                  {'name': '업무관리', 'tel': '02-0000-0000', 'addr': '(설정 > CJ대한통운에서 출고지 입력)', 'addr_detail': ''},
     }

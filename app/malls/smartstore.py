@@ -9,7 +9,7 @@
 - 발송처리: POST /external/v1/pay-order/seller/product-orders/dispatch
   productOrderId 단위. 주문번호(orderId)만 알면 됨 — 상품주문 ID는 전송 시점에 조회한다.
 
-RMS(rental-system)에서 실운영으로 검증한 연동을 HMS 규율로 다시 지었다.
+RMS(rental-system)에서 실운영으로 검증한 연동을 OWS 규율로 다시 지었다.
 
 ★몰별 함정(RMS 실운영에서 확인)
 1) 상태 필터에 PAYMENT_WAITING/PRODUCT_PREPARE를 넣으면 400이 난다(이 엔드포인트가
@@ -34,6 +34,12 @@ import requests
 from .base import (MallAdapter, MallError, cached_token, check_cooldown, drop_token,
                    pick_product_code, register, set_cooldown, store_token)
 
+# 우리 스토어 주소(대표 2026-08-14 제공) — 상품명 링크를 상품 페이지로 보낼 때 쓴다.
+# ★설정(스마트스토어 ▸ 스토어 주소)에 값이 있으면 그쪽이 이긴다. 여기 있는 건
+#   '아직 아무것도 안 넣었을 때'의 기본값이다(라이브 DB에 직접 쓰지 않기 위한 방식).
+# ★렌탈(RMS)과 판매(OWS)가 같은 스마트스토어 계정을 쓴다 — 그래서 주소가 ExampleShare이다.
+DEFAULT_STORE_URL = "https://smartstore.naver.com/ExampleShare"
+
 BASE_URL = "https://api.commerce.naver.com/external/v1"
 TOKEN_URL = f"{BASE_URL}/oauth2/token"
 ORDERS_PATH = "/pay-order/seller/product-orders"
@@ -49,8 +55,8 @@ DEFAULT_COURIER = "CJGLS"           # 네이버 택배사 코드표의 CJ대한�
 # (DELIVERING/DELIVERED/PURCHASE_DECIDED는 이미 나간 주문, CANCELED류는 취소)
 NEW_ORDER_STATUSES = {"PAYED", "PRODUCT_PREPARE"}
 
-# ★같은 스마트스토어 계정에 렌탈(RMS)과 판매(HMS) 상품이 함께 올라가 있다.
-#   렌탈 주문이 HMS로 들어오면 판매팀이 렌탈 주문에 노트북을 '판매 출고'하는 사고가 난다.
+# ★같은 스마트스토어 계정에 렌탈(RMS)과 판매(OWS) 상품이 함께 올라가 있다.
+#   렌탈 주문이 OWS로 들어오면 판매팀이 렌탈 주문에 노트북을 '판매 출고'하는 사고가 난다.
 #   RMS는 반대로 판매 상품을 걸러낸다(화이트리스트+미분류 태깅) — 그 거울상이다.
 #   상품명에 이 말이 들어가면 상품번호 등록 전이라도 렌탈로 보고 제외한다.
 RENTAL_KEYWORDS = ("렌탈", "렌트", "대여", "임대", "사용기간")
@@ -252,7 +258,7 @@ class SmartStoreAdapter(MallAdapter):
         option = _s(po.get("productOption") or po.get("productOptionText")
                     or po.get("optionName"))
 
-        # ★렌탈 상품 주문은 HMS(판매)로 가져오지 않는다 — RMS(렌탈) 몫이다.
+        # ★렌탈 상품 주문은 OWS(판매)로 가져오지 않는다 — RMS(렌탈) 몫이다.
         product_id = _s(po.get("productId") or po.get("productNo"))
         # ★제품코드는 '판매자상품코드'에 들어온다(대표 확인 2026-08-04).
         #   네이버는 응답 스키마에서 이 칸 이름이 여러 가지라 알려진 후보를 모두 본다.
@@ -293,6 +299,8 @@ class SmartStoreAdapter(MallAdapter):
                 memo=("⚠분류 미등록 상품 — 렌탈 주문이면 설정>스마트스토어에서 "
                       f"상품번호 {product_id}를 렌탈로 등록하세요" if klass == "unknown" else ""),
                 productCode=sku or product_id,
+                # 상품 페이지 링크용 상품번호(2026-08-14) — 스토어 주소와 합쳐 URL을 만든다
+                mallProductId=product_id,
                 quantity=qty,
                 amount=amount,
                 recipient=_s(sa.get("name")) or _s(order.get("ordererName")),
@@ -312,6 +320,48 @@ class SmartStoreAdapter(MallAdapter):
                                         if bucket["optionName"] else option)[:300]
             bucket["quantity"] += qty
             bucket["amount"] += amount
+
+    # ---- 상품 조회(코드 스펙 동기화용) --------------------------------
+    def search_goods(self, keyword="", field="auto", size=20):
+        """판매자관리코드(=우리 제품코드, 고도몰과 동일 축 — 대표 확인 2026-08-13)로
+        상품을 조회한다. 반환 모양은 고도몰 search_goods와 같은 dict 규약.
+
+        ★네이버엔 고도몰의 '짧은설명(소제목)' 같은 스펙 전용 칸이 없다 — 스펙 파싱은
+          상품명 텍스트로 한다(상품명에 DDR4/NVMe 표기가 있으면 잡힌다).
+        ★이름 검색(field='name')은 미지원 — 코드 검색만 쓴다(소비처가 그것뿐이다).
+        ★응답 스키마가 {contents:[{channelProducts:[...]}]} / 평평한 목록 두 모양이
+          있어 둘 다 받는다(주문 수집의 _contents 방어와 같은 이유).
+        """
+        keyword = _s(keyword)
+        if not keyword:
+            return []
+        size = max(1, min(int(size or 20), 100))
+        data = self._call("POST", "/products/search",
+                          body={"sellerManagementCode": keyword, "page": 1, "size": size})
+        self.pace()
+        out = []
+        for row in self._contents(data):
+            chans = row.get("channelProducts") or [row]
+            for cp in chans:
+                if not isinstance(cp, dict):
+                    continue
+                code = _s(cp.get("sellerManagementCode") or row.get("sellerManagementCode"))
+                nm = _s(cp.get("name") or cp.get("productName") or row.get("name"))
+                if not (code or nm):
+                    continue
+                stock = _num(cp.get("stockQuantity"))
+                out.append({
+                    "goodsCd": code, "goodsNm": nm,
+                    "shortDescription": "",            # 네이버엔 소제목 칸이 없다
+                    "modelNo": _s(cp.get("modelName")),
+                    "price": _num(cp.get("salePrice")), "priceText": "",
+                    "fixedPrice": 0, "maker": _s(cp.get("brandName")),
+                    "state": _s(cp.get("statusType")),
+                    "stateLabel": _s(cp.get("statusType")),
+                    "stock": stock, "soldOut": stock == 0,
+                    "sellFl": "", "openFl": "",
+                })
+        return out[:size]
 
     # ---- 연결 테스트 -------------------------------------------------
     def test_connection(self):

@@ -1,13 +1,13 @@
 @echo off
 REM ============================================================
-REM  HMS STATUS - is it running, and what is it running on?
-REM  ASCII-only on purpose (see HMS-STOP.bat).
+REM  OWS STATUS - is it running, and what is it running on?
+REM  ASCII-only on purpose (see OWS-STOP.bat).
 REM ============================================================
 setlocal
 cd /d "%~dp0"
 
 echo.
-echo   ==================== HMS STATUS ====================
+echo   ==================== OWS STATUS ====================
 echo   folder : %~dp0
 echo.
 
@@ -23,17 +23,17 @@ if errorlevel 1 (
 
 REM --- stop signal ---
 if exist "data\watchdog.stop" (
-  echo   stop signal   : PRESENT - HMS-START.bat will clear it
+  echo   stop signal   : PRESENT - OWS-START.bat will clear it
 ) else (
   echo   stop signal   : none
 )
 
 REM --- auto start ---
-schtasks /Query /TN "HalfbookSystemAutoStart" /FO LIST >nul 2>&1
+schtasks /Query /TN "OperationsSystemAutoStart" /FO LIST >nul 2>&1
 if errorlevel 1 (
-  echo   auto-start    : NOT REGISTERED - run HMS-SETUP.bat
+  echo   auto-start    : NOT REGISTERED - run OWS-SETUP.bat
 ) else (
-  for /f "tokens=2 delims=:" %%S in ('schtasks /Query /TN "HalfbookSystemAutoStart" /FO LIST ^| findstr /R /C:"^Status" /C:"^Scheduled Task State"') do (
+  for /f "tokens=2 delims=:" %%S in ('schtasks /Query /TN "OperationsSystemAutoStart" /FO LIST ^| findstr /R /C:"^Status" /C:"^Scheduled Task State"') do (
     echo   auto-start    : %%S
   )
 )
@@ -47,17 +47,17 @@ if errorlevel 1 goto :badvenv
 echo   venv          : ok
 goto :dbcheck
 :novenv
-echo   venv          : MISSING - run HMS-SETUP.bat
+echo   venv          : MISSING - run OWS-SETUP.bat
 goto :dbcheck
 :badvenv
-echo   venv          : BROKEN on this machine - run HMS-SETUP.bat
+echo   venv          : BROKEN on this machine - run OWS-SETUP.bat
 :dbcheck
 
 REM --- database ---
-if not exist "data\hms.db" (
+if not exist "data\ows.db" (
   echo   database      : MISSING
 ) else (
-  for %%F in ("data\hms.db") do echo   database      : %%~zF bytes, last change %%~tF
+  for %%F in ("data\ows.db") do echo   database      : %%~zF bytes, last change %%~tF
 )
 
 REM --- last backup ---

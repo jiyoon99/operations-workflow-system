@@ -190,7 +190,7 @@ class TestSmsResend(unittest.TestCase):
     def setUp(self):
         import shutil, tempfile
         from app import auth as auth_mod, create_app
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-sms-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-sms-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.app = create_app(db_path=self.tmp / "t.db")
         self.app.testing = True

@@ -1,5 +1,7 @@
 # Python / local runtime
 venv/
+.venv/
+venv_new/
 venv.broken-*/
 __pycache__/
 *.py[cod]
@@ -21,6 +23,10 @@ backups/
 *.sqlite3
 *.log
 *.pid
+*.key
+*.pem
+bridge_token.txt
+static/capture-*.html
 
 # Local exports and business documents
 tms-export/

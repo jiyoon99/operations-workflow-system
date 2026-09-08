@@ -1,12 +1,12 @@
 """기존 QC 프로그램(order-workflow) 데이터 이관.
 
-NAS 백업의 data/orders.json + data/users.json을 HMS로 그대로 옮긴다.
+NAS 백업의 data/orders.json + data/users.json을 OWS로 그대로 옮긴다.
 
 옮겨지는 것
 - 사용자: 비밀번호 해시가 같은 형식(pbkdf2_sha256$310000$…)이라 **기존 비밀번호 그대로 로그인**된다.
-  구 역할(owner/admin/sales_manager/md/as_manager/worker)은 HMS 메뉴 권한으로 환산한다.
+  구 역할(owner/admin/sales_manager/md/as_manager/worker)은 OWS 메뉴 권한으로 환산한다.
 - 주문: 단계별 담당자·시각(누가 준비/제작/검수/출고했는지)을 그대로 보존한다.
-- 관리번호: TMS 형식(YYMMDD-NNNN)이라 HMS 자산으로 만들고 주문에 매칭한다.
+- 관리번호: TMS 형식(YYMMDD-NNNN)이라 OWS 자산으로 만들고 주문에 매칭한다.
   이미 있는 자산이면 그것을 쓰고, 없으면 '이관 자산'으로 새로 만든다.
 
 재실행해도 안전하다 — 아이디·주문키·관리번호로 중복을 건너뛴다.
@@ -30,7 +30,7 @@ _PW_HASH_RE = re.compile(r"^pbkdf2_sha256\$\d{4,}\$[A-Za-z0-9+/=_-]{8,}\$[A-Za-z
 # (이관 파일만으로 관리자가 만들어지면 그게 곧 권한 상승 통로다. 승격은 대표가 화면에서 한다.)
 TOP_ROLE_PERMS = sorted(PERM_CODES)
 
-# 구 역할 → HMS 권한. 그 사람이 하던 일을 그대로 할 수 있는 최소 권한으로 맞춘다.
+# 구 역할 → OWS 권한. 그 사람이 하던 일을 그대로 할 수 있는 최소 권한으로 맞춘다.
 ROLE_PERMS = {
     "owner": "__admin__",
     "developer": "__admin__",
@@ -157,32 +157,42 @@ def _plan(conn, orders, users):
 
     # ★이미 들어온 주문이라도 '단계가 더 진행됐으면' 그건 갱신해야 한다.
     #   예전에는 중복이면 통째로 건너뛰어서, 첫 취입 뒤 QC에서 셋팅·검수·출고를 끝내도
-    #   HMS는 옛날 상태 그대로였다(2026-08-04 실측: 745건 중 37건 56개 플래그가 어긋나 있었다).
+    #   OWS는 옛날 상태 그대로였다(2026-08-04 실측: 745건 중 37건 56개 플래그가 어긋나 있었다).
     #   대표가 이 파일을 '목록 최신화'로 쓰므로 갱신이 되어야 목적에 맞는다.
     have_rows = {r["import_key"]: r for r in conn.execute(
         "SELECT import_key, preparing, production_done, inspection_done, shipping_done, "
         "       archived_at, archive_reason "
         "FROM orders WHERE import_key != ''").fetchall()}
 
-    new_orders, dup_orders, adv_orders = [], [], []
+    new_orders, dup_orders, adv_orders, link_orders = [], [], [], []
     asset_nos = []
     for o in orders:
         key = _s(o.get("importKey")) or f"qc-{_s(o.get('id'))}"
+        mns = _mgmt_numbers(o)
         if key in have_keys:
             fwd = _advance_fields(have_rows.get(key), o)
             if fwd:
                 adv_orders.append((key, o, fwd))
             else:
                 dup_orders.append(o)
+            # ★이미 있는 주문의 관리번호도 걷는다(2026-08-10 대표 승인).
+            #   예전엔 새 주문만 연결해서, 먼저 수집돼 있던 주문은 QC에 번호가
+            #   적혀 있어도 영영 미매칭으로 남았다(8월 실측 12건).
+            if mns:
+                link_orders.append((key, o))
+                for mn in mns:
+                    if mn not in asset_nos:
+                        asset_nos.append(mn)
             continue
         new_orders.append((key, o))
-        for mn in _mgmt_numbers(o):
+        for mn in mns:
             if mn not in asset_nos:
                 asset_nos.append(mn)
     new_assets = [a for a in asset_nos if a not in have_assets]
     return {
         "newUsers": new_users, "dupUsers": dup_users,
         "newOrders": new_orders, "dupOrders": dup_orders, "advOrders": adv_orders,
+        "linkOrders": link_orders,
         "newAssets": new_assets, "haveAssets": have_assets,
     }
 
@@ -206,7 +216,7 @@ def _advance_fields(row, o):
     """이미 있는 주문에서 '앞으로 나간 단계'만 뽑는다.
 
     ★전진만 반영한다(미완료 → 완료). 되돌리지 않는다.
-      HMS에서도 같은 주문을 만지고 있어서, 파일이 옛것이면 되돌리기가 일을 지운다.
+      OWS에서도 같은 주문을 만지고 있어서, 파일이 옛것이면 되돌리기가 일을 지운다.
       끝난 일을 안 끝난 것으로 만드는 사고는 되돌릴 방법이 없다.
     """
     if row is None:
@@ -231,7 +241,7 @@ def _advance_fields(row, o):
             if _s(o.get(src_at)):
                 out[col_at] = _s(o.get(src_at))
     # ★보관(마감)도 같은 '전진만' 규칙으로 따라온다. 단계만 옮기고 마감을 두고 오면
-    #   QC에서 닫은 주문이 HMS에선 계속 열려 있어 '한쪽에서만 닫힌 주문'이 쌓인다
+    #   QC에서 닫은 주문이 OWS에선 계속 열려 있어 '한쪽에서만 닫힌 주문'이 쌓인다
     #   (2026-08-04 감사: 전진철·해피모바일 2건). 해제는 절대 하지 않는다.
     if _s(o.get("archivedAt")) and not row["archived_at"]:
         out["archived_at"] = _s(o.get("archivedAt"))
@@ -260,7 +270,9 @@ def qc_preview():
                             "role": _s(u.get("role")),
                             "grant": f"{len(_grant_perms(_s(u.get('role'))))}개 권한"}
                            for u in p["newUsers"]]},
-        "assets": {"toCreate": len(p["newAssets"]), "sample": p["newAssets"][:10]},
+        "assets": {"toCreate": len(p["newAssets"]), "sample": p["newAssets"][:10],
+                   # 이미 있는 주문 중 관리번호가 적혀 있어 연결(백필) 대상인 것
+                   "linkExisting": len(p.get("linkOrders", []))},
         "sample": [{"channel": _clean_channel(o.get("channel")), "orderNumber": _s(o.get("orderNumber")),
                     "productName": _s(o.get("productName"))[:40], "recipient": _s(o.get("recipient")),
                     "관리번호": ", ".join(_mgmt_numbers(o))}
@@ -314,9 +326,12 @@ def qc_run():
         cat_id = cat["id"] if cat else None
         assets = dict(p["haveAssets"])
         for no in p["newAssets"]:
+            # ★tier를 명시한다 — 라이브 DB의 assets.tier 컬럼은 2026-08-04에
+            #   DEFAULT '양품'으로 추가됐고 SQLite는 그 저장 기본값을 영영 못 바꾼다.
+            #   생략하면 개명(양품→가용) 뒤에도 옛 값이 여기서 되살아난다(2026-08-08 검토).
             cur = conn.execute(
-                "INSERT INTO assets(asset_no, category_id, grade, status, notes, created_by, "
-                "created_at, updated_at) VALUES(?,?,'미정','shipped',?,?,?,?)",
+                "INSERT INTO assets(asset_no, category_id, grade, status, tier, notes, created_by, "
+                "created_at, updated_at) VALUES(?,?,'미정','shipped','가용',?,?,?,?)",
                 (no, cat_id, "[이관] QC 프로그램 주문에 기록된 관리번호", actor, ts, ts))
             assets[no] = cur.lastrowid
             asset_event(conn, cur.lastrowid, "이관등록", {"출처": "QC 프로그램", "관리번호": no})
@@ -356,7 +371,7 @@ def qc_run():
                 matched += 1
 
         # 3) 이미 있는 주문의 '더 진행된 단계'를 반영한다(전진만).
-        #    ★취소·보관 같은 상태는 손대지 않는다 — 여기서 건드리면 HMS 쪽 판단을 뒤집는다.
+        #    ★취소·보관 같은 상태는 손대지 않는다 — 여기서 건드리면 OWS 쪽 판단을 뒤집는다.
         for _key, o, fwd in p["advOrders"]:
             cols = list(fwd.keys())
             conn.execute(
@@ -366,19 +381,51 @@ def qc_run():
             advanced += 1
             advanced_stages += len([c for c in cols if c in _STAGE_LABEL])
 
+        # 4) ★이미 있는 주문에도 관리번호 자산을 이어 준다(2026-08-10 대표 승인).
+        #    예전엔 새로 만드는 주문에만 연결해서, OWS가 먼저 수집한 주문은 QC에
+        #    번호가 적혀 있어도 영영 미매칭으로 남았다. 이미 연결돼 있으면 건너뛴다.
+        linked_existing = 0
+        for _key, o in p.get("linkOrders", []):
+            row = conn.execute(
+                "SELECT id, order_no, recipient, channel FROM orders WHERE import_key=?",
+                (_key,)).fetchone()
+            if row is None:
+                continue
+            for mn in _mgmt_numbers(o):
+                aid = assets.get(mn)
+                if not aid:
+                    continue
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO order_assets(order_id, asset_id, prev_status, "
+                    "matched_by, matched_at) VALUES(?,?,?,?,?)",
+                    (row["id"], aid, "ready",
+                     _s(o.get("managementNumberBy")) or "이관",
+                     _s(o.get("managementNumberAt")) or ts))
+                if cur.rowcount:
+                    # 자산 이력에도 남긴다 — '이 기계가 누구에게 나갔는지'가 목적이므로
+                    asset_event(conn, aid, "주문매칭", {
+                        "orderId": row["id"], "주문번호": row["order_no"] or "",
+                        "수취인": row["recipient"] or "", "채널": row["channel"] or "",
+                        "출처": "QC 이관(기존 주문 연결)"})
+                    linked_existing += 1
+
         audit.log("qc_migrated", target=f"주문 {created_o} / 사용자 {created_u} / 자산 {created_a}",
                   detail={"orders": created_o, "users": created_u, "assets": created_a,
                           "matched": matched, "advanced": advanced,
+                          "linkedExisting": linked_existing,
                           "계정": imported_names})   # 누가 생겼는지 남긴다
 
     msg = (f"주문 {created_o}건, 사용자 {created_u}명, 자산 {created_a}대를 옮겼습니다.")
     if advanced:
         msg += f" 이미 있던 주문 {advanced}건의 진행 단계({advanced_stages}개)를 최신으로 맞췄습니다."
+    if linked_existing:
+        msg += f" 이미 있던 주문에 자산 {linked_existing}대를 새로 연결했습니다."
     return jsonify({
         "ok": True,
         "orders": {"created": created_o, "duplicates": len(p["dupOrders"]),
                    "advanced": advanced, "advancedStages": advanced_stages},
         "users": {"created": created_u, "duplicates": len(p["dupUsers"])},
-        "assets": {"created": created_a, "matched": matched},
+        "assets": {"created": created_a, "matched": matched,
+                   "linkedExisting": linked_existing},
         "message": msg + " 직원들은 쓰던 비밀번호 그대로 로그인할 수 있습니다.",
     })

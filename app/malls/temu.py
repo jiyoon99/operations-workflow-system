@@ -22,6 +22,18 @@
    한글이 섞여도 서버가 JSON을 먼저 디코드해 검증하므로 UTF-8로 해시하면 된다.
 5) 금액 단위(원/센트)와 통화가 문서상 미확정이다. 소수점이 있으면 반올림해 정수로 만들고,
    KRW가 아닌 통화면 memo에 통화를 남겨 대표가 확인할 수 있게 했다.
+6) ★★키가 나오면 **금액 기준부터 맞춰야 한다** — 지금 이 경로는 정산 가산율을 안 건다.
+   대표 확정(2026-09-07): 테무는 부가세를 뺀 판매가로 주문을 주고, 정산은 거기에
+   +10.75% 다. 엑셀 임포터는 그래서 주문 합계에 가산율을 건다
+   (app/importers/mall_excel.py temu_settlement_amount).
+   여기서 같이 걸지 않은 이유는 위 3)·5) 그대로다 — 이 어댑터가 amount 로 집는
+   goodsAmount/salePrice 류가 '우리 판매가'인지 '소비자 결제 총액'인지 응답 스펙이
+   확정되지 않았다. 소비자 결제 총액이면 부가세가 이미 들어 있어 한 번 더 곱하는 순간
+   매출이 통째로 부풀고, 아무 화면에서도 안 걸린다. 그래서 확인 전에는 안 건다.
+   ★이 어댑터와 엑셀은 importKey(`테무:{주문ID}`)를 공유하므로, 켜는 순간 같은 주문이
+     수집 경로에 따라 다른 금액이 되고 '먼저 들어온 쪽이 이긴다'. 켜기 전에 실주문
+     1건을 테무 정산 명세서와 대조해 기준을 확정하고, 그 결과대로 여기서도
+     temu_settlement_amount 를 부르거나 부르지 않도록 정해야 한다.
 
 키 발급 전에는 설정에서 '테무 사용'이 꺼져 있어 어댑터 자체가 만들어지지 않는다.
 """
@@ -243,7 +255,7 @@ class TemuAdapter(MallAdapter):
             resp = requests.post(
                 self._endpoint(), json=params, timeout=timeout,
                 headers={"Content-Type": "application/json;charset=UTF-8",
-                         "Accept": "application/json", "User-Agent": "HMS/1.0"})
+                         "Accept": "application/json", "User-Agent": "OWS/1.0"})
         except requests.Timeout as e:
             raise MallError(f"테무 응답이 {timeout}초 안에 오지 않았습니다(네트워크/게이트웨이 확인).") from e
         except requests.RequestException as e:

@@ -1,6 +1,6 @@
 """자체 XLSX 파서 (순수 stdlib).
 
-하프북 주문 워크플로 원본(src/excel.py) 이식본.
+업무관리 주문 워크플로 원본(src/excel.py) 이식본.
 - .xlsx: zipfile + ElementTree로 직접 파싱
 - .xls: LibreOffice headless 변환에 의존(미설치 시 명확한 한국어 에러)
 - 확장자만 .xls인 HTML 표 파일도 지원
@@ -95,7 +95,7 @@ def _read_html_table(content: bytes) -> list[dict[str, str]]:
         return []
     headers = [value.strip().replace("\n", "") for value in parser.rows[0]]
     return [
-        {header: row[index] if index < len(row) else "" for index, header in enumerate(headers) if header}
+        _row_dict(headers, row)
         for row in parser.rows[1:]
         if any(value.strip() for value in row)
     ]
@@ -141,6 +141,25 @@ def _convert_xls_to_xlsx(content: bytes) -> bytes:
         if result.returncode != 0 or not converted.exists():
             raise ValueError(".xls 파일 변환에 실패했습니다. 올바른 .xls 파일인지 확인하세요.")
         return converted.read_bytes()
+
+
+def _row_dict(headers: list[str], row: list) -> dict[str, str]:
+    """헤더 목록 + 한 행 → dict.
+
+    ★같은 헤더 이름이 두 번 나올 때 '빈 값'이 앞의 값을 덮지 않게 한다(2026-09-01).
+      테무 주문 엑셀은 '수령인 이름' 열이 두 개(앞에 실제 이름, 뒤는 빈 칸)라서,
+      단순 dict 변환이면 뒤의 빈 칸이 이름을 지워 수취인이 사라진다(송장 발행 불가).
+      값이 있는 쪽을 남기는 것이 어느 양식에서도 안전하다.
+    """
+    out: dict[str, str] = {}
+    for index, header in enumerate(headers):
+        if not header:
+            continue
+        value = row[index] if index < len(row) else ""
+        if header in out and not str(value).strip():
+            continue                       # 중복 헤더의 빈 칸 — 앞의 값을 지키다
+        out[header] = value
+    return out
 
 
 def read_first_sheet(content: bytes, source_file: str = "") -> list[dict[str, str]]:
@@ -200,7 +219,7 @@ def read_first_sheet(content: bytes, source_file: str = "") -> list[dict[str, st
     if not any(headers):
         return []
     return [
-        {header: row[index] if index < len(row) else "" for index, header in enumerate(headers) if header}
+        _row_dict(headers, row)
         for row in rows[header_index + 1:]
         if any(str(value).strip() for value in row)
     ]

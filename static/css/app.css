@@ -1,4 +1,4 @@
-/* HMS — HALFBOOK 디자인 토큰(에메랄드) 기반. 다크모드는 [data-theme="dark"] */
+/* OWS — OPERATIONS 디자인 토큰(에메랄드) 기반. 다크모드는 [data-theme="dark"] */
 :root {
   --primary: #059669;
   --primary-deep: #006948;
@@ -76,6 +76,42 @@ input, select, textarea { font: inherit; color: inherit; }
 }
 .brand { font-size: 24px; font-weight: 800; letter-spacing: 1px; color: var(--primary); padding: 22px 20px 14px; }
 .brand span { display: block; font-size: 12px; font-weight: 500; letter-spacing: 0; color: var(--text-dim); margin-top: 2px; }
+/* 업데이트 내역 버튼(브랜드 바로 아래, 좌측 상단) — 대표 2026-08-14 */
+.whatsnew-btn {
+  display: flex; align-items: center; gap: 6px; width: calc(100% - 24px);
+  margin: 0 12px 8px; padding: 8px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--slate-soft);
+  color: var(--text); font-size: 13px; font-weight: 600; text-align: left;
+}
+.whatsnew-btn:hover { background: var(--primary-soft); color: var(--primary); }
+.whatsnew-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--danger);
+  margin-left: auto; flex: 0 0 auto;
+}
+/* 업데이트 내역 — 날짜별 카드(RMS와 같은 모양으로 맞춤, 2026-08-17) */
+.wn-day { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin: 0 0 12px; }
+.wn-day-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  background: var(--slate-soft); border-bottom: 1px solid var(--border);
+}
+.wn-day-head b { font-size: 14px; font-weight: 800; }
+.wn-today {
+  font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+  background: var(--primary-soft); color: var(--primary);
+}
+.wn-meta { margin-left: auto; font-size: 11px; color: var(--text-dim); }
+.wn-day ol { margin: 0; padding: 8px 18px 10px 34px; }
+.wn-day li { font-size: 13px; line-height: 1.8; }
+.wn-editor {
+  border: 2px solid var(--primary-soft); border-radius: 12px;
+  padding: 10px 12px; margin-top: 10px; background: var(--bg);
+}
+.wn-editor textarea {
+  width: 100%; margin: 8px 0; padding: 8px 10px; resize: vertical;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface); font-family: inherit; font-size: 13px;
+}
+
 #nav { flex: 1; padding: 8px 12px; }
 #nav a {
   display: flex; align-items: center; gap: 8px; padding: 10px 12px; margin-bottom: 2px;
@@ -87,6 +123,20 @@ input, select, textarea { font: inherit; color: inherit; }
 .sidebar-foot { border-top: 1px solid var(--border); padding: 14px 16px; }
 .user-chip .user-name { font-weight: 700; }
 .user-chip .user-role { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+.server-health {
+  display: flex; align-items: center; gap: 7px; margin-top: 10px;
+  font-size: 12px; font-weight: 700; color: var(--text-dim);
+}
+.server-health-dot {
+  width: 8px; height: 8px; flex: 0 0 8px; border-radius: 50%; background: #94a3b8;
+  box-shadow: 0 0 0 3px rgba(148,163,184,.14);
+}
+.server-health.ok { color: #15803d; }
+.server-health.ok .server-health-dot { background: #22c55e; box-shadow: 0 0 0 3px rgba(34,197,94,.16); }
+.server-health.down { color: #b42318; }
+.server-health.down .server-health-dot { background: #ef4444; box-shadow: 0 0 0 3px rgba(239,68,68,.16); }
+.server-health.checking .server-health-dot { animation: server-health-pulse 1.2s ease-in-out infinite; }
+@keyframes server-health-pulse { 50% { opacity: .35; } }
 .foot-actions { display: flex; gap: 6px; margin-top: 10px; }
 
 main { flex: 1; padding: 28px 32px; min-width: 0; }
@@ -150,12 +200,134 @@ table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 th { font-size: 12px; color: var(--text-dim); font-weight: 600; position: sticky; top: 0; background: var(--surface); }
 tr:hover td { background: var(--slate-soft); }
-.chip { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+.chip { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px;
+        font-weight: 600; white-space: nowrap; }
 .chip-green { background: var(--primary-soft); color: var(--primary); }
 .chip-slate { background: var(--slate-soft); color: var(--text-dim); }
 .chip-red { background: var(--danger-soft); color: var(--danger); }
 .chip-blue { background: var(--blue-soft); color: var(--blue); }
 
+/* ---------- 전표 상세 좌측 표(화면을 좌우 반씩 쓴다) ----------
+   ★칸이 좁아지면 표를 찌그러뜨리지 말고 옆으로 밀어 본다. 안 그러면
+     '판매가능'이 한 자씩 세로로 쌓이고 관리번호가 '260813-' / '0014'로 갈린다
+     (대표 지적 2026-08-24). 감싼 .table-wrap 이 이미 overflow-x: auto 다.
+   스펙만 줄바꿈을 허용한다 — 제일 길어서 한 줄로 두면 표가 쓸데없이 넓어진다. */
+.sd-assets th, .sd-assets td { white-space: nowrap; }
+/* 스펙·제품코드만 줄바꿈을 허용해 표 폭을 줄인다. 폭·행높이를 브라우저에서 재 보고
+   고른 값이다 — 머리글까지 줄바꿈을 풀면 넘침은 0이 되지만 행높이가 70→147로 뛴다. */
+.sd-assets td.sd-spec { white-space: normal; min-width: 132px; }
+.sd-assets td.sd-code { white-space: normal; overflow-wrap: anywhere; max-width: 86px; }
+
+/* ---------- 운송장 문구 편집(좌: 종이 모습 · 우: 문구) ----------
+   대표 2026-08-24: "보기 헷갈리고 어렵네. 미리보기가 좌측에 있고 우측에서 문구 넣으면
+   바로 반영되서 보이는 것처럼." 어느 칸을 고치는 중인지 눈으로 알아야 한다. */
+.wb-tmpl { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.wb-tmpl-pv { flex: 1 1 340px; min-width: 0; }
+.wb-tmpl-ed { flex: 1 1 300px; min-width: 0; }
+/* 견본 운송장 PDF — 실제 인쇄물(123×100mm) 비율 그대로 */
+.wb-pdf { border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+          background: #fff; aspect-ratio: 123 / 100; }
+.wb-pdf iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+.wb-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.wb-chips .btn { font-size: 11.5px; padding: 2px 8px; }
+.wb-bad { background: var(--danger-soft); border-radius: 8px; padding: 7px 10px;
+          margin-bottom: 8px; font-size: 12.5px; }
+
+/* ---------- 채널별 색(2026-08-24 대표) — 몰마다 다른 색으로 한눈에 구분 ----------
+   실제 브랜드색 계열을 옅게: 쿠팡=빨강, 카카오=노랑, 네이버=초록, 토스=파랑,
+   11번가=주홍, 고도몰=보라, 롯데온=자주, 지마켓=청록, 옥션=남색, 테무=주황. */
+.ch-godo    { background: rgba(124, 58, 237, .13); color: #7c3aed; }
+.ch-coupang { background: rgba(220, 38, 38, .12);  color: #dc2626; }
+.ch-kakao   { background: rgba(250, 204, 21, .28); color: #92660a; }
+.ch-naver   { background: rgba(3, 199, 90, .15);   color: #059644; }
+.ch-toss    { background: rgba(49, 130, 246, .14); color: #1d6fe0; }
+.ch-st11    { background: rgba(244, 63, 94, .13);  color: #e11d48; }
+.ch-lotte   { background: rgba(190, 24, 93, .12);  color: #be185d; }
+.ch-gmarket { background: rgba(13, 148, 136, .14); color: #0d9488; }
+.ch-auction { background: rgba(67, 56, 202, .13);  color: #4338ca; }
+.ch-temu    { background: rgba(234, 88, 12, .13);  color: #ea580c; }
+.ch-manual  { background: var(--slate-soft);       color: var(--text-dim); }
+.ch-b2b     { background: rgba(124, 58, 237, .16); color: #6d28d9; }
+.order-product-code { display:inline-block; color:#078849; font-weight:800; font-size:12px;
+  letter-spacing:.01em; vertical-align:baseline; }
+
+.setup-memo-chip { border:0; background:var(--danger-soft); color:var(--danger); cursor:pointer;
+  max-width:min(320px, 35vw); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:middle; }
+.setup-memo-chip:hover { filter:brightness(.94); }
+.setup-memo-add { border:1px dashed var(--border); border-radius:999px; padding:2px 8px;
+  background:transparent; color:var(--text-dim); font-size:11px; cursor:pointer; }
+.setup-memo-add:hover { color:var(--primary); border-color:var(--primary); }
+.setup-cancel { display:block; margin:7px auto 0; padding:3px 7px; color:var(--danger);
+  border-color:rgba(220,38,38,.35); background:transparent; font-size:11px; }
+.setup-cancel:hover { background:var(--danger-soft); }
+
+/* ---------- 셋팅 보드 주문 구분선(2026-08-24 대표: "행마다 구분선") ----------
+   행 사이 1px 선만으로는 주문 덩어리가 안 갈라져 보인다 — 주문(본 행)마다 굵은 윗선.
+   상세 펼침 행(.setup-detail)은 제 주문에 붙어 보이도록 선을 긋지 않는다. */
+#setup-rows > tr:not(.setup-detail) > td {
+  border-top: 2px solid rgba(100, 116, 139, .55);
+}
+#setup-rows > tr.setup-detail > td { border-top: 0; }
+
+/* 상품 칸 내부 구분선(2026-08-25 대표: "제품코드·상품명·스펙·옵션 쪽에도 선을 —
+   주문 구분선보다 조금 얇은 걸로 헷갈리지 않게"). 주문 경계는 2px/.55, 여기는 1px/.16. */
+/* ★선택자 순서 주의: 옛 시험이 setup-opts 원 정의를 '첫 등장 + 여는 중괄호'로 잘라
+   읽는다 — 마지막 선택자가 setup-opts 로 끝나면 이 블록이 가로챈다. prod-line 으로 끝낼 것. */
+.setup-prod .prod-line + .setup-opts,
+.setup-prod .setup-opts + .setup-opts,
+.setup-prod .prod-line + .prod-line {
+  border-top: 1px solid rgba(100, 116, 139, .16);
+  padding-top: 3px;
+  margin-top: 3px;
+}
+
+/* ---------- 주문자 정보 수정(2026-08-24 대표: "단색바탕에 구분선으로 깔끔하게") ----------
+   겹치는 카드·그림자·둥근 상자 없이 — 한 가지 바탕에 가는 구분선으로만 섹션을 나눈다. */
+.ct-modal { padding: 0; background: var(--surface); }
+.ct-sec { padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.ct-sec:last-child { border-bottom: 0; }
+.ct-head-sec { display: flex; align-items: center; gap: 10px; font-size: 15px; }
+.ct-row { display: flex; align-items: center; gap: 10px; }
+.ct-row + .ct-row { margin-top: 8px; }
+.ct-k { flex: 0 0 84px; font-size: 13px; color: var(--text-dim); }
+.ct-row input[type="text"] {
+  flex: 1; min-width: 0; padding: 7px 10px;
+  border: 0; border-bottom: 1px solid var(--border); border-radius: 0;
+  background: transparent; font-size: 14px;
+}
+.ct-row input[type="text"]:focus {
+  outline: none; border-bottom-color: var(--primary);
+}
+.ct-hist { margin-top: 8px; }
+.ct-hist-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 0; border-top: 1px solid var(--border); font-size: 13px;
+}
+.ct-actions { display: flex; justify-content: flex-end; gap: 8px; background: var(--bg); }
+
+/* ---------- 대별 준비 목록(2026-08-24 대표: "들여쓰기와 구분선으로 1대씩") ---------- */
+.setup-units td { padding: 0 13px 8px 13px !important; }
+.units-box {
+  margin-left: 34px;                     /* 들여쓰기 — 본 행에 딸린 목록임이 보이게 */
+  border-left: 3px solid var(--primary);
+  background: var(--bg);
+  border-radius: 0 8px 8px 0;
+}
+.unit-line {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px dashed var(--border);   /* 대별 구분선 */
+  font-size: 13px;
+}
+.unit-line:last-child { border-bottom: 0; }
+.unit-no {
+  flex: 0 0 22px; text-align: center; font-weight: 700; font-size: 12px;
+  color: var(--text-dim);
+}
+.unit-prep { margin: 0 0 0 auto; gap: 4px; font-size: 12.5px; white-space: nowrap; }
+
+/* ---------- 폼/편집 패널 ---------- */
 /* ---------- 폼/편집 패널 ---------- */
 .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px 16px; align-items: end; }
 .form-grid label, .form-col label { display: block; font-size: 13px; color: var(--text-dim); }
@@ -289,6 +461,9 @@ body.has-bulkbar main { padding-bottom: 96px; }
 .in-modal {
   width: 100%; max-width: 900px; margin: auto;
 }
+/* ★좌우 5:5로 쓰는 팝업(전표 상세 — 왼쪽 전표·자산 표, 오른쪽 자산 상세)은 넓게 쓴다.
+   900px에 묶여 있으면 5:5가 안 들어가 오른쪽 칸이 아래로 접힌다(대표 지적 2026-08-17). */
+.in-modal.wide { max-width: 1480px; }
 /* 패널 안의 카드가 곧 팝업 본체다 — 화면보다 길면 안에서만 스크롤한다 */
 .in-modal > .card {
   margin: 0; max-height: calc(100vh - 64px); overflow-y: auto;
@@ -414,6 +589,9 @@ body.modal-open { overflow: hidden; }          /* 뒤쪽 목록은 스크롤 잠
     flex-wrap: wrap;
   }
   table.resp-card td > * { max-width: 100%; overflow-wrap: anywhere; }
+  /* ★카드로 세울 때는 한 줄 강제(.sd-assets)를 풀어야 값이 카드 밖으로 안 나간다 */
+  table.sd-assets th, table.sd-assets td,
+  table.sd-assets td.sd-spec, table.sd-assets td.sd-code { white-space: normal; max-width: none; }
   /* 값이 여러 조각이면 이름표 다음 줄에 오른쪽 정렬로 쌓는다 */
   table.resp-card td > .muted,
   table.resp-card td > div { flex: 1 1 100%; text-align: right; }
@@ -466,6 +644,17 @@ body.modal-open { overflow: hidden; }          /* 뒤쪽 목록은 스크롤 잠
 /* ★고정 레이아웃 — 안 쓰면 내용(nowrap)이 칸 폭을 밀어 표가 화면의 두 배(3187px)가 된다.
    fixed면 아래에 적은 폭이 그대로 지켜지고, 남는 자리는 폭을 안 준 '상품' 칸이 가져간다. */
 .setup-table { table-layout: fixed; width: 100%; }
+.setup-tag-filters { margin: 13px 0 15px; display: grid; gap: 8px; }
+.setup-filter-line { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.setup-filter-label { width: 64px; flex: 0 0 64px; color: var(--text-dim); font-size: 12px; font-weight: 700; }
+.setup-filter-tag {
+  border: 1px solid var(--border); border-radius: 999px; padding: 5px 11px;
+  background: var(--bg); color: var(--text); font: inherit; font-size: 12px; cursor: pointer;
+}
+.setup-filter-tag b { margin-left: 3px; color: var(--text-dim); font-size: 11px; }
+.setup-filter-tag:hover { border-color: var(--primary); }
+.setup-filter-tag.on { background: var(--primary); border-color: var(--primary); color: white; }
+.setup-filter-tag.on b { color: rgba(255,255,255,.82); }
 /* 칸 폭은 colgroup으로 정한다. 폭을 안 준 두 번째 칸(상품)이 남는 자리를 전부 가져간다. */
 /* ★단계 칸을 넓히면 그만큼 상품 칸이 줄어 옵션 칩이 접히고 행이 다시 들쭉날쭉해진다
    (2026-08-05 실측 62~114px). 다른 칸에서 나눠 덜어 상품 칸 손실을 최소로 잡는다.
@@ -476,6 +665,8 @@ body.modal-open { overflow: hidden; }          /* 뒤쪽 목록은 스크롤 잠
 .setup-table .col-recipient { width: 152px; }
 .setup-table .col-assets { width: 206px; }   /* 자산번호 + 스캔칸이 잘렸다(실측 169>152) */
 .setup-table .col-stage { width: 80px; }   /* 46px일 때 담당자 이름이 잘렸다 */
+.setup-table .col-wb { width: 132px; }     /* 송장 + 셋팅라벨 — 상태 칸에 우겨넣으면 잘린다(2026-08-24)
+                                              2026-09-03: 라벨 버튼이 같이 들어가 폭을 넓혔다 */
 .setup-table .col-status { width: 108px; }
 /* 표에서 tr의 height는 '최소 높이'로 동작한다 — 옵션이 많으면 그만큼 커지고,
    짧은 주문은 62px로 가지런히 맞는다. */
@@ -554,6 +745,11 @@ a.prod-title:hover { color: var(--primary); text-decoration: underline; }
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
 .setup-status { white-space: nowrap; }
+/* ★송장 칸은 절대 잘리면 안 된다 — 버튼이 안 보이면 없는 기능과 같다 */
+/* 송장 줄과 라벨 버튼이 세로로 두 줄 — 한 줄로 붙이면 104px 칸에서 잘렸다(2026-09-03) */
+.setup-wb { white-space: normal; overflow: visible; }
+.setup-wb .btn { white-space: nowrap; }
+.setup-wb .wb-line { display: inline-flex; align-items: center; gap: 4px; }
 .setup-status .chip { white-space: nowrap; }
 
 @media (max-width: 1600px) {
@@ -561,6 +757,7 @@ a.prod-title:hover { color: var(--primary); text-decoration: underline; }
   .setup-table .col-recipient { width: 140px; }
   .setup-table .col-assets { width: 198px; }
   .setup-table .col-stage { width: 78px; }
+  .setup-table .col-wb { width: 120px; }
   .setup-table .col-status { width: 108px; }
 }
 @media (max-width: 1360px) {
@@ -624,6 +821,13 @@ a.prod-title:hover { color: var(--primary); text-decoration: underline; }
 .code-item:last-child { border-bottom: none; }
 .code-item:hover, .code-item.on { background: var(--slate-soft); }
 .code-item .chip { margin-left: 6px; font-size: 11px; }
+/* 맨 윗줄 — 지금 친 코드가 몰에 있는지. 목록을 스크롤해도 안 가려지게 붙여 둔다. */
+.code-head {
+  position: sticky; top: 0; z-index: 1; padding: 6px 10px; font-size: 12px;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.code-head.ok { color: var(--primary); background: var(--primary-soft); }
+.code-head.warn { color: var(--danger); background: var(--danger-soft); }
 
 /* 긴 목록 페이지 넘김 — 표 바로 아래 오른쪽에 붙는다.
    ★한 쪽에 다 들어가면 JS가 아예 안 그린다(빈 막대가 남지 않게). */
@@ -672,7 +876,7 @@ a.prod-title:hover { color: var(--primary); text-decoration: underline; }
 .prep-chip:disabled { cursor: default; opacity: .7; }
 .prep-chip:not(:disabled):hover { filter: brightness(.93); }
 
-/* 셋팅 행 상세 — QC 프로그램(192.168.0.185:3000)과 같은 4칸 구성
+/* 셋팅 행 상세 — QC 프로그램(127.0.0.1:3000)과 같은 4칸 구성
    (대표 요청 2026-08-05): 상품 정보 / 결제 정보 / 구매자·배송지 / 처리 이력. */
 .setup-chan .chan-stock { margin-top: 5px; display: flex; gap: 5px; flex-wrap: wrap; }
 .setup-chan .chan-stock:empty { display: none; }
@@ -728,3 +932,168 @@ a.prod-title:hover { color: var(--primary); text-decoration: underline; }
 .ship-done { margin-top: 3px; font-size: 11px; color: var(--text-dim); line-height: 1.3; }
 .ship-done b { color: var(--text); font-weight: 700; }
 .ship-done span { font-size: 10px; font-variant-numeric: tabular-nums; }
+
+/* 셋팅 본문 보수적 시각 개선 — 기능/마크업 변경 없음 */
+#setup-kpi, #pb-kpi { gap: 14px; margin-bottom: 20px; }
+#setup-kpi .kpi, #pb-kpi .kpi { min-height: 78px; padding: 15px 17px; border-radius: 12px; }
+#setup-kpi .kpi-label, #pb-kpi .kpi-label { margin-bottom: 7px; }
+.setup-table { border-collapse: separate; border-spacing: 0; }
+.setup-table thead th {
+  padding: 13px 12px; font-size: 12px; color: var(--text-dim);
+  background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.setup-rows-fixed tr { height: 96px; }
+.setup-rows-fixed td { padding: 14px 12px; }
+.setup-rows-fixed tr:has(.stage-cell input[data-stage="preparing"]:checked) {
+  background: rgba(245, 158, 11, .035);
+}
+.setup-rows-fixed tr:has(.stage-cell input[data-stage="production"]:checked) {
+  background: rgba(34, 197, 94, .055);
+}
+.setup-rows-fixed tr:has(.stage-cell input[data-stage="softwareInspection"]:checked) {
+  background: rgba(59, 130, 246, .045);
+}
+.setup-table .stage-cell { padding-left: 9px; padding-right: 9px; }
+.setup-table .stage-cell::before {
+  content: ""; display: block; position: absolute; left: 7px; top: 18px; bottom: 18px;
+  width: 3px; border-radius: 3px; background: rgba(148, 163, 184, .38);
+}
+.setup-table .stage-cell { position: relative; }
+.setup-table .stage-cell:has(input[data-stage="preparing"]:checked)::before { background: #f59e0b; }
+.setup-table .stage-cell:has(input[data-stage="production"]:checked)::before { background: #22c55e; }
+.setup-table .stage-cell:has(input[data-stage="softwareInspection"]:checked)::before { background: #3b82f6; }
+.setup-table .stage-cell input { width: 17px; height: 17px; }
+.setup-table .stage-by { margin-top: 5px; }
+.setup-table .stage-at { margin-top: 2px; }
+.setup-assets .as-slots {
+  padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg);
+}
+
+
+/* A/S 현황(2026-09-02) — 분포 막대와 2단 배치. 좁은 화면에서는 한 줄로 접힌다. */
+.as-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 900px) { .as-grid2 { grid-template-columns: 1fr; } }
+.as-bars { display: flex; flex-direction: column; gap: 6px; }
+.as-bar-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.as-bar-k { flex: 0 0 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.as-bar-t { flex: 1; background: var(--line, #e5e7eb); border-radius: 4px; height: 14px; }
+.as-bar-t > i { display: block; height: 100%; border-radius: 4px; background: var(--primary); }
+.as-bar-n { flex: 0 0 92px; text-align: right; color: var(--text-dim, #6b7280); }
+
+
+/* 자산 매칭 경고(2026-09-03) — 주문 제품과 다른 자산이 붙었을 때 그 행 아래 줄 */
+tr.asset-warn-row > td.asset-warn {
+  background: #fef3c7; color: #92400e; font-size: 13px; padding: 8px 12px;
+  border-left: 3px solid #f59e0b;
+}
+tr.asset-warn-row .asset-warn-x { margin-top: 6px; }
+
+
+/* ───────────── A/S 접수·상세 팝업 (2026-09-03 대표, 3차 정리)
+   대표 요구: "좌/우로 깔끔하게 나눠서. FHD 기준으로 깔끔히 보이되 화면 크기에 따라 조절되게."
+   ★2차(자동 배치 grid)는 오른쪽 위가 통째로 빈 구멍이 됐다 — 카드 높이가 제각각인데
+     자동 배치에 맡겼기 때문이다. 이제 화면(as.js)이 카드를 왼쪽/오른쪽 두 기둥(.as-dcol)에
+     직접 담고, 여기서는 그 두 기둥을 나란히 세우기만 한다. 구멍이 생길 수 없다.
+   ★폭은 픽셀로 못 박지 않는다 — min(원하는폭, 화면비율)이라 작은 화면에서 저절로 줄고,
+     기둥은 좁아지면 위아래로 쌓인다(FHD 1920 → 접수 1120 / 상세 1440). */
+
+/* ① 접수 폼 — 짧은 폼이라 1400px는 너무 넓다(가운데가 텅 빈다) */
+#as-form.as-wide-form.in-modal {
+  width: min(1120px, 96vw); max-width: min(1120px, 96vw);
+}
+#as-form.as-wide-form.in-modal > div { margin: 0; }
+.as-form2 {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px 28px;
+  margin-top: 12px; align-items: start;
+}
+.as-fcol { min-width: 0; }        /* grid 칸이 안쪽 입력칸 때문에 넘치지 않게 */
+.as-fcol-h {
+  margin: 0 0 10px; padding-bottom: 6px; font-size: 13.5px; font-weight: 700;
+  color: var(--text-dim); border-bottom: 1px solid var(--border);
+}
+.as-fl { display: block; margin-top: 12px; font-size: 13px; }
+/* 한 기둥 안에서는 입력칸을 2개까지만 — 더 잘게 쪼개면 글씨보다 칸이 작아진다 */
+.as-form2 .form-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+/* 좁은 화면(태블릿 세로·노트북 분할 화면)에서는 두 기둥을 위아래로 쌓는다 —
+   억지로 좌우를 유지하면 입력칸이 글씨보다 좁아진다 */
+@media (max-width: 900px) {
+  .as-form2 { grid-template-columns: 1fr; gap: 10px; }
+  .as-fcol-h { margin-top: 6px; }
+}
+
+/* ② 상세 — 왼쪽 기둥(기본 정보·과거) / 오른쪽 기둥(수리 내역·문자·이력) */
+.as-wide-form.in-modal {
+  width: min(1440px, 96vw); max-width: min(1440px, 96vw);
+  max-height: 92vh; overflow: auto;
+}
+@media (min-width: 1100px) {
+  #as-detail.as-wide-form.in-modal {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start;
+  }
+}
+/* .in-modal > *:not(.card) 가 기둥까지 흰 상자로 만들어 버리므로 여기서 되돌린다 */
+#as-detail.as-wide-form.in-modal > .as-dcol {
+  background: none !important; border: 0 !important; padding: 0 !important;
+  box-shadow: none !important; max-height: none !important; overflow: visible !important;
+  display: flex; flex-direction: column; gap: 16px; min-width: 0;
+}
+/* 카드마다 스크롤 막대가 생기면 어디를 굴리는지 알 수 없다 — 팝업 하나만 굴린다 */
+#as-detail.as-wide-form.in-modal .card {
+  margin: 0; max-height: none; overflow: visible;
+}
+#as-detail.as-wide-form.in-modal .form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+/* ③ 결제 줄 — 유상 건에만. 안 받았으면 눈에 띄고, 받았으면 조용해진다 */
+.as-payline {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+  background: var(--amber-soft, rgba(217, 119, 6, .12));
+  border: 1px solid var(--amber, #d97706);
+}
+.as-payline.is-paid {
+  background: var(--primary-soft); border-color: var(--primary);
+}
+
+/* ───────────── 🚦 A/S 진행 보드(2026-09-03 대표 "담당자가 현황 파악이 되도록") ───────────── */
+.as-board {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+  gap: 10px; margin-bottom: 16px;
+}
+.as-bcard {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 11px 13px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); color: var(--text); cursor: pointer; text-align: left;
+  font: inherit; transition: border-color .12s, box-shadow .12s;
+}
+.as-bcard:hover { border-color: var(--primary); }
+.as-bcard.on { border-color: var(--primary); box-shadow: inset 0 0 0 2px var(--primary); }
+.as-bcard-l {
+  font-size: 12.5px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
+}
+.as-bcard-n { font-size: 22px; font-weight: 800; line-height: 1.2; }
+/* 사람이 손을 대야 움직이는 칸(입고 완료·결제 전)은 숫자가 있으면 색으로 부른다 */
+.as-bcard.hot .as-bcard-n { color: var(--danger); }
+.as-board-tb td { vertical-align: top; }
+.as-board-tb .as-symcell { max-width: 280px; }
+.as-board-tb .as-symcell > div {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.as-parcel { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.as-parcel .chip { margin: 0; }
+.as-bact { white-space: nowrap; }
+/* 기한을 넘긴 줄은 왼쪽에 빨간 띠 — 표를 훑을 때 먼저 눈에 걸린다 */
+.as-board-tb tr.as-late > td:first-child { box-shadow: inset 3px 0 0 var(--danger); }
+
+/* 고른 줄 표시 — 셋팅·작업 실적에서 담당자 줄을 누르면 그 줄만 살짝 밝아진다 */
+tr.row-on > td { background: var(--primary-soft); }
+tr.row-on > td:first-child { box-shadow: inset 3px 0 0 var(--primary); }
+
+/* ───────────── 🏠 A/S 대시보드(2026-09-07 대표 개편) ───────────── */
+.as-dash-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 900px) { .as-dash-cols { grid-template-columns: 1fr; } }
+.as-dash-cols .timeline { max-height: 360px; overflow: auto; }
+/* 수리 내역 요약 줄 — 표를 넓히지 않게 한 줄로 자른다(전체는 title 로) */
+.as-board-tb .as-workline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 280px; }

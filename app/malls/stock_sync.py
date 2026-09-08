@@ -1,16 +1,16 @@
-"""쇼핑몰 재고 동기화 — HMS의 '재고반영' 자산 수를 몰별 상품 재고로 밀어넣는다.
+"""쇼핑몰 재고 동기화 — OWS의 '재고반영' 자산 수를 몰별 상품 재고로 밀어넣는다.
 
 개념(대표 확정 2026-08-04):
   제품코드(예: 840 G3_i7-6_내장) = 쇼핑몰 재고의 축. 대표가 매입 자산에 직접 기입한다.
   자산번호 = 개체 하나(셋팅·QC 출고의 축). 서로 다른 역할이다.
 
-HMS 기준 재고 = 제품코드가 같고 + 재고반영(stock_listed=1) + 판매가능 + 입고완료인 자산 수.
+OWS 기준 재고 = 제품코드가 같고 + 재고반영(stock_listed=1) + 판매가능 + 입고완료인 자산 수.
   ★stock_listed 가 핵심이다. 매입 등록만 하면 0(꺼짐)이라 아무것도 몰에 잡히지 않고,
     수리를 다녀온 물건을 사람이 [재고반영]을 체크한 순간부터 세어진다.
 
 안전 원칙:
   ① 몰별 토글 기본 OFF — 설정에 명시적으로 켜기 전에는 어떤 몰에도 아무것도 보내지 않는다.
-     OFF인 몰은 '기존에 몰에 등록된 재고값'이 그대로 유지된다(HMS가 손대지 않는다).
+     OFF인 몰은 '기존에 몰에 등록된 재고값'이 그대로 유지된다(OWS가 손대지 않는다).
   ② 외부 호출은 절대 tx(write=True) 안에서 하지 않는다(원칙 #1).
      보낼 목록을 먼저 계산해 두고, 트랜잭션 밖에서 몰을 부르고, 결과만 다시 기록한다.
   ③ 시험 모드(dry run) — 무엇을 보낼지 계산만 하고 실제로 보내지 않는 경로를 항상 제공한다.
@@ -23,22 +23,32 @@ from flask import abort, g, jsonify, request
 
 from .. import audit, config
 from ..auth.perms import require
-from ..db import get_db, tx
+from ..db import get_db, sale_only, tx
 from ..settings import bp
 from .base import get_adapter
 from .collect import _mall_settings
 
-# 재고를 셀 때 포함하는 자산 상태 — 판매가능(purchase.AVAILABLE_STATUSES)과 같다
+# ★재고를 셀 때 포함하는 자산 상태 — 셋팅 화면(product_info.stock_by_code)과 같은 기준.
+#   예전엔 여기만 ('in_stock','ready') 하드코딩이라 정비중(refurbishing)이 빠지고
+#   가재고가 섞였다 — 주석은 "판매가능과 같다"였는데 실제로는 달랐다(2026-08-07 검증).
+#   기준이 두 개면 몰 재고와 셋팅 재고가 서로 다른 숫자를 말하게 된다.
+from ..purchase import AVAILABLE_STATUSES  # noqa: E402
+
 _COUNT_SQL = (
     "SELECT product_code, COUNT(*) AS n FROM assets "
     "WHERE stock_listed=1 AND received=1 AND TRIM(product_code)<>'' "
-    "AND status IN ('in_stock','ready') GROUP BY product_code"
+    f"AND status IN ({','.join('?' * len(AVAILABLE_STATUSES))}) "
+    "AND tier <> '가재고'"
+    # ★division이 빠지면 렌탈 사업부 자산이 쇼핑몰 재고로 올라간다.
+    #   바깥으로 나가는 유일한 경로라 가장 중요한 지점이다.
+    + sale_only("") + " GROUP BY product_code"
 )
 
 
-def hms_stock(conn):
-    """제품코드별 HMS 기준 재고 수량."""
-    return {r["product_code"]: r["n"] for r in conn.execute(_COUNT_SQL).fetchall()}
+def ows_stock(conn):
+    """제품코드별 OWS 기준 재고 수량."""
+    return {r["product_code"]: r["n"]
+            for r in conn.execute(_COUNT_SQL, list(AVAILABLE_STATUSES)).fetchall()}
 
 
 def _sync_conf(conn):
@@ -62,11 +72,11 @@ def _is_on(conf, mall):
 
 @bp.get("/stock-sync")
 def stock_sync_status():
-    """설정 화면 — 몰별 토글 상태와 HMS 기준 재고 미리보기."""
+    """설정 화면 — 몰별 토글 상태와 OWS 기준 재고 미리보기."""
     require("settings.manage")
     conn = get_db()
     conf = _sync_conf(conn)
-    stock = hms_stock(conn)
+    stock = ows_stock(conn)
     from . import MALLS
     malls = [{
         "code": m["code"], "name": m["name"],
@@ -110,7 +120,7 @@ def stock_sync_preview():
     require("settings.manage")
     conn = get_db()
     conf = _sync_conf(conn)
-    stock = hms_stock(conn)
+    stock = ows_stock(conn)
     from . import MALLS
     out = []
     for m in MALLS:
@@ -133,12 +143,12 @@ def stock_sync_preview():
 #   고도몰  — 재고변경 API(Goods_Stock.php)는 '수량'을 직접 받지 않는다.
 #             data_url(우리가 XML을 올려 둔, 인터넷에서 접근 가능한 주소) 하나만 받고
 #             고도몰 서버가 그 주소로 파일을 가지러 온다(스펙 정의서 3.5, p.28).
-#             HMS는 사내 PC라 외부 접속 주소가 없다 → 대표 결정 필요.
+#             OWS는 사내 PC라 외부 접속 주소가 없다 → 대표 결정 필요.
 #             또 옵션 상품은 sno·stockCnt·optionViewFl·optionSellFl·optionPrice 전부
 #             필수라, 먼저 상품조회로 현재 옵션값을 읽어 보관한 뒤 그대로 되돌려 보내야
 #             등급별 추가금액(-30,000원 등)이 날아가지 않는다.
 #   쿠팡    — 수량만 바꾸는 안전한 API(PUT .../vendor-items/{id}/quantities/{n})가
-#             있으나 키가 vendorItemId(옵션ID)다. HMS는 이 번호를 저장한 적이 없고,
+#             있으나 키가 vendorItemId(옵션ID)다. OWS는 이 번호를 저장한 적이 없고,
 #             확보하려면 쿠팡 상품조회 API 3종을 새로 붙여 대조표부터 만들어야 한다.
 #   스마트스토어·카카오 — 재고만 바꾸는 API가 없다. 상품 전체 덮어쓰기라
 #             빠뜨린 항목(상세설명·태그·옵션가)이 삭제된다 → 당분간 제외.
@@ -151,7 +161,7 @@ _PUSHERS = {}
 
 @bp.post("/stock-sync/run")
 def stock_sync_run():
-    """켜진 몰에 HMS 기준 재고를 실제로 보낸다(수동 실행 버튼).
+    """켜진 몰에 OWS 기준 재고를 실제로 보낸다(수동 실행 버튼).
 
     ★원칙 #1 — 외부 호출은 트랜잭션 밖에서. 계산(읽기) → 전송(외부) → 기록(쓰기) 순서.
     body.dry=true 면 전송 없이 결과만 보여준다.
@@ -163,7 +173,7 @@ def stock_sync_run():
 
     conn = get_db()
     conf = _sync_conf(conn)
-    stock = hms_stock(conn)
+    stock = ows_stock(conn)
     items = [{"productCode": k, "count": v} for k, v in sorted(stock.items())]
 
     from . import MALLS

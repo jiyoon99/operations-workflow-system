@@ -1,6 +1,6 @@
 """주문 중복 판정/병합 (순수 stdlib).
 
-하프북 주문 워크플로 원본(src/orders/dedupe.py) 이식본.
+업무관리 주문 워크플로 원본(src/orders/dedupe.py) 이식본.
 - 다층 중복키(주문번호 → fingerprint → syntheticContent → importKey + exactContent/쿠팡 교차)
 - 중복 병합(빈 배송/금액 정보만 보강, 작업 상태는 보존)
 - 같은 주문번호의 배송지 변경은 pendingShippingUpdate로 운영자 확인 유도
@@ -11,7 +11,10 @@ import re
 from datetime import datetime, timezone
 
 SHIPPING_UPDATE_FIELDS = ("recipient", "phone", "postalCode", "address", "deliveryMessage")
-DUPLICATE_DETAIL_FIELDS = ("phone", "postalCode", "address", "deliveryMessage")
+# 빈 칸만 보강하는 필드 — 어댑터 키 누락으로 반쪽 저장된 주문(2026-08-31 롯데온 사고)이
+# 재수집 때 스스로 복구되도록 상품명/제품코드/주문일시도 포함한다(값이 있으면 안 덮는다).
+DUPLICATE_DETAIL_FIELDS = ("phone", "postalCode", "address", "deliveryMessage",
+                           "productName", "productCode", "orderedAt")
 
 
 def normalized_order_value(value: object) -> str:
@@ -146,6 +149,15 @@ def order_duplicate_keys(order: dict) -> list[tuple[str, ...]]:
     return keys
 
 
+def is_shaped_product_code(value: object) -> bool:
+    """자사 제품코드 축(「모델_CPU_그래픽」) 모양인가 — 밑줄 2개, 세 칸 전부 값.
+
+    malls/base.py product_code_in 과 같은 모양 판정(여기는 순수 stdlib 모듈이라 복제).
+    """
+    t = str(value or "").split("/")[0].strip()
+    return t.count("_") == 2 and all(x.strip() for x in t.split("_"))
+
+
 def merge_duplicate_order_details(existing: dict, imported: dict, now: str) -> bool:
     # 중복으로 판단된 주문을 버리기 전에, 기존 주문의 빈 배송/금액 정보만 보강한다.
     # 제작/SW검수/출고 상태는 작업 기록이므로 여기서 덮어쓰지 않는다.
@@ -154,6 +166,16 @@ def merge_duplicate_order_details(existing: dict, imported: dict, now: str) -> b
         if not str(existing.get(field, "")).strip() and str(imported.get(field, "")).strip():
             existing[field] = imported.get(field, "")
             changed = True
+    # ★제품코드 '축 승격'(2026-09-01 대표 "롯데온 고유코드는 필요하지 않아"): 기존 칸에
+    #   몰 내부번호(LO2746331973·숫자 상품ID — 코드 모양이 아님)가 박혀 있고 새로 온 값이
+    #   자사 코드 축이면 교체한다. 빈 칸 보강과 달리 '잘못된 축의 값'을 바로잡는 규칙 —
+    #   코드 모양인 기존 값(사람이 넣은 자사 코드 포함)은 절대 덮지 않는다.
+    ex_code = str(existing.get("productCode", "")).strip()
+    im_code = str(imported.get("productCode", "")).strip()
+    if (ex_code and im_code and ex_code != im_code
+            and not is_shaped_product_code(ex_code) and is_shaped_product_code(im_code)):
+        existing["productCode"] = im_code
+        changed = True
     existing_amount = normalized_order_value(existing.get("amount"))
     imported_amount = normalized_order_value(imported.get("amount"))
     if existing_amount in {"", "0"} and imported_amount not in {"", "0"}:

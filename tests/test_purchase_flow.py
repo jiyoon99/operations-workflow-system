@@ -10,6 +10,8 @@
      (백엔드가 assignedAmount/totalAmount를 정확히 내려주는지만 여기서 확인)
 """
 import io
+import json
+import re
 import shutil
 import sys
 import tempfile
@@ -21,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from app import auth as auth_mod  # noqa: E402
 from app import create_app  # noqa: E402
+from app.db import get_db  # noqa: E402
 from app.purchase import GRADES, TIERS, tier_for_grade  # noqa: E402
 
 PW = "admin-pass-1"
@@ -28,7 +31,7 @@ PW = "admin-pass-1"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-pf-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-pf-"))
         self.app = create_app(db_path=self.tmp / "t.db")
         self.app.testing = True
         self.c = self.app.test_client()
@@ -56,6 +59,420 @@ class Base(unittest.TestCase):
             body["batchId"] = batch_id
         body.update(kw)
         return self.c.post("/api/assets", json=body)
+
+
+class TestRentalStatusHonesty(Base):
+    """렌탈 자산의 상태를 정직하게(2026-09-01 대표).
+
+    "상태 → 판매가능으로 되어있는데 출고완료랑 별개로 움직여? 어떤 의미가 있는지 모르겠어."
+    "재고복귀를 해도 재고 복귀가 안돼."
+
+    ★두 말은 같은 뿌리다 — 렌탈 자산에 '판매가능'이라 써 놓고 판매 재고에서는 빼고 있었다.
+      재고복귀는 제대로 됐는데(출고완료→입고), 사업부가 렌탈이라 재고에 안 잡힌 것이다.
+      실측 당시 렌탈인데 '판매가능' 107대 · '입고' 357대.
+    """
+
+    def _rental_shipped(self, serial="RH-1", rms_status="available", renter=""):
+        b = self._batch()["id"]
+        aid = self._asset(b, model="렌탈기계", serial=serial).get_json()[0]["id"]
+        no = self.c.get(f"/api/assets/{aid}").get_json()["assetNo"]
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET division='rental', status='shipped' WHERE id=?",
+                             (aid,))
+                conn.execute(
+                    "INSERT OR REPLACE INTO rms_inventory(asset_no, status, renter, synced_at) "
+                    "VALUES(?,?,?,?)", (no, rms_status, renter, "2026-09-01T10:00:00+09:00"))
+        return aid, no
+
+    def test_목록과_상세가_RMS_상태를_함께_준다(self):
+        aid, no = self._rental_shipped(renter="주식회사코넥", rms_status="rented")
+        row = self.c.get(f"/api/assets?q={no}&division=all").get_json()["rows"][0]
+        self.assertEqual(row["rmsStatus"], "rented", "목록에 RMS 상태가 안 실린다")
+        self.assertEqual(row["rmsRenter"], "주식회사코넥")
+        one = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertEqual(one["rmsStatus"], "rented", "상세에 RMS 상태가 안 실린다")
+        self.assertEqual(one["rmsRenter"], "주식회사코넥")
+
+    def test_RMS_사본이_없어도_목록이_열린다(self):
+        b = self._batch()["id"]
+        aid = self._asset(b, model="사본없음", serial="RH-N").get_json()[0]["id"]
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET division='rental' WHERE id=?", (aid,))
+        one = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertEqual((one["rmsStatus"], one["rmsRenter"]), ("", ""))
+
+    def test_재고복귀가_판매재고_아님을_알려_준다(self):
+        """복귀는 되지만 판매 재고는 아니다 — 그 자리에서 말해 줘야 헛걸음이 없다."""
+        aid, no = self._rental_shipped("RH-2")
+        r = self.c.post("/api/assets/restock",
+                        json={"ids": [aid], "reason": "반품 입고"}).get_json()
+        self.assertEqual(r["ok"], 1)
+        self.assertIn(no, r["rentalKept"], "렌탈이라 판매재고가 아니라는 안내가 없다")
+        a = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertEqual(a["status"], "in_stock", "복귀 자체는 됐어야 한다")
+
+    def test_복귀후보_단건도_알려_준다(self):
+        aid, _no = self._rental_shipped("RH-3")
+        r = self.c.post(f"/api/assets/{aid}/restock", json={"action": "restock"}).get_json()
+        self.assertTrue(r.get("rentalKept"), "단건 복귀에는 안내가 없다")
+
+    def test_판매_자산에는_그_안내가_없다(self):
+        b = self._batch()["id"]
+        aid = self._asset(b, model="판매기계", serial="RH-S").get_json()[0]["id"]
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET status='shipped' WHERE id=?", (aid,))
+        r = self.c.post("/api/assets/restock",
+                        json={"ids": [aid], "reason": "반품"}).get_json()
+        self.assertEqual(r["rentalKept"], [], "판매 자산인데 렌탈 안내가 붙었다")
+
+    def test_화면_배선(self):
+        js = (ROOT / "static" / "js" / "purchase.js").read_text("utf-8")
+        # ★상태 칸은 한 함수로 묶여야 한다 — 목록·상세·전표가 따로 그리면 또 어긋난다
+        self.assertIn("function statusCell", js, "상태 칸 공용 함수가 없다")
+        self.assertIn("<td>${statusCell(a)}</td>", js, "자산목록이 공용 함수를 안 쓴다")
+        self.assertIn("statusCell(a, a.sale", js, "전표 상세가 공용 함수를 안 쓴다")
+        self.assertIn("판매 재고에 잡히지 않습니다", js, "왜 재고에 없는지 안내가 없다")
+        self.assertIn("r.rentalKept", js, "일괄 복귀 안내가 없다")
+        self.assertIn("rr.rentalKept", js, "단건 복귀 안내가 없다")
+
+
+class TestRestockFromList(Base):
+    """자산목록에서 재고 복귀(2026-09-01 대표: "재고로 어디서 되돌려?"
+    "매입 → 자산 → 자산목록에서 검색하여 돌릴 수 있게 해주면 좋을 것 같아").
+
+    ↩ 복귀 후보 탭은 'TMS가 반입/반납이라 하는 것'만 모은다. TMS 기록이 안 들어온 반품은
+    그 목록에 안 떠서 되돌릴 길이 없었다.
+    ★출고 상태를 사람이 바꾸는 일이라 사유가 필수다. 처리 내용·이벤트명은 복귀 후보와 같다
+      — 두 경로가 다른 기록을 남기면 이력을 못 믿는다.
+    """
+
+    def _shipped(self, serial="RS-1"):
+        b = self._batch()["id"]
+        aid = self._asset(b, model="반품기계", serial=serial).get_json()[0]["id"]
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET status='shipped' WHERE id=?", (aid,))
+        return aid
+
+    def _asset_row(self, aid):
+        return self.c.get(f"/api/assets/{aid}").get_json()
+
+    def test_사유_없이는_못_되돌린다(self):
+        aid = self._shipped()
+        self.assertEqual(self.c.post("/api/assets/restock",
+                                     json={"ids": [aid]}).status_code, 400)
+        self.assertEqual(self._asset_row(aid)["status"], "shipped", "막았는데 바뀌었다")
+
+    def test_되돌리면_입고_실재고가_된다(self):
+        aid = self._shipped()
+        r = self.c.post("/api/assets/restock",
+                        json={"ids": [aid], "reason": "반품 입고 — 실물 확인함"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["ok"], 1)
+        a = self._asset_row(aid)
+        self.assertEqual((a["status"], a["tier"]), ("in_stock", "실재고"))
+        self.assertTrue(a["received"], "입고확인이 안 켜졌다")
+
+    def test_사유가_이력에_남는다(self):
+        aid = self._shipped()
+        self.c.post("/api/assets/restock", json={"ids": [aid], "reason": "쿠팡 반품"})
+        evs = self.c.get(f"/api/assets/{aid}").get_json()["events"]
+        hit = [e for e in evs if e.get("action") == "재고복귀"]
+        self.assertTrue(hit, "재고복귀 이력이 없다")
+        self.assertIn("쿠팡 반품", json.dumps(hit[0], ensure_ascii=False))
+
+    def test_출고_폐기가_아니면_건너뛴다(self):
+        b = self._batch()["id"]
+        aid = self._asset(b, model="정상", serial="RS-OK").get_json()[0]["id"]
+        r = self.c.post("/api/assets/restock", json={"ids": [aid], "reason": "시험"})
+        d = r.get_json()
+        self.assertEqual(d["ok"], 0, "되돌릴 게 없는데 처리됐다")
+        self.assertTrue(d["skipped"], "건너뛴 사유가 없다")
+
+    def test_복귀후보_탭과_같은_기록을_남긴다(self):
+        """두 경로가 다른 이벤트를 남기면 복귀 후보 목록이 어긋난다."""
+        aid = self._shipped()
+        with self.app.app_context():
+            from app.db import tx
+            from app.purchase import asset_event
+            with tx(write=True) as conn:
+                asset_event(conn, aid, "복귀후보", {"TMS표기": "반입", "당시상태": "shipped"})
+        before = self.c.get("/api/assets/revert-candidates").get_json()
+        self.assertIn(aid, [x["id"] for x in before["rows"]], "후보에 안 뜬다")
+        self.c.post("/api/assets/restock", json={"ids": [aid], "reason": "실물 확인"})
+        after = self.c.get("/api/assets/revert-candidates").get_json()
+        self.assertNotIn(aid, [x["id"] for x in after["rows"]],
+                         "되돌렸는데 복귀 후보에 남아 있다")
+
+    def test_화면_배선(self):
+        js = (ROOT / "static" / "js" / "purchase.js").read_text("utf-8")
+        self.assertIn('id="af-restock"', js, "재고 복귀 버튼이 없다")
+        self.assertIn('"/api/assets/restock"', js, "창구 배선이 없다")
+        self.assertIn("heldByOrder", js, "아직 주문이 잡고 있다는 경고가 없다")
+
+
+class TestHoldOverride(Base):
+    """이관 보류 사유 해제(2026-09-01 대표, 260731-0032).
+
+    "TMS에서 원래 반입처리가 되어야 하는데 담당자가 깜빡했나 봐.
+     TMS 반입처리 후 바로 적용이 안 되니, 임의로 풀 수 있는 방법이 있나?"
+
+    판매 기록 가드는 asset_events 의 '판매' 사건을 본다 — 지난 기록이라 지울 수도 없고
+    주문을 취소해도 안 사라진다. 반품·오등록이면 그 자산은 영영 이관 불가로 남았다.
+
+    ★전체를 여는 스위치가 아니다: 자산 한 대 · 사유 하나 · 사유 필수 · 기록 남김 · 되돌리기 가능.
+      (대표 2026-08-14 "강제 이관 우회로 없음"은 그대로다 — 이건 사람이 남기는 판정이다)
+    """
+
+    def _sold_rental(self, serial="HO-1"):
+        """렌탈 귀속인데 판매 기록이 붙어 있는 자산 — 딱 그 상황을 만든다."""
+        b = self._batch()["id"]
+        aid = self._asset(b, model="반품기계", serial=serial).get_json()[0]["id"]
+        with self.app.app_context():
+            from app.db import tx
+            from app.purchase import asset_event
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET division='rental' WHERE id=?", (aid,))
+                asset_event(conn, aid, "판매", {"판매전표": "S260818-001", "수령자": "박현호"})
+        return self.c.get(f"/api/assets/{aid}").get_json()["assetNo"]
+
+    def _inspect(self, no):
+        r = self.c.post("/api/transfers",
+                        json={"direction": "rental->sale", "assetNos": [no]})
+        d = r.get_json()
+        it = d["items"][0]
+        if d.get("commitId"):
+            self.c.post(f"/api/transfers/{d['commitId']}/reject")
+        return it
+
+    def test_풀기_전에는_막힌다(self):
+        no = self._sold_rental()
+        it = self._inspect(no)
+        self.assertEqual(it["result"], "blocked")
+        self.assertIn("판매 기록", it["note"])
+        self.assertIn("보류 해제", it["note"], "어떻게 푸는지 안내가 없다")
+
+    def test_사유_없이는_못_푼다(self):
+        no = self._sold_rental()
+        self.assertEqual(self.c.post("/api/assets/hold-override",
+                                     json={"assetNos": [no], "kinds": ["sold_rec"]}).status_code,
+                         400, "사유 없이 풀렸다")
+
+    def test_못_푸는_사유는_거부한다(self):
+        """대여중·폐기 같은 건 기록이 틀린 게 아니라 지금 그런 상태다 — 여기서 못 푼다."""
+        no = self._sold_rental()
+        for kind in ("rms_out", "scrapped", "locked"):
+            r = self.c.post("/api/assets/hold-override",
+                            json={"assetNos": [no], "kinds": [kind], "note": "x"})
+            self.assertEqual(r.status_code, 400, f"{kind} 가 풀렸다")
+
+    def test_풀면_넘어가되_경고가_붙는다(self):
+        no = self._sold_rental()
+        note = "TMS 반입처리 누락 — 실물은 창고에 있음"
+        r = self.c.post("/api/assets/hold-override",
+                        json={"assetNos": [no], "kinds": ["sold_rec"], "note": note})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        it = self._inspect(no)
+        self.assertEqual(it["result"], "ok", it.get("note"))
+        self.assertTrue(it.get("warn"), "조용히 넘어갔다 — 풀었다는 사실이 안 보인다")
+        self.assertIn("보류 해제됨", it["note"])
+        self.assertIn(note, it["note"], "왜 풀었는지가 미리보기에 없다")
+
+    def test_다른_자산까지_열리지는_않는다(self):
+        a = self._sold_rental("HO-A")
+        b = self._sold_rental("HO-B")
+        self.c.post("/api/assets/hold-override",
+                    json={"assetNos": [a], "kinds": ["sold_rec"], "note": "확인함"})
+        self.assertEqual(self._inspect(a)["result"], "ok")
+        self.assertEqual(self._inspect(b)["result"], "blocked", "전체가 열렸다")
+
+    def test_다시_막을_수_있다(self):
+        no = self._sold_rental()
+        self.c.post("/api/assets/hold-override",
+                    json={"assetNos": [no], "kinds": ["sold_rec"], "note": "확인함"})
+        self.assertEqual(self._inspect(no)["result"], "ok")
+        self.assertEqual(self.c.post("/api/assets/hold-override",
+                                     json={"assetNos": [no], "undo": True,
+                                           "note": "원복"}).status_code, 200)
+        self.assertEqual(self._inspect(no)["result"], "blocked")
+
+    def test_풀면_정리대기에서_빠지고_표시는_남는다(self):
+        no = self._sold_rental()
+        rows = self.c.get("/api/assets?issue=hold").get_json()["rows"]
+        self.assertIn(no, [x["assetNo"] for x in rows], "막힌 자산이 정리 대기에 없다")
+        self.c.post("/api/assets/hold-override",
+                    json={"assetNos": [no], "kinds": ["sold_rec"], "note": "확인함"})
+        rows = self.c.get("/api/assets?issue=hold").get_json()["rows"]
+        self.assertNotIn(no, [x["assetNo"] for x in rows], "풀었는데 정리 대기에 남아 있다")
+        one = self.c.get(f"/api/assets?q={no}&division=all").get_json()["rows"][0]
+        self.assertEqual(one["holdOverride"], ["sold_rec"], "해제 표시가 목록에 안 남는다")
+        self.assertEqual(one["holdOverrideNote"], "확인함")
+
+    def test_걸린_사유를_전부_알려_준다(self):
+        """한 자산에 매입중복·판매기록이 둘 다 걸릴 수 있다. 하나만 알려 주면
+        화면이 풀고 나서 또 막혀 같은 버튼을 두 번 누르게 된다."""
+        b = self._batch()["id"]
+        a1 = self._asset(b, model="쌍둥이A", serial="TWIN12345").get_json()[0]["id"]
+        # ★같은 시리얼은 등록 자체가 막혀 있다(중복 매입 가드) — 쌍둥이는 DB로 만든다.
+        #   여기서 보려는 것은 등록 가드가 아니라 '걸린 사유를 다 알려 주는가'다.
+        #   ★시리얼은 정규화해서 5자 이상이어야 중복으로 센다 — 짧으면 안 걸린다.
+        a2 = self._asset(b, model="쌍둥이B", serial="OTHER9999").get_json()[0]["id"]
+        with self.app.app_context():
+            from app.db import tx
+            from app.purchase import asset_event
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET serial='TWIN12345' WHERE id=?", (a2,))
+                conn.execute("UPDATE assets SET division='rental' WHERE id=?", (a1,))
+                asset_event(conn, a1, "판매", {"판매전표": "S-1"})
+        no = self.c.get(f"/api/assets/{a1}").get_json()["assetNo"]
+        it = self._inspect(no)
+        kinds = [k for k in str(it.get("overridable") or "").split(",") if k]
+        self.assertEqual(sorted(kinds), ["dup_buy", "sold_rec"],
+                         f"걸린 사유를 다 안 알려 준다: {it.get('overridable')}")
+        self.assertIn("매입 중복", it["note"])
+        self.assertIn("판매 기록", it["note"])
+        self.assertTrue(a2)     # 쌍둥이가 있어야 성립하는 시험이다
+
+    def test_이관창에서_바로_풀_수_있다(self):
+        """대표 2026-09-01 "3단계는 번거로워" — 자산목록에 안 가고 이관 창에서 푼다.
+        RMS도 같은 창구를 쓴다(토큰 자격)."""
+        no = self._sold_rental("IN-1")
+        it = self._inspect(no)
+        kinds = [k for k in str(it.get("overridable") or "").split(",") if k]
+        r = self.c.post("/api/assets/hold-override",
+                        json={"assetNos": [no], "kinds": kinds, "note": "반입 누락"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(self._inspect(no)["result"], "ok", "풀었는데 아직 막힌다")
+
+    def test_화면_배선(self):
+        js = (ROOT / "static" / "js" / "purchase.js").read_text("utf-8")
+        self.assertIn('id="tr-unhold"', js, "이관 창에 풀기 버튼이 없다")
+        self.assertIn("function overrideBadge", js, "해제 배지가 없다")
+        self.assertIn('id="af-unhold"', js, "보류 해제 버튼이 없다")
+        self.assertIn("/api/assets/hold-override", js, "창구 배선이 없다")
+
+
+class TestRentalNotSellable(Base):
+    """렌탈 귀속 자산은 판매 재고로 올릴 수 없다(대표 2026-08-31 저녁).
+
+    매입 전표에는 렌탈로 나간 제품도 그대로 남는다 — 매입은 두 사업부의 공통 앞단이라
+    기록을 지우면 안 된다. 다만 그 전표를 열었을 때 '팔 수 있는 물건'처럼 보이면 안 된다.
+
+    ★이전에는 [몰 재고 전송]을 켤 수 있었고 켜면 초록 '전송'까지 떴다. 그런데 몰 재고를
+      세는 쿼리에는 sale_only 가 걸려 있어 실제로는 아무 데도 안 올라갔다 —
+      화면만 "올라갔다"고 말하는 상태였다.
+    """
+
+    def _rental_asset(self):
+        b = self._batch()["id"]
+        aid = self._asset(b, model="렌탈기계", serial="RENT-1",
+                          productCode="CODE-R").get_json()[0]["id"]
+        # 사업부 이관 창구를 거치지 않고 직접 렌탈로 만든다 — 여기서 보려는 것은
+        # 이관 흐름이 아니라 '렌탈이면 재고반영이 막히는가'뿐이다.
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET division='rental' WHERE id=?", (aid,))
+        return b, aid
+
+    def _listed(self, aid):
+        with self.app.app_context():
+            from app.db import get_db
+            return get_db().execute(
+                "SELECT stock_listed FROM assets WHERE id=?", (aid,)).fetchone()[0]
+
+    def test_자산수정으로_켤_수_없다(self):
+        _b, aid = self._rental_asset()
+        r = self.c.patch(f"/api/assets/{aid}", json={"stockListed": True})
+        self.assertEqual(r.status_code, 400, r.get_data(as_text=True))
+        msg = r.get_json()["error"]
+        self.assertIn("렌탈", msg)
+        self.assertIn("이관", msg, "무엇을 해야 하는지(사업부 이관)가 안내되지 않는다")
+        self.assertEqual(self._listed(aid), 0, "막았다면서 값이 바뀌었다")
+
+    def test_제품코드보다_렌탈_사유가_먼저_나온다(self):
+        """렌탈 자산은 대개 제품코드가 없다 — 순서가 반대면 담당자가 코드를 채운 뒤에야
+        진짜 이유를 만나게 된다."""
+        b = self._batch()["id"]
+        aid = self._asset(b, model="코드없음", serial="RENT-2").get_json()[0]["id"]
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET division='rental' WHERE id=?", (aid,))
+        msg = self.c.patch(f"/api/assets/{aid}",
+                           json={"stockListed": True}).get_json()["error"]
+        self.assertIn("렌탈", msg, f"제품코드 안내가 먼저 떴다: {msg}")
+
+    def test_일괄에서는_건너뛰고_판매분만_반영된다(self):
+        _b, rid = self._rental_asset()
+        b2 = self._batch()["id"]
+        sid = self._asset(b2, model="판매기계", serial="SALE-1",
+                          productCode="CODE-S").get_json()[0]["id"]
+        r = self.c.post("/api/assets/stock-listing", json={"ids": [rid, sid], "on": True})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        d = r.get_json()
+        self.assertEqual(d["ok"], 1, "판매 자산 1대만 반영돼야 한다")
+        self.assertTrue(any("렌탈" in (x.get("reason") or "") for x in d["skipped"]),
+                        f"렌탈을 건너뛴 사유가 없다: {d['skipped']}")
+        self.assertEqual(self._listed(rid), 0)
+        self.assertEqual(self._listed(sid), 1)
+
+    def test_끄는_것은_막지_않는다(self):
+        """옛 데이터를 정리할 길은 항상 열려 있어야 한다."""
+        _b, aid = self._rental_asset()
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute("UPDATE assets SET stock_listed=1 WHERE id=?", (aid,))
+        self.assertEqual(
+            self.c.patch(f"/api/assets/{aid}", json={"stockListed": False}).status_code, 200)
+        self.assertEqual(self._listed(aid), 0)
+
+    def test_전표상세가_렌탈의_진짜_상태를_알려준다(self):
+        """대표 2026-09-01 — "출고완료에 아무것도 적혀있지 않은 애들 중 일부 렌탈이 있는데
+        전표상세에도 렌탈자산으로 나올 수 있게 해줘야 돼".
+
+        렌탈 자산의 OWS status 는 실상을 말해 주지 못한다(shipped=TMS 이관 흔적,
+        ready=아예 틀린 말). RMS가 밀어 넣어 둔 사본에서 진짜 상태와 임차인을 가져온다.
+        """
+        b, aid = self._rental_asset()
+        no = self.c.get(f"/api/assets/{aid}").get_json()["assetNo"]
+        with self.app.app_context():
+            from app.db import tx
+            with tx(write=True) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO rms_inventory(asset_no, status, renter, synced_at) "
+                    "VALUES(?,?,?,?)", (no, "rented", "주식회사코넥", "2026-09-01T10:00:00+09:00"))
+        d = self.c.get(f"/api/purchase-batches/{b}").get_json()
+        a = next(x for x in d["assets"] if x["assetNo"] == no)
+        self.assertEqual(a["rmsStatus"], "rented", "RMS 상태가 전표 상세에 안 실린다")
+        self.assertEqual(a["rmsRenter"], "주식회사코넥", "임차인이 전표 상세에 안 실린다")
+        self.assertEqual(d["rentalCount"], 1, "전표의 렌탈 대수가 안 나온다")
+
+    def test_RMS_사본이_없어도_전표상세가_열린다(self):
+        """RMS가 한 번도 목록을 안 밀었으면 상태를 모를 뿐, 화면이 깨지면 안 된다."""
+        b, aid = self._rental_asset()
+        d = self.c.get(f"/api/purchase-batches/{b}").get_json()
+        a = next(x for x in d["assets"] if x["id"] == aid)
+        self.assertEqual(a["rmsStatus"], "")
+        self.assertEqual(a["rmsRenter"], "")
+
+    def test_전표_화면이_렌탈을_판매불가로_보여준다(self):
+        js = (ROOT / "static" / "js" / "purchase.js").read_text("utf-8")
+        self.assertIn("판매불가</span>", js, "전표 상세 재고 칸에 판매불가 표시가 없다")
+        self.assertIn("sd-rentalcount", js, "전표 머리에 판매/렌탈 대수가 없다")
+        self.assertIn("${escapeHtml(a.assetNo)}</button>${divBadge(a)}", js,
+                      "전표 상세 행에 렌탈 배지가 없다")
+        self.assertIn("function rentalStateChip", js, "렌탈 상태 칩이 없다")
+        self.assertIn("렌탈 대여중", js, "RMS 상태를 사람 말로 바꾸는 표가 없다")
+        self.assertIn("a.rmsRenter", js, "임차인을 안 보여준다")
 
 
 class TestProvisionalNotInStock(Base):
@@ -205,7 +622,7 @@ class TestAuditFixes(unittest.TestCase):
     """2026-07-30 감사(47에이전트, 확정 13건)에서 나온 결함들의 회귀 방지."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-af-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-af-"))
         self.app = create_app(db_path=self.tmp / "t.db")
         self.app.testing = True
         self.c = self.app.test_client()
@@ -293,26 +710,30 @@ class TestAuditFixes(unittest.TestCase):
         self.assertEqual(p["avgBuy"], 100000, f"매입가 0원까지 나눠 평균이 낮아졌다: {p['avgBuy']}")
         self.assertEqual(p["buyMissing"], 7, "매입가 미입력 대수를 알려 줘야 한다")
 
-    # ── 모델 재고 브리핑 ─────────────────────────────────────────────
-    def test_모델_브리핑이_재고와_최근매입가를_준다(self):
+    # ── 모델 매입단가 브리핑 ─────────────────────────────────────────
+    def test_모델_브리핑이_최근매입가를_준다(self):
         b = self._b()
         for _ in range(2):
             self.c.post("/api/assets", json={
                 "batchId": b["id"], "categoryId": self.cat, "qty": 1,
                 "maker": "LG", "model": "17Z95N", "purchasePrice": 660000})
         r = self.c.get("/api/assets/model-brief?model=17Z95N").get_json()
-        self.assertEqual(r["stock"], 2)
         self.assertEqual(r["avgBuy"], 660000)
         self.assertTrue(r["recentBuys"])
 
-    def test_브리핑은_가입고분을_재고와_분리한다(self):
-        v = self._b("provisional")
+    def test_브리핑은_재고_대수를_주지_않는다(self):
+        """★대표 지시 2026-08-07 — "이름으로 유추하는 재고 안내는 아예 없애줘.
+        모든 재고 확인은 제품코드로 통일." 모델명 LIKE 는 '갤럭시탭 S6'를 치면
+        'S6 Lite'까지 세는 식이라 숫자가 틀렸다. 이 응답에 재고 칸이 다시 생기면
+        화면 어딘가가 또 그걸 그리게 된다 — 여기서 막는다.
+        """
+        b = self._b()
         self.c.post("/api/assets", json={
-            "batchId": v["id"], "categoryId": self.cat, "qty": 1,
+            "batchId": b["id"], "categoryId": self.cat, "qty": 1,
             "maker": "LG", "model": "17Z95N", "purchasePrice": 660000})
         r = self.c.get("/api/assets/model-brief?model=17Z95N").get_json()
-        self.assertEqual(r["stock"], 0, "안 받은 물건이 재고로 잡혔다")
-        self.assertEqual(r["pending"], 1, "입고대기 대수를 알려 줘야 한다")
+        for gone in ("stock", "pending", "byGrade"):
+            self.assertNotIn(gone, r, f"이름 기반 재고 안내({gone})가 되살아났다")
 
 
 class TestMigrationFill(unittest.TestCase):
@@ -323,7 +744,7 @@ class TestMigrationFill(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-mg-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-mg-"))
         self.app = create_app(db_path=self.tmp / "t.db")
         self.app.testing = True
         self.c = self.app.test_client()
@@ -400,6 +821,19 @@ class TestMigrationFill(unittest.TestCase):
         r = self._post("/api/assets/migrate", rows, fill=True).get_json()
         self.assertEqual(r["created"], 1)
 
+    def test_대분류_PC만_있으면_노트북_중분류가_있으면_그_카테고리(self):
+        """카테고리 = TMS 중분류 축(2026-09-03, A5 결정 ③) — 중분류 없이 'PC'만 오는 옛 엑셀 행은 기본값(노트북)."""
+        cats = {c["name"]: c["id"] for c in self.c.get("/api/categories").get_json()}
+        # ★_xls 는 첫 행의 키를 머리글로 쓴다 — 모든 행이 같은 칸을 가져야 한다(중분류 빈칸은 "")
+        rows = [{"관리번호": "260101-0010", "대분류": "PC", "중분류": "", "모델명": "NEW-A", "매입가": "1"},
+                {"관리번호": "260101-0011", "대분류": "PC", "중분류": "데스크탑", "모델명": "NEW-B", "매입가": "1"},
+                {"관리번호": "260101-0012", "대분류": "모니터", "중분류": "", "모델명": "NEW-C", "매입가": "1"}]
+        r = self._post("/api/assets/migrate", rows, fill=True).get_json()
+        self.assertEqual(r["created"], 3, r)
+        got = {a["assetNo"]: a["categoryId"] for a in self.c.get("/api/assets?limit=500").get_json()["rows"]}
+        self.assertEqual(got["260101-0010"], cats["노트북"])
+        self.assertEqual(got["260101-0011"], cats["데스크탑"])
+        self.assertEqual(got["260101-0012"], cats["모니터"])
 
 class TestCancelReturn(Base):
     """전표 취소·반품 — TMS도 '매입취소'를 쓴다(465건 중 6건). 지우지 않고 표시한다."""
@@ -427,8 +861,10 @@ class TestCancelReturn(Base):
         self.c.post(f"/api/purchase-batches/{b['id']}/cancel", json={"reason": "오등록"})
         got = self.c.get(f"/api/assets/{a['id']}").get_json()
         self.assertEqual(got["status"], "cancelled")
-        br = self.c.get("/api/assets/model-brief?model=L480").get_json()
-        self.assertEqual(br["stock"], 0, "취소된 자산이 재고로 남았다")
+        # 재고 오라클: 목록 API의 상태 필터 (model-brief 재고는 2026-08-07 제거됨)
+        rows = self.c.get("/api/assets?status=in_stock").get_json()["rows"]
+        self.assertEqual(len([x for x in rows if x["model"] == "L480"]), 0,
+                         "취소된 자산이 재고로 남았다")
 
     def test_출고된_자산이_있으면_취소를_막는다(self):
         """★이미 고객에게 나간 물건이 걸린 전표를 무르면 안 된다."""
@@ -467,7 +903,9 @@ class TestCancelReturn(Base):
         self.assertEqual(self.c.get(f"/api/assets/{a['id']}").get_json()["status"], "returned")
         d = self.c.get(f"/api/purchase-batches/{b['id']}").get_json()
         self.assertEqual(d["returnedAt"], "2026-07-31")
-        self.assertEqual(self.c.get("/api/assets/model-brief?model=L480").get_json()["stock"], 0)
+        rows = self.c.get("/api/assets?status=in_stock").get_json()["rows"]
+        self.assertEqual(len([x for x in rows if x["model"] == "L480"]), 0,
+                         "반품된 자산이 재고로 남았다")
 
     def test_일부만_반품하면_전표_반품일은_안_찍힌다(self):
         b = self._batch()
@@ -525,7 +963,7 @@ class TestBatchWithAssets(Base):
         self.assertIn("3번째 줄", r.get_json()["error"])
         after = len(self.c.get("/api/purchase-batches?includeCancelled=1").get_json())
         self.assertEqual(before, after, "실패했는데 전표가 남았다")
-        self.assertEqual(len(self.c.get("/api/assets").get_json()), 0, "자산이 부분 생성됐다")
+        self.assertEqual(len(self.c.get("/api/assets").get_json()["rows"]), 0, "자산이 부분 생성됐다")
 
     def test_가입고로_동시저장하면_전부_미입고다(self):
         r = self.c.post("/api/purchase-batches", json={
@@ -549,7 +987,7 @@ class TestBatchWithAssets(Base):
 
 
 class TestTmsStatusMapping(unittest.TestCase):
-    """★TMS 재고상태 → HMS 자산상태 매핑.
+    """★TMS 재고상태 → OWS 자산상태 매핑.
 
     2026-07-30 내보내기 14,969건에서 확인한 실제 값은 매입/판매/렌탈/반납/반입/판매취소인데
     매핑표에는 하나도 없었다. 그대로 두면 전부 기본값(입고)으로 들어가
@@ -564,7 +1002,7 @@ class TestTmsStatusMapping(unittest.TestCase):
         self.assertEqual(self._resolve(tms_status="판매")[1], "shipped")
 
     def test_렌탈나간_것도_재고가_아니다(self):
-        """렌탈은 RMS가 관리한다 — HMS 재고로 세면 이중 계상이다."""
+        """렌탈은 RMS가 관리한다 — OWS 재고로 세면 이중 계상이다."""
         self.assertEqual(self._resolve(tms_status="렌탈")[1], "shipped")
 
     def test_매입은_판매가능_재고다(self):
@@ -594,15 +1032,152 @@ class TestTmsStatusMapping(unittest.TestCase):
         self.assertEqual((grade, status, note), ("A급", "ready", ""))
 
 
+class TestTmsStatusUpdate(unittest.TestCase):
+    """★기존 자산 상태 자동 갱신(2026-08-07 대표 결정) — 정방향만 따라간다.
+
+    "판매인지 폐기인지 이런 세부사항들이 계속 변경이 돼" → TMS가 나감/폐기라고
+    하면 기존 자산도 따라간다. 단 주문매칭·회수중·매입취소·거래처반품은 각자
+    주인이 있는 상태라 절대 건드리지 않고, 재고 복귀는 알림만 남긴다.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-st-"))
+        self.app = create_app(db_path=self.tmp / "t.db")
+        self.app.testing = True
+        self.c = self.app.test_client()
+        auth_mod._login_failures.clear()
+        self.c.post("/api/auth/setup", json={
+            "username": "admin", "displayName": "대표", "password": PW})
+        self.cat = self.c.get("/api/categories").get_json()[0]["id"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mk(self, no, status):
+        """지정 상태의 기존 자산 하나 — reserved 등은 API가 막으니 직접 넣는다."""
+        import sqlite3
+        a = self.c.post("/api/assets", json={
+            "categoryId": self.cat, "qty": 1, "assetNo": no}).get_json()[0]
+        if status != "in_stock":
+            conn = sqlite3.connect(self.tmp / "t.db")
+            conn.execute("UPDATE assets SET status=? WHERE id=?", (status, a["id"]))
+            conn.commit()
+            conn.close()
+        return a["id"]
+
+    def _sync(self, rows):
+        from app.db import tx
+        from app.purchase.migration import _prepare, apply_rows
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                ready, dup, errors, updates, _lk = _prepare(conn, rows, fill_blanks=True)
+                return apply_rows(conn, ready, updates, actor="자동반영")
+
+    def _status(self, aid):
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "t.db")
+        st = conn.execute("SELECT status FROM assets WHERE id=?", (aid,)).fetchone()[0]
+        conn.close()
+        return st
+
+    def test_판매로_바뀌면_출고완료로_따라간다(self):
+        aid = self._mk("260807-1001", "ready")
+        res = self._sync([{"관리번호": "260807-1001", "모델명": "L480", "재고상태": "판매"}])
+        self.assertEqual(res["statusUpdated"], 1, res)
+        self.assertEqual(self._status(aid), "shipped")
+        # 이력이 남아야 추적/복구할 수 있다
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "t.db")
+        ev = conn.execute("SELECT detail FROM asset_events WHERE asset_id=? "
+                          "AND action='TMS상태갱신'", (aid,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(ev, "상태갱신 이력이 없다")
+
+    def test_폐기로_바뀌면_폐기로_따라간다(self):
+        aid = self._mk("260807-1002", "defective")
+        res = self._sync([{"관리번호": "260807-1002", "모델명": "L480", "재고상태": "폐기"}])
+        self.assertEqual(res["statusUpdated"], 1, res)
+        self.assertEqual(self._status(aid), "scrapped")
+
+    def test_주문매칭_자산은_절대_건드리지_않는다(self):
+        aid = self._mk("260807-1003", "reserved")
+        res = self._sync([{"관리번호": "260807-1003", "모델명": "L480", "재고상태": "판매"}])
+        self.assertEqual(res["statusUpdated"], 0, res)
+        self.assertEqual(self._status(aid), "reserved", "★주문 흐름의 상태를 TMS가 덮었다")
+
+    def test_매입취소_거래처반품도_안_건드린다(self):
+        for no, st in (("260807-1004", "cancelled"), ("260807-1005", "returned")):
+            aid = self._mk(no, st)
+            self._sync([{"관리번호": no, "모델명": "L480", "재고상태": "판매"}])
+            self.assertEqual(self._status(aid), st, "전표 회계 상태를 TMS가 덮었다")
+
+    def test_작업상태끼리는_옮기지_않는다(self):
+        """TMS '매입'(판매가능)이 수리 중인 자산을 판매가능으로 풀면 안 된다."""
+        aid = self._mk("260807-1006", "repair")
+        res = self._sync([{"관리번호": "260807-1006", "모델명": "L480", "재고상태": "매입"}])
+        self.assertEqual(res["statusUpdated"], 0, res)
+        self.assertEqual(self._status(aid), "repair")
+
+    def test_재고복귀는_자동반영_대신_알림만(self):
+        aid = self._mk("260807-1007", "shipped")
+        res = self._sync([{"관리번호": "260807-1007", "모델명": "L480", "재고상태": "반입"}])
+        self.assertEqual(self._status(aid), "shipped", "★검수 없이 재고로 되살아났다")
+        self.assertEqual(res.get("statusReverts"), 1, res)
+        self.assertTrue(any("260807-1007" in s for s in res.get("statusAlerts", [])), res)
+
+    def test_읽은_뒤_사람이_바꿨으면_덮지_않는다(self):
+        """_prepare 가 읽은 상태와 지금 상태가 다르면(그 사이 주문 매칭 등) 건드리지 않는다."""
+        aid = self._mk("260807-1008", "ready")
+        from app.db import tx
+        from app.purchase.migration import _prepare, apply_rows
+        rows = [{"관리번호": "260807-1008", "모델명": "L480", "재고상태": "판매"}]
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                ready, dup, errors, updates, _lk = _prepare(conn, rows, fill_blanks=True)
+                conn.execute("UPDATE assets SET status='reserved' WHERE id=?", (aid,))
+                res = apply_rows(conn, ready, updates, actor="자동반영")
+        self.assertEqual(res["statusUpdated"], 0, "★경합 방지가 뚫렸다")
+        self.assertEqual(self._status(aid), "reserved")
+
+    def test_상태갱신되면_재고반영도_함께_꺼진다(self):
+        """★유령 재고 방지(2026-08-09) — 팔린 자산이 몰 재고에 계속 세어지면 안 된다."""
+        import sqlite3
+        aid = self._mk("260807-1009", "ready")
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.execute("UPDATE assets SET product_code='TST_1_1', stock_listed=1 WHERE id=?", (aid,))
+        conn.commit(); conn.close()
+        self._sync([{"관리번호": "260807-1009", "모델명": "L480", "재고상태": "판매"}])
+        conn = sqlite3.connect(self.tmp / "t.db")
+        listed = conn.execute("SELECT stock_listed FROM assets WHERE id=?", (aid,)).fetchone()[0]
+        ev = conn.execute("SELECT 1 FROM asset_events WHERE asset_id=? AND action='재고해제'",
+                          (aid,)).fetchone()
+        conn.close()
+        self.assertEqual(listed, 0, "★출고된 자산의 재고반영이 켜진 채 남았다")
+        self.assertIsNotNone(ev, "재고해제 이력이 없다")
+
+    def test_복귀후보는_이벤트로_한_번만_쌓인다(self):
+        """★복귀후보 대기열(2026-08-09) — 2시간마다 다시 와도 열린 후보는 중복으로 안 쌓인다."""
+        import sqlite3
+        aid = self._mk("260807-1010", "shipped")
+        row = [{"관리번호": "260807-1010", "모델명": "L480", "재고상태": "반입"}]
+        self._sync(row)
+        self._sync(row)                       # 다음 주기 — 또 온다
+        conn = sqlite3.connect(self.tmp / "t.db")
+        n = conn.execute("SELECT COUNT(*) FROM asset_events WHERE asset_id=? "
+                         "AND action='복귀후보'", (aid,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1, "★복귀후보가 주기마다 중복으로 쌓인다")
+
+
 class TestAutoSync(unittest.TestCase):
     """★TMS 엑셀 자동 반영 — 폴더에 새 파일이 들어오면 알아서 최신화.
 
     대표 질문(2026-07-30): "매일 엑셀 내보내기해서 데이터 최신화는 언제 할래?"
-    → 내보내기는 대표가(TMS를 건드리지 않기 위해), 반영은 HMS가 자동으로.
+    → 내보내기는 대표가(TMS를 건드리지 않기 위해), 반영은 OWS가 자동으로.
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-as-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-as-"))
         self.app = create_app(db_path=self.tmp / "t.db")
         self.app.testing = True
         self.c = self.app.test_client()
@@ -625,10 +1200,10 @@ class TestAutoSync(unittest.TestCase):
         self.assertFalse(_is_asset_sheet([]))
 
     def test_우리_주문엑셀은_자산표로_보지_않는다(self):
-        """★HMS가 뽑은 주문 엑셀에도 '자산번호' 칸이 있다.
+        """★OWS가 뽑은 주문 엑셀에도 '자산번호' 칸이 있다.
 
         tms-export 폴더에 잘못 떨구면 자산 표로 오인돼 없는 자산이 자동 등록된다
-        (2026-07-31 hms-orders-20260731.xlsx가 실제로 이 폴더를 통과했다).
+        (2026-07-31 ows-orders-20260731.xlsx가 실제로 이 폴더를 통과했다).
         """
         from app.purchase.autosync import _is_asset_sheet
         order_row = [{"주문일": "2026-07-31", "쇼핑몰": "고도몰", "주문번호": "12345",
@@ -637,7 +1212,7 @@ class TestAutoSync(unittest.TestCase):
         self.assertFalse(_is_asset_sheet(order_row), "주문 표가 자산 표로 통과했다")
         # 파일 이름만으로도 막는다(칸 구성이 바뀌어도)
         self.assertFalse(_is_asset_sheet([{"관리번호": "260101-0001", "모델명": "L480"}],
-                                         "hms-orders-20260731.xlsx"))
+                                         "ows-orders-20260731.xlsx"))
         # 관리번호 한 칸만 있는 표는 자산 표로 보지 않는다 — 무엇이든 통과시키던 구멍
         self.assertFalse(_is_asset_sheet([{"자산번호": "260101-0001"}]))
 
@@ -647,7 +1222,7 @@ class TestAutoSync(unittest.TestCase):
         from app.purchase.migration import _prepare
         with self.app.app_context():
             with tx() as conn:
-                ready, dup, errors, updates = _prepare(
+                ready, dup, errors, updates, _lk = _prepare(
                     conn, [{"관리번호": "260101-0001, 260101-0002", "모델명": "L480"}])
         self.assertEqual(ready, [], "쉼표가 섞인 관리번호가 자산으로 등록됐다")
         self.assertTrue(any("형식이 아닙니다" in e for e in errors), errors)
@@ -813,6 +1388,8 @@ class TestAssetToCustomerTrace(Base):
 
     def test_다른_주문에_이미_붙은_자산은_못_붙인다(self):
         """★같은 노트북이 두 고객에게 나가면 안 된다."""
+        self.assertEqual(self.c.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": False}}).status_code, 200)
         b = self._batch()
         a = self._asset(b["id"], model="L480").get_json()[0]
         o1, o2 = self._order("고객A"), self._order("고객B")
@@ -822,14 +1399,282 @@ class TestAssetToCustomerTrace(Base):
         r = self.c.patch(f"/api/orders/{o2['id']}", json={"action": "assets", "assetIds": [a["id"]]})
         self.assertGreaterEqual(r.status_code, 400, "한 자산이 두 주문에 붙었다")
 
+    def test_설정에서_허용하면_반품_재출고_자산을_중복_매칭한다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        o1, o2 = self._order("기존고객"), self._order("재출고고객")
+        self.assertEqual(
+            self.c.patch(f"/api/orders/{o1['id']}",
+                         json={"action": "assets", "assetIds": [a["id"]]}).status_code, 200)
+        self.assertEqual(self.c.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": True}}).status_code, 200)
+
+        found = self.c.get(f"/api/orders/asset-search?q={a['assetNo']}").get_json()
+        hit = next(x for x in found if x["assetId"] == a["id"])
+        self.assertTrue(hit["available"], "허용 설정인데 셋팅 입력 후보에서 막혔다")
+        r = self.c.patch(f"/api/orders/{o2['id']}",
+                         json={"action": "assets", "assetIds": [a["id"]]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+    def test_설정에서_허용한_경우에만_렌탈_자산을_선제작한다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="렌탈 L480").get_json()[0]
+        with self.app.app_context():
+            conn = get_db()
+            conn.execute("UPDATE assets SET division='rental' WHERE id=?", (a["id"],))
+            conn.commit()
+
+        blocked = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]})
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("렌탈", blocked.get_data(as_text=True))
+
+        saved = self.c.put("/api/settings", json={
+            "prebuild_rental_asset": {"enabled": True}})
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        made = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]})
+        self.assertEqual(made.status_code, 201, made.get_data(as_text=True))
+        self.assertEqual(made.get_json()["assetNo"], a["assetNo"])
+
+    def test_설정에서_허용한_경우에만_렌탈_자산을_셋팅에_매칭한다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="렌탈 셋팅 L480").get_json()[0]
+        o = self._order("렌탈셋팅고객")
+        with self.app.app_context():
+            conn = get_db()
+            conn.execute("UPDATE assets SET division='rental' WHERE id=?", (a["id"],))
+            conn.commit()
+
+        found = self.c.get(f"/api/orders/asset-search?q={a['assetNo']}").get_json()
+        hit = next(x for x in found if x["assetId"] == a["id"])
+        self.assertFalse(hit["available"])
+        blocked = self.c.patch(f"/api/orders/{o['id']}",
+                               json={"action": "assets", "assetIds": [a["id"]]})
+        self.assertEqual(blocked.status_code, 409)
+        self.assertIn("렌탈", blocked.get_data(as_text=True))
+
+        saved = self.c.put("/api/settings", json={
+            "prebuild_rental_asset": {"enabled": True}})
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        found = self.c.get(f"/api/orders/asset-search?q={a['assetNo']}").get_json()
+        hit = next(x for x in found if x["assetId"] == a["id"])
+        self.assertTrue(hit["available"], "허용 설정인데 셋팅 입력 후보에서 막혔다")
+        matched = self.c.patch(f"/api/orders/{o['id']}",
+                               json={"action": "assets", "assetIds": [a["id"]]})
+        self.assertEqual(matched.status_code, 200, matched.get_data(as_text=True))
+        self.assertEqual(matched.get_json()["assets"][0]["assetNo"], a["assetNo"])
+
+    def test_선제작_완료_자산을_주문에_넣으면_단계와_실적이_자동_반영된다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        made = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]})
+        self.assertEqual(made.status_code, 201, made.get_data(as_text=True))
+        pid = made.get_json()["id"]
+        for action in ("production", "inspection", "ready"):
+            r = self.c.patch(f"/api/prebuilds/{pid}", json={"action": action, "value": True})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+        found = self.c.get(f"/api/orders/asset-search?q={a['assetNo']}").get_json()
+        hit = next(x for x in found if x["assetId"] == a["id"])
+        self.assertTrue(hit["prebuild"]["ready"])
+
+        o = self._order("선제작고객")
+        linked = self.c.patch(f"/api/orders/{o['id']}",
+                              json={"action": "assets", "assetIds": [a["id"]]})
+        self.assertEqual(linked.status_code, 200, linked.get_data(as_text=True))
+        order = linked.get_json()
+        self.assertTrue(order["assets"][0]["isPrebuilt"])
+        self.assertTrue(order["productionDone"])
+        self.assertTrue(order["softwareInspectionDone"])
+        self.assertEqual(order["productionBy"], "대표")
+        self.assertEqual(order["softwareInspectionBy"], "대표")
+        used = self.c.get("/api/prebuilds?view=used").get_json()["rows"]
+        self.assertEqual(used[0]["usedOrderId"], o["id"])
+
+        stats = self.c.get("/api/reports/setup-stats?period=year&date=2026-08-31").get_json()
+        staff = next(x for x in stats["staff"] if x["name"] == "대표")
+        self.assertEqual(staff["units"], 1)
+        self.assertEqual(staff["inspected"], 1)
+        pre_stats = self.c.get(
+            "/api/reports/prebuild-stats?period=year&date=2026-08-31").get_json()
+        self.assertEqual(pre_stats["totals"], {
+            "production": 1, "inspection": 1, "ready": 1, "used": 1})
+        self.assertEqual(pre_stats["currentReady"], 0)
+        self.assertEqual(pre_stats["rows"][0]["assetNo"], a["assetNo"])
+
+        workload = self.c.get(
+            "/api/workload-stats?from=2026-01-01&to=2026-12-31").get_json()
+        worker = next(x for x in workload["workers"] if x["worker"] == "대표")
+        self.assertEqual(worker["stages"]["production"], 1)
+        self.assertEqual(worker["stages"]["inspection"], 1)
+        self.assertEqual(worker["stages"]["prebuildProduction"], 1)
+        self.assertEqual(worker["stages"]["prebuildInspection"], 1)
+        prebuild_work = [x for x in workload["workOrders"]
+                         if x["stage"].startswith("prebuild")]
+        self.assertEqual(len(prebuild_work), 2)
+        self.assertTrue(all(x["managementNumber"] == a["assetNo"] for x in prebuild_work))
+
+        # 사양이 같아도 작업자가 선택하면 사양변경 모드로 전환할 수 있다.
+        rework = self.c.patch(f"/api/orders/{o['id']}", json={
+            "action": "prebuildRework", "assetId": a["id"],
+            "ram1Type": "온보드", "ram1": "8GB", "ram2Type": "D4", "ram2": "8GB",
+            "ssdType": "M.2 NVMe", "ssd": "512GB", "hdd": "없음"})
+        self.assertEqual(rework.status_code, 200, rework.get_data(as_text=True))
+        changed = rework.get_json()
+        self.assertFalse(changed["productionDone"])
+        self.assertFalse(changed["softwareInspectionDone"])
+        self.assertTrue(changed["assets"][0]["prebuildReworkRequired"])
+        changed_prebuild = self.c.get("/api/prebuilds?view=used").get_json()["rows"][0]
+        self.assertEqual(changed_prebuild["finalRam"], "16GB")
+        self.assertEqual(changed_prebuild["finalSsd"], "512GB")
+
+        cancelled = self.c.patch(f"/api/orders/{o['id']}", json={
+            "action": "cancel", "reason": "선제작 원복 테스트"})
+        self.assertEqual(cancelled.status_code, 200, cancelled.get_data(as_text=True))
+        active = self.c.get("/api/prebuilds?view=active").get_json()["rows"]
+        self.assertEqual(active[0]["assetNo"], a["assetNo"])
+        self.assertIsNone(active[0]["usedOrderId"])
+        after = self.c.get(
+            "/api/reports/prebuild-stats?period=year&date=2026-08-31").get_json()
+        self.assertEqual(after["totals"]["used"], 0)
+        self.assertEqual(after["currentReady"], 1)
+
+    def test_선제작과_주문_사양이_다르면_기존실적을_유지하고_사양변경을_추가한다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", ram="8GB", ssd="256GB").get_json()[0]
+        made = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]}).get_json()
+        for action in ("production", "inspection", "ready"):
+            r = self.c.patch(f"/api/prebuilds/{made['id']}",
+                             json={"action": action, "value": True})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+
+        o = self.c.post("/api/orders", json={
+            "recipient": "사양변경고객", "productName": "노트북",
+            "optionName": "RAM 16GB / SSD 256GB", "phone": "010-5555-6666",
+            "address": "서울시 강남구 1", "postalCode": "06000", "amount": 1200000,
+        }).get_json()
+        linked = self.c.patch(f"/api/orders/{o['id']}",
+                              json={"action": "assets", "assetIds": [a["id"]]})
+        self.assertEqual(linked.status_code, 200, linked.get_data(as_text=True))
+        order = linked.get_json()
+        self.assertFalse(order["productionDone"])
+        self.assertFalse(order["softwareInspectionDone"])
+        self.assertTrue(order["assets"][0]["prebuildReworkRequired"])
+        self.assertIn("RAM", order["assets"][0]["prebuildReworkReason"])
+
+        used = self.c.get("/api/prebuilds?view=used").get_json()["rows"][0]
+        self.assertTrue(used["specChangeRequired"])
+        self.assertIn("8GB", used["specChangeReason"])
+
+        before_rework = self.c.get(
+            "/api/workload-stats?from=2026-01-01&to=2026-12-31").get_json()
+        before_worker = next(x for x in before_rework["workers"] if x["worker"] == "대표")
+        self.assertEqual(before_worker["stages"]["prebuildProduction"], 1)
+        self.assertEqual(before_worker["stages"]["prebuildInspection"], 1)
+
+        for action in ("production", "softwareInspection"):
+            r = self.c.patch(f"/api/orders/{o['id']}", json={"action": action, "value": True})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        workload = self.c.get(
+            "/api/workload-stats?from=2026-01-01&to=2026-12-31").get_json()
+        worker = next(x for x in workload["workers"] if x["worker"] == "대표")
+        self.assertEqual(worker["stages"]["production"], 0)
+        self.assertEqual(worker["stages"]["inspection"], 1)
+        self.assertEqual(worker["stages"]["prebuildProduction"], 0)
+        self.assertEqual(worker["stages"]["prebuildInspection"], 0)
+        self.assertEqual(worker["stages"]["specChange"], 1)
+
+    def test_미사용_선제작은_취소하면_삭제되어_즉시_재등록할_수_있다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", ram="8GB", ssd="256GB").get_json()[0]
+        made = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]}).get_json()
+        for action in ("production", "inspection", "ready"):
+            self.c.patch(f"/api/prebuilds/{made['id']}",
+                         json={"action": action, "value": True})
+
+        cancelled = self.c.patch(f"/api/prebuilds/{made['id']}", json={
+            "action": "cancel", "reason": "선제작 계획 변경"})
+        self.assertEqual(cancelled.status_code, 200, cancelled.get_data(as_text=True))
+        self.assertEqual(self.c.get("/api/prebuilds?view=active").get_json()["rows"], [])
+        self.assertEqual(self.c.get("/api/prebuilds?view=all").get_json()["rows"], [])
+        workload = self.c.get(
+            "/api/workload-stats?from=2026-01-01&to=2026-12-31").get_json()
+        self.assertEqual(workload["workers"], [])
+
+        remade = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]})
+        self.assertEqual(remade.status_code, 201, remade.get_data(as_text=True))
+        self.assertEqual(len(self.c.get("/api/prebuilds?view=active").get_json()["rows"]), 1)
+
+    def test_선제작은_부품재고와_무관하게_제작사양만_기록한다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", ram="8GB", ssd="256GB").get_json()[0]
+        made = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]}).get_json()
+
+        saved = self.c.patch(f"/api/prebuilds/{made['id']}", json={
+            "action": "spec", "ram1Type": "온보드", "ram1": "8GB",
+            "ram2Type": "D4", "ram2": "8GB",
+            "ssdType": "M.2 NVMe", "ssd": "1TB", "hdd": "500GB"})
+        self.assertEqual(saved.status_code, 200, saved.get_data(as_text=True))
+        d = saved.get_json()
+        self.assertEqual(d["ram"], "8GB")
+        self.assertEqual(d["ssd"], "256GB")
+        self.assertEqual(d["finalRam"], "16GB")
+        self.assertEqual(d["finalSsd"], "1TB")
+        self.assertEqual(d["ram1Type"], "온보드")
+        self.assertEqual(d["ram1"], "8GB")
+        self.assertEqual(d["ram2Type"], "D4")
+        self.assertEqual(d["ram2"], "8GB")
+        self.assertEqual(d["ssdType"], "M.2 NVMe")
+        self.assertEqual(d["hdd"], "500GB")
+        asset = self.c.get(f"/api/assets/{a['id']}").get_json()
+        self.assertEqual(asset["ram"], "8GB", "TMS 기본 RAM을 덮어썼다")
+        self.assertEqual(asset["ssd"], "256GB", "TMS 기본 SSD를 덮어썼다")
+
+        for action in ("production", "inspection", "ready"):
+            r = self.c.patch(f"/api/prebuilds/{made['id']}",
+                             json={"action": action, "value": True})
+            self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        ready = self.c.get("/api/prebuilds?view=active").get_json()["rows"][0]
+        self.assertEqual(ready["builtRam"], "16GB")
+        self.assertEqual(ready["builtSsd"], "1TB")
+
+        # 취소하면 선제작 사양도 사라지고, 재등록하면 TMS 기본 사양부터 다시 시작한다.
+        self.c.patch(f"/api/prebuilds/{made['id']}", json={
+            "action": "cancel", "reason": "작업판 재등록 테스트"})
+        remade = self.c.post("/api/prebuilds", json={"assetNo": a["assetNo"]}).get_json()
+        self.assertEqual(remade["finalRam"], "8GB")
+        self.assertEqual(remade["finalSsd"], "256GB")
+        self.assertEqual(remade["ramType"], "")
+        self.assertEqual(remade["ram1"], "")
+        self.assertEqual(remade["ram2Type"], "")
+        self.assertEqual(remade["ram2"], "")
+        self.assertEqual(remade["ssdType"], "")
+        self.assertEqual(remade["hdd"], "")
+        self.c.patch(f"/api/prebuilds/{remade['id']}", json={
+            "action": "spec", "ram1Type": "온보드", "ram1": "8GB",
+            "ram2Type": "D4", "ram2": "8GB",
+            "ssdType": "M.2 NVMe", "ssd": "1TB", "hdd": "없음"})
+        for action in ("production", "inspection", "ready"):
+            self.c.patch(f"/api/prebuilds/{remade['id']}",
+                         json={"action": action, "value": True})
+        o = self.c.post("/api/orders", json={
+            "recipient": "최종사양고객", "productName": "노트북",
+            "optionName": "RAM 16GB / SSD 1TB", "phone": "010-5555-6666",
+            "address": "서울시 강남구 1", "postalCode": "06000", "amount": 1200000,
+        }).get_json()
+        linked = self.c.patch(f"/api/orders/{o['id']}",
+                              json={"action": "assets", "assetIds": [a["id"]]}).get_json()
+        self.assertTrue(linked["productionDone"])
+        self.assertTrue(linked["softwareInspectionDone"])
+        self.assertFalse(linked["assets"][0]["prebuildReworkRequired"])
+
 
 class TestNumberRangeSplit(Base):
     """★TMS와 번호대 분리 (대표 결정 2026-07-31).
 
     두 시스템을 함께 쓰는 동안 규칙이 같으면 같은 번호가 서로 다른 물건에 붙는다.
     형식·자릿수는 그대로 두고 시작 번호만 나눈다.
-      자산: TMS 0001~4999 / HMS 5000~9999
-      전표: TMS 001~499   / HMS 500~999
+      자산: TMS 0001~4999 / OWS 5000~9999
+      전표: TMS 001~499   / OWS 500~999
     """
 
     def test_새_자산은_5000번대부터_받는다(self):
@@ -845,8 +1690,8 @@ class TestNumberRangeSplit(Base):
         self.assertGreaterEqual(seq, 500, f"TMS 번호대를 침범했다: {slip}")
         self.assertEqual(len(slip), 11, "형식이 바뀌면 안 된다(P+YYMMDD-NNN)")
 
-    def test_TMS_번호가_있어도_HMS는_자기_번호대를_쓴다(self):
-        """★핵심 — 오늘 TMS가 0001~0100을 썼어도 HMS는 5000부터 시작해야 한다."""
+    def test_TMS_번호가_있어도_OWS는_자기_번호대를_쓴다(self):
+        """★핵심 — 오늘 TMS가 0001~0100을 썼어도 OWS는 5000부터 시작해야 한다."""
         from app import config
         today = config.now().strftime("%y%m%d")
         b = self._batch()
@@ -858,12 +1703,12 @@ class TestNumberRangeSplit(Base):
         self.assertGreaterEqual(int(no.split("-")[1]), 5000,
                                 f"TMS 번호를 이어받아 충돌 위험: {no}")
 
-    def test_HMS_번호대_안에서는_연속이다(self):
+    def test_OWS_번호대_안에서는_연속이다(self):
         b = self._batch()
         nos = [self._asset(b["id"], model="L480").get_json()[0]["assetNo"] for _ in range(3)]
         seqs = [int(n.split("-")[1]) for n in nos]
         self.assertEqual(seqs, list(range(seqs[0], seqs[0] + 3)))
-        self.assertEqual(seqs[0], 5000, "HMS 첫 번호는 5000이어야 한다")
+        self.assertEqual(seqs[0], 5000, "OWS 첫 번호는 5000이어야 한다")
 
     def test_수량으로_한번에_등록해도_5000번대다(self):
         b = self._batch()
@@ -972,12 +1817,109 @@ class TestAuditRound2(Base):
         self._asset(b3["id"], model="KEEPME")
         self.c.post(f"/api/purchase-batches/{b3['id']}/return", json={})   # 반품
 
-        br = self.c.get("/api/assets/model-brief?model=KEEPME").get_json()
-        self.assertEqual(br["stock"], 1, f"재고가 1이어야 하는데 {br['stock']}")
+        rows = self.c.get("/api/assets?status=in_stock").get_json()["rows"]
+        live = [x for x in rows if x["model"] == "KEEPME" and x["received"]]
+        self.assertEqual(len(live), 1, f"재고가 1이어야 하는데 {len(live)}")
         summ = self.c.get("/api/assets/summary").get_json()
         counted = sum(r["count"] for r in summ
                       if r["status"] not in ("shipped", "scrapped", "cancelled", "returned"))
         self.assertEqual(counted, 1, f"요약이 {counted}대로 셌다(미입고·취소·반품 포함 의심)")
+
+    # ── 대표 요청 5건 (2026-08-07) ───────────────────────────────────
+    def test_자산_목록이_전체_대수와_이어받기를_준다(self):
+        """★500대 상한 때문에 판매완료 13,000여 대가 화면에서 영영 안 보였다.
+
+        "매입 안에서 판매완료인 제품은 이력이 아예 안 보이는 게 맞아?" — 이력은
+        늘 있었고, 목록이 거기까지 못 갔던 것이다. total 과 offset 으로 이어 받는다.
+        """
+        b = self._batch()
+        for _ in range(3):
+            self._asset(b["id"], model="PAGE-T")
+        d = self.c.get("/api/assets").get_json()
+        self.assertEqual(d["total"], 3)
+        self.assertEqual(len(d["rows"]), 3)
+        d2 = self.c.get("/api/assets?offset=2").get_json()
+        self.assertEqual(d2["total"], 3)
+        self.assertEqual(len(d2["rows"]), 1, "offset 이 안 먹는다")
+
+    def test_일괄_bulk가_재고구분도_바꾼다(self):
+        """판매불가 사유 전환(수리→판매가능 등)과 가재고 해제를 일괄로."""
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        r = self.c.post("/api/assets/bulk",
+                        json={"ids": [a["id"]], "tier": "가재고", "status": "repair"})
+        self.assertEqual(r.get_json()["ok"], 1)
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()
+        self.assertEqual(got["tier"], "가재고")
+        self.assertEqual(got["status"], "repair")
+
+    def test_일괄_bulk_상태가_막혀도_나머지는_반영된다(self):
+        """★예전엔 매칭·출고된 자산이면 통째로 건너뛰어 등급·위치까지 조용히 무시됐다."""
+        import sqlite3
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.execute("UPDATE assets SET status='shipped' WHERE id=?", (a["id"],))
+        conn.commit()
+        conn.close()
+        r = self.c.post("/api/assets/bulk",
+                        json={"ids": [a["id"]], "status": "ready", "grade": "A급"}).get_json()
+        self.assertEqual(len(r["failed"]), 1, "상태 거부는 알려야 한다")
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()
+        self.assertEqual(got["status"], "shipped", "출고 상태가 뚫리면 안 된다")
+        self.assertEqual(got["grade"], "A급", "상태가 막혔다고 등급까지 무시했다")
+
+    def test_판매불가_모아보기가_사유를_준다(self):
+        """"판매불가능 제품만 모아놓은 카테고리" — uncoded 화면이 겸한다."""
+        b = self._batch()
+        a1 = self._asset(b["id"], model="NOSALE").get_json()[0]
+        self.c.post("/api/assets/bulk", json={"ids": [a1["id"]], "status": "repair"})
+        # 코드가 '있어도' 수리중이면 잡혀야 한다 — 코드 없음만 보던 예전 WHERE 로는 놓친다
+        self.c.post("/api/assets/product-code",
+                    json={"ids": [a1["id"]], "productCode": "NOSALE_i5-8_내장"})
+        d = self.c.get("/api/assets/uncoded").get_json()
+        self.assertEqual(d["unsellable"], 1)
+        g = next(x for x in d["groups"] if x["model"] == "NOSALE")
+        asset = next(x for x in g["assets"] if x["id"] == a1["id"])
+        self.assertIn("상태:수리", asset["reasons"])
+
+    def test_판매가능하고_코드도_있으면_모아보기에서_빠진다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="CLEAN").get_json()[0]
+        self.c.post("/api/assets/product-code",
+                    json={"ids": [a["id"]], "productCode": "CLEAN_i5-8_내장"})
+        d = self.c.get("/api/assets/uncoded").get_json()
+        self.assertNotIn("CLEAN", [g["model"] for g in d["groups"]])
+
+    def test_자산_상세에_AS_요약이_붙는다(self):
+        """판매된 제품의 사후 관리 — 단, 고객 개인정보는 여기로 새면 안 된다."""
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        from app.db import tx
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                conn.execute(
+                    "INSERT INTO as_tickets(ticket_no, asset_id, customer, phone, symptom, "
+                    " as_type, status, received_at, created_at, updated_at) "
+                    "VALUES('AS-260807-01', ?, '홍길동', '010-1111-2222', '액정', "
+                    " 'repair', 'received', '2026-08-07', '2026-08-07', '2026-08-07')",
+                    (a["id"],))
+        import json as _json
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()
+        self.assertEqual(got["asTickets"][0]["ticketNo"], "AS-260807-01")
+        blob = _json.dumps(got["asTickets"], ensure_ascii=False)
+        self.assertNotIn("홍길동", blob, "고객 이름이 매입 권한으로 새고 있다")
+        self.assertNotIn("010-1111-2222", blob, "연락처가 매입 권한으로 새고 있다")
+
+    def test_제품코드_보유수는_죽은_자산을_빼고_센다(self):
+        """출고·폐기·취소·반품이 '보유'에 섞이면 유령 재고가 뜬다(라이브 실측 20대)."""
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        self.c.post("/api/assets/product-code",
+                    json={"ids": [a["id"]], "productCode": "GHOST_i5-8_내장"})
+        self.c.post(f"/api/purchase-batches/{b['id']}/cancel", json={})
+        codes = [c["code"] for c in self.c.get("/api/product-codes").get_json()["codes"]]
+        self.assertNotIn("GHOST_i5-8_내장", codes, "취소된 자산이 보유로 잡힌다")
 
     def test_취소_전표는_재무_매입액에서_빠진다(self):
         b = self._batch(totalAmount=500000, purchaseDate="2026-07-31")
@@ -1001,25 +1943,34 @@ class TestSetupDisplay(Base):
         self.assertEqual(model_of("", "LG 그램 17Z95N"), "Z95N")
         self.assertEqual(model_of("6966207626", ""), "")
 
-    def test_창고_재고가_쿠팡_주문에도_나온다(self):
+    def test_모델명만_같은_자산은_재고로_안_센다(self):
+        """★2026-08-14 대표 재확인: "제품코드가 입력되기 전까지 셋팅·QC에서 그 자산들이
+        잡히면 안 된다 — 제품은 없다고 보면 된다."
+        예전에는 모델명으로 짐작해 창고 N대를 띄웠는데, 그 숫자가 실재고와 안 맞았다."""
         b = self._batch()
         for _ in range(3):
             self._asset(b["id"], maker="SAMSUNG", model="NT551EAA",
                         purchasePrice=200000, grade="A급")
         r = self.c.post("/api/orders/product-info", json={
-            "mall": "godomall", "codes": ["13675224455"], "specCodes": [],
+            "codes": ["13675224455"],
             "names": {"13675224455": "S급 삼성 NT551EAA 노트북"}})
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         p = r.get_json()["products"]["13675224455"]
-        self.assertEqual(p["ourStock"], 3, f"창고 재고가 0으로 나왔다: {p}")
+        self.assertEqual(p["ourStock"], 0, f"모델명 짐작 재고가 아직 나온다: {p}")
+        self.assertEqual(p["codeStock"], 0)
+        self.assertFalse(p["codeRegistered"])
 
-    def test_상품명이_없으면_예전처럼_동작한다(self):
+    def test_제품코드를_넣어야_재고로_잡힌다(self):
         b = self._batch()
-        self._asset(b["id"], model="L480", purchasePrice=100000)
-        r = self.c.post("/api/orders/product-info", json={
-            "mall": "godomall", "codes": ["L480_i5-8_내장"], "specCodes": []})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.get_json()["products"]["L480_i5-8_내장"]["ourStock"], 1)
+        a = self._asset(b["id"], model="L480", purchasePrice=100000).get_json()[0]
+        code = "L480_i5-8_내장"
+        r = self.c.post("/api/orders/product-info", json={"codes": [code]})
+        self.assertEqual(r.get_json()["products"][code]["codeStock"], 0)
+        self.c.post("/api/assets/product-code", json={"ids": [a["id"]], "productCode": code})
+        r2 = self.c.post("/api/orders/product-info", json={"codes": [code]})
+        p = r2.get_json()["products"][code]
+        self.assertEqual(p["codeStock"], 1)
+        self.assertTrue(p["codeRegistered"])
 
 class TestModalBackground(unittest.TestCase):
     """팝업이 투명하게 떠 뒤쪽 목록이 비쳐 안 읽히던 문제(대표 지적 2026-07-31).
@@ -1559,7 +2510,7 @@ class TestStockSync(Base):
     def test_없는_몰은_404(self):
         self.assertEqual(self.c.put("/api/stock-sync/nomall", json={"enabled": True}).status_code, 404)
 
-    def test_HMS_기준_재고는_재고반영_체크된_것만_센다(self):
+    def test_OWS_기준_재고는_재고반영_체크된_것만_센다(self):
         b = self._batch()
         a1 = self._asset(b["id"], model="840 G3").get_json()[0]
         a2 = self._asset(b["id"], model="840 G3").get_json()[0]
@@ -1657,7 +2608,12 @@ class TestPrepOptionsMerged(unittest.TestCase):
     def test_챙길옵션_칸이_없다(self):
         self.assertNotIn("<th>챙길 옵션</th>", self.js, "별도 칸이 되살아났다")
         self.assertNotIn("col-prep", self.js)
-        self.assertNotIn('colspan="9"', self.js, "칸 수가 8로 줄었는데 colspan이 9면 표가 어긋난다")
+        # ★칸 수를 박아 두면 안 된다 — 2026-08-05엔 8칸이었는데 그 뒤 SW 검수가
+        #   독립 단계로 되살아나 9칸이 됐고, 이 시험만 옛 숫자를 붙들고 있었다.
+        #   진짜 지켜야 할 것은 '머리글 칸 수 == 상세줄 colspan'이다.
+        n = self.js.split("<thead>", 1)[1].split("</thead>", 1)[0].count("<th")
+        self.assertIn(f'colspan="{n}"', self.js,
+                      f"머리글은 {n}칸인데 상세줄 colspan이 다르면 표가 통째로 어긋난다")
 
     def test_챙길옵션이_옵션_칩으로_나온다(self):
         """★2026-08-05 정정: 칩은 유지하되 '누를 수 있어야' 한다.
@@ -1671,7 +2627,7 @@ class TestPrepOptionsMerged(unittest.TestCase):
         self.assertIn("data-opt=", self.js, "누를 수 없으면 제작완료가 영영 안 된다")
 
 class TestStockTier(Base):
-    """재고 3단계(2026-08-04 대표): 양품 / 실재고 / 가재고.
+    """재고 3단계(2026-08-04 대표): 가용 / 실재고 / 가재고.
 
     가재고 = 입고는 됐지만 완전한 수리 전. 매칭까지는 되되 출고는 막는다.
     """
@@ -1688,21 +2644,73 @@ class TestStockTier(Base):
             self.assertEqual(self.c.patch(f"/api/orders/{o['id']}",
                              json={"action": act, "value": True}).status_code, 200)
 
-    def test_기본값은_양품이다(self):
+    def test_기본값은_가용이다(self):
         """기존 자산 15,013대가 갑자기 출고 불가가 되면 안 된다."""
         b = self._batch()
         a = self._asset(b["id"], model="L480").get_json()[0]
-        self.assertEqual(self.c.get(f"/api/assets/{a['id']}").get_json()["tier"], "양품")
+        self.assertEqual(self.c.get(f"/api/assets/{a['id']}").get_json()["tier"], "가용")
 
     def test_세_단계를_지정해_등록할_수_있다(self):
         b = self._batch()
-        for t in ("양품", "실재고", "가재고"):
+        for t in ("가용", "실재고", "가재고"):
             a = self._asset(b["id"], model="L480", tier=t).get_json()[0]
             self.assertEqual(self.c.get(f"/api/assets/{a['id']}").get_json()["tier"], t)
 
     def test_없는_구분은_거부한다(self):
         b = self._batch()
         self.assertEqual(self._asset(b["id"], model="L480", tier="반품").status_code, 400)
+
+    def test_구명칭_양품은_가용으로_받아_준다(self):
+        """2026-08-08 이름 확정(양품→가용) — 갱신 안 된 화면이 보내는 옛 값도 통한다."""
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", tier="양품").get_json()[0]
+        self.assertEqual(self.c.get(f"/api/assets/{a['id']}").get_json()["tier"], "가용")
+        r = self.c.patch(f"/api/assets/{a['id']}", json={"tier": "실재고"})
+        self.assertEqual(r.status_code, 200)
+        r = self.c.patch(f"/api/assets/{a['id']}", json={"tier": "양품"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(self.c.get(f"/api/assets/{a['id']}").get_json()["tier"], "가용")
+
+    def test_보수체크를_저장하고_돌려받는다(self):
+        """2026-08-08 대표: 실재고는 무엇을 보수해야 하는지, 하는 중인지까지 지정."""
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", tier="실재고").get_json()[0]
+        body = {"tierTasks": {"items": [
+            {"name": "시트지", "state": "doing"},
+            {"name": "셋팅", "state": "todo"},
+            {"name": "힌지 교체", "state": "done"},
+        ], "note": "힌지는 부품 도착함"}}
+        r = self.c.patch(f"/api/assets/{a['id']}", json=body)
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()["tierTasks"]
+        self.assertEqual({(i["name"], i["state"]) for i in got["items"]},
+                         {("시트지", "doing"), ("셋팅", "todo"), ("힌지 교체", "done")})
+        self.assertEqual(got["note"], "힌지는 부품 도착함")
+        # 이력에 남아야 나중에 누가 뭘 지정했는지 알 수 있다
+        events = self.c.get(f"/api/assets/{a['id']}").get_json()["events"]
+        self.assertTrue(any(e["action"] == "보수체크" for e in events), events)
+
+    def test_보수체크_잘못된_상태는_거부한다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", tier="실재고").get_json()[0]
+        r = self.c.patch(f"/api/assets/{a['id']}", json={
+            "tierTasks": {"items": [{"name": "시트지", "state": "끝남"}], "note": ""}})
+        self.assertEqual(r.status_code, 400)
+        r = self.c.patch(f"/api/assets/{a['id']}", json={
+            "tierTasks": {"items": [{"name": f"항목{i}", "state": "todo"} for i in range(21)],
+                          "note": ""}})
+        self.assertEqual(r.status_code, 400, "항목 수 제한이 없다")
+
+    def test_보수체크를_비우면_빈_값으로_저장된다(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", tier="실재고").get_json()[0]
+        self.c.patch(f"/api/assets/{a['id']}", json={
+            "tierTasks": {"items": [{"name": "셋팅", "state": "todo"}], "note": ""}})
+        r = self.c.patch(f"/api/assets/{a['id']}", json={
+            "tierTasks": {"items": [], "note": ""}})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()["tierTasks"]
+        self.assertEqual(got, {"items": [], "note": ""})
 
     def test_가재고는_매칭은_되지만_출고가_막힌다(self):
         b = self._batch()
@@ -1714,7 +2722,7 @@ class TestStockTier(Base):
         self.assertIn("가재고", r.get_json()["error"])
         self.assertIn(a["assetNo"], r.get_json()["error"], "어느 자산인지 알려 줘야 한다")
 
-    def test_양품_실재고로_바꾸면_출고된다(self):
+    def test_가용_실재고로_바꾸면_출고된다(self):
         b = self._batch()
         a = self._asset(b["id"], model="L480", tier="가재고").get_json()[0]
         o = self._order()
@@ -1746,7 +2754,7 @@ class TestStockTier(Base):
 
     def test_셋팅_재고집계가_가재고를_빼고_센다(self):
         b = self._batch()
-        for t in ("양품", "양품", "실재고", "가재고"):
+        for t in ("가용", "가용", "실재고", "가재고"):
             self._asset(b["id"], model="NT371B5M", tier=t)
         from app.db import tx
         from app.orders.product_info import our_stock
@@ -1761,7 +2769,7 @@ class TestStockTier(Base):
     def test_구분_변경이_이력에_남는다(self):
         b = self._batch()
         a = self._asset(b["id"], model="L480", tier="가재고").get_json()[0]
-        self.c.patch(f"/api/assets/{a['id']}", json={"tier": "양품"})
+        self.c.patch(f"/api/assets/{a['id']}", json={"tier": "가용"})
         d = self.c.get(f"/api/assets/{a['id']}").get_json()
         self.assertTrue(any(e["action"] == "재고구분" for e in d["events"]),
                         "누가 언제 가재고를 풀었는지 남아야 한다")
@@ -1775,8 +2783,8 @@ class TestStockByProductCode(Base):
 
     def test_제품코드로_정확히_센다(self):
         b = self._batch()
-        for t, pc in (("양품", "840 G3_i7-6_내장"), ("양품", "840 G3_i7-6_내장"),
-                      ("가재고", "840 G3_i7-6_내장"), ("양품", "840 G3_i5-6_내장")):
+        for t, pc in (("가용", "840 G3_i7-6_내장"), ("가용", "840 G3_i7-6_내장"),
+                      ("가재고", "840 G3_i7-6_내장"), ("가용", "840 G3_i5-6_내장")):
             a = self._asset(b["id"], model="840 G3", tier=t).get_json()[0]
             self.c.patch(f"/api/assets/{a['id']}", json={"productCode": pc})
         from app.db import tx
@@ -1813,14 +2821,117 @@ class TestStockByProductCode(Base):
         # 스마트스토어 — 코드도 이름도 형식이 아니다
         self.assertEqual(sku_of("13675224455", "삼성 15인치 노트북"), "")
 
+    def test_급_없는_등급_꼬리도_뗀다(self):
+        """롯데온 epdNo "…내장 AA"·쿠팡 "…내장 AS 256"처럼 '급' 자 없이 붙는 등급 꼬리
+        (2026-09-01) — 남겨 두면 고도몰 스펙·자산 재고 대조가 전부 빗나간다."""
+        from app.orders.product_info import sku_of
+        self.assertEqual(sku_of("X13 Gen3_i5-12_내장 AA", ""), "X13 Gen3_i5-12_내장")
+        self.assertEqual(sku_of("NT371B5L_i3-6_내장 AS 256", ""), "NT371B5L_i3-6_내장")
+        # S+ 등급은 '+'가 등급의 일부 — 사은품 split 이 먼저 자르면 " S"가 남아 오염된다(리뷰 #1)
+        self.assertEqual(sku_of("X13 Gen3_i5-12_내장 S+S", ""), "X13 Gen3_i5-12_내장")
+        # 사은품 표기 뒤에 숨은 bare 꼬리 — split 후에도 한 번 더 뗀다
+        self.assertEqual(sku_of("NT371B5L_i3-6_내장 AA+장패드", ""), "NT371B5L_i3-6_내장")
+        # "(AS급)" 꼴은 급-정규식이 괄호 안만 지워 "()"가 남던 라이브 실존 결함(리뷰 #5)
+        self.assertEqual(sku_of("840 G3_i7-6_내장 (AS급)", ""), "840 G3_i7-6_내장")
+        # 그래픽 이름의 일부(한 글자·비등급 글자)는 등급으로 오인하면 안 된다
+        self.assertEqual(sku_of("Z16 Gen1_R7p-6_RX6500M", ""), "Z16 Gen1_R7p-6_RX6500M")
+        self.assertEqual(sku_of("440 G6_i7-8_MX130", ""), "440 G6_i7-8_MX130")
+
+    def test_송장_요구등급이_급없는_꼬리도_읽는다(self):
+        """셋팅이 떼는 꼬리를 송장은 등급으로 읽는다 — 두 화면이 같은 규칙(2026-09-01).
+        bare 꼬리는 코드 모양의 "/" 앞 조각 끝에서만(자유 텍스트 오인 방지 — 리뷰 #3·#8)."""
+        from app.orders.waybill import _order_grade
+        self.assertEqual(_order_grade({"product_code": "NT371B5M_i7-7_내장 AA급3",
+                                       "product_name": ""}), "AA급3")
+        self.assertEqual(_order_grade({"product_code": "X13 Gen3_i5-12_내장 AA",
+                                       "product_name": ""}), "AA")
+        # 쿠팡 상품명 꼴 "코드 AA / 옵션…" — 끝앵커가 옵션 텍스트에 막히면 안 된다
+        self.assertEqual(_order_grade({"product_code": "12345",
+                                       "product_name": "NT371B5L_i5-6_내장 AA / 단일색상 512G"}),
+                         "AA")
+        # 자유 텍스트 상품명의 'AS'(수리 보증)를 등급으로 오인하면 안 된다
+        self.assertEqual(_order_grade({"product_code": "12345",
+                                       "product_name": "삼성 노트북 1년 무상 AS"}), "")
+        self.assertEqual(_order_grade({"product_code": "440 G6_i7-8_MX130",
+                                       "product_name": ""}), "", "그래픽 이름을 등급으로 오인")
+
+    def test_셋팅_등급칩도_급없는_꼬리를_읽는다(self):
+        """setup.js orderGrade 가 송장(_order_grade)과 같은 등급을 말해야 대조가 유효하다
+        (리뷰 #4·#9·#14) — bare 꼬리 인식 + productCode 도 읽는 배선을 핀한다."""
+        js = (ROOT / "static" / "js" / "setup.js").read_text("utf-8")
+        self.assertIn("RE_BARE_TAIL", js, "급 없는 꼬리 정규식이 없다")
+        blk = js.split("function orderGrade", 1)[1].split(chr(10) + "}", 1)[0]
+        self.assertIn("o.productCode", blk, "등급 꼬리는 제품코드 칸에 실려 온다(롯데온 epdNo)")
+        self.assertIn('split("/")[0]', blk, "\"코드 / 옵션\" 꼴에서 끝앵커가 막힌다")
+
+    def test_몰에_없는_장식_코드는_꼬리를_떼고_다시_찾는다(self):
+        """lookup_any 폴백(2026-09-01): "…내장 AA"가 몰에 없으면 sku 로 한 번 더 —
+        이미 저장된 장식 코드 주문도 스펙이 붙는다. 결과는 원 코드로도 캐시된다."""
+        from app.orders import product_info as pi
+
+        class FakeAdapter:
+            code = "godomall"
+
+            def search_goods(self, keyword="", field="auto", size=20):
+                if keyword == "X13 Gen3_i5-12_내장":
+                    return [{"goodsCd": "X13 Gen3_i5-12_내장", "goodsNm": "씽크패드 X13",
+                             "shortDescription": "i5-12세대 / 16G / 256G", "stock": 3}]
+                return []                                   # 장식 코드는 정확 일치가 없다
+
+        with pi._lock:
+            pi._cache.clear()
+        try:
+            data, mall, _used = pi.lookup_any([FakeAdapter()], "X13 Gen3_i5-12_내장 AA")
+            self.assertTrue(data, "꼬리 뗀 코드로 못 찾으면 스펙이 영영 안 붙는다")
+            self.assertEqual(mall, "godomall")
+            self.assertEqual(data["spec"], "i5-12세대 / 16G / 256G")
+            # 원 코드('…AA')로도 캐시돼 다음 폴링부터 몰 호출이 없어야 한다
+            hit = pi._cached(("*", "x13 gen3_i5-12_내장 aa"))
+            self.assertTrue(hit and hit.get("spec"), "원 코드 캐시가 안 남는다")
+            # 어디에도 없는 코드는 폴백까지 다 뒤진 뒤 '없음'({})으로 확정한다
+            none, _m, _u = pi.lookup_any([FakeAdapter()], "840 G3_i7-6_내장 AB")
+            self.assertEqual(none, {}, "없는 코드는 없음으로 확정해 재조회를 아껴야 한다")
+        finally:
+            with pi._lock:
+                pi._cache.clear()
+
+    def test_같은_코드_여러_등록이면_스펙_있는_쪽이_대표다(self):
+        """고도몰에 본상품·B급할인·테스트 등록이 같은 코드를 쓴다(2026-09-01 실측 X13 —
+        첫 행이 스펙 없는 테스트 상품이라 화면 스펙이 비고 재고 999가 떴다)."""
+        from app.orders import product_info as pi
+
+        class Fake:
+            code = "godomall"
+
+            def search_goods(self, keyword="", field="auto", size=20):
+                return [
+                    {"goodsCd": "X13_i5_내장", "goodsNm": "test상품",
+                     "shortDescription": "", "stock": 999},
+                    {"goodsCd": "X13_i5_내장", "goodsNm": "B급할인",
+                     "shortDescription": "스펙A", "stock": 0},
+                    {"goodsCd": "X13_i5_내장", "goodsNm": "본상품",
+                     "shortDescription": "스펙A", "stock": 8},
+                ]
+
+        with pi._lock:
+            pi._cache.clear()
+        try:
+            d = pi.lookup(Fake(), "X13_i5_내장")
+            self.assertEqual(d["spec"], "스펙A", "스펙 없는 테스트 등록이 대표로 잡혔다")
+            self.assertEqual(d["stock"], 8, "스펙 있는 등록 중 재고가 살아 있는 쪽이 대표다")
+            self.assertEqual(d["name"], "본상품")
+        finally:
+            with pi._lock:
+                pi._cache.clear()
+
     def test_화면이_미등록을_숨기지_않는다(self):
         js = (ROOT / "static" / "js" / "setup.js").read_text("utf-8")
         block = js.split("function stockChip", 1)[1].split(chr(10) + "}", 1)[0]
         self.assertIn("codeRegistered", block, "코드 등록 여부를 안 보면 짐작값을 정답처럼 보여준다")
-        # '제품코드 미등록' 칩은 대표 지시로 제거(2026-08-04) — 대신 칩 이름이 '모델 N대'가 되고
-        # 근사값이라는 사실은 마우스 오버 설명에 남는다
-        self.assertIn("모델 ${ship}대", block, "코드가 없을 때 모델 기준임을 이름으로 알려야 한다")
-        self.assertIn("짐작", block, "근사값임을 설명에 남겨야 한다")
+        # ★2026-08-14 대표 재확인: 코드가 없으면 '없는 제품'이다 — 모델명으로 짐작한
+        #   'N대'를 띄우면 안 된다(그 숫자가 실재고와 안 맞아 잡았다가 되돌아왔다).
+        self.assertNotIn("모델 ${ship}대", block, "모델명 기준 재고 칩이 아직 남아 있다")
+        self.assertIn("코드 미입력", block, "코드가 없으면 그 사실을 칩 이름으로 알려야 한다")
 
 class TestCoupangProductCode(unittest.TestCase):
     """쿠팡 제품코드는 '등록상품명(판매자 관리용)'에도 들어온다(대표 확인 2026-08-04).
@@ -1854,7 +2965,7 @@ class TestCoupangProductCode(unittest.TestCase):
         self.assertEqual(o["productCode"], "P16V Gen1_i7-13_내장")
 
     def test_코드_형식이_아니면_예전대로_내부번호(self):
-        o = self._line(sellerProductName="[하프북X녹스] 게이밍 키보드 청축",
+        o = self._line(sellerProductName="[업무관리X녹스] 게이밍 키보드 청축",
                        externalVendorSkuCode="")
         self.assertEqual(o["productCode"], "95787471151",
                          "부속품까지 억지로 코드로 만들면 안 된다")
@@ -1986,7 +3097,7 @@ class TestUncodedAssets(Base):
 
     def test_상태_등급_구분별_집계를_준다(self):
         b = self._batch()
-        self._asset(b["id"], model="집계", grade="AA", tier="양품")
+        self._asset(b["id"], model="집계", grade="AA", tier="가용")
         self._asset(b["id"], model="집계", grade="AS", tier="가재고")
         g = next(x for x in self.c.get("/api/assets/uncoded").get_json()["groups"]
                  if x["model"] == "집계")
@@ -2037,23 +3148,424 @@ class TestBulkGradeAndTier(Base):
                          json={"ids": [a1["id"]]}).status_code, 400)
 
 
+class TestGhostUnlist(Base):
+    """★유령 재고반영 방지(2026-08-09) — 수동 상태변경도 재고반영을 함께 끈다."""
+
+    def _listed_asset(self):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        r = self.c.patch(f"/api/assets/{a['id']}",
+                         json={"productCode": "TST_1_1", "stockListed": True, "status": "ready"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertTrue(self.c.get(f"/api/assets/{a['id']}").get_json()["stockListed"])
+        return a["id"]
+
+    def test_상태를_수리로_바꾸면_재고반영이_꺼진다(self):
+        aid = self._listed_asset()
+        r = self.c.patch(f"/api/assets/{aid}", json={"status": "repair"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        got = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertFalse(got["stockListed"], "★수리 중인 자산이 몰 재고에 세어진다")
+        self.assertTrue(any(e["action"] == "재고해제" for e in got["events"]))
+
+    def test_판매가능_상태끼리는_재고반영을_유지한다(self):
+        aid = self._listed_asset()
+        self.c.patch(f"/api/assets/{aid}", json={"status": "refurbishing"})
+        self.assertTrue(self.c.get(f"/api/assets/{aid}").get_json()["stockListed"],
+                        "판매가능 축 안의 이동인데 재고반영이 꺼졌다")
+
+    def test_일괄_상태변경도_재고반영을_끈다(self):
+        aid = self._listed_asset()
+        r = self.c.post("/api/assets/bulk", json={"ids": [aid], "status": "defective"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertFalse(self.c.get(f"/api/assets/{aid}").get_json()["stockListed"])
+
+    def test_한_요청에서_반영켜기와_수리상태를_같이_보내도_유령이_안_남는다(self):
+        """★자산 상세 폼은 재고반영 체크와 상태를 항상 같이 보낸다(2026-08-09 검토 발견)."""
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        r = self.c.patch(f"/api/assets/{a['id']}", json={
+            "productCode": "TST_1_1", "stockListed": True, "status": "repair"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()
+        self.assertEqual(got["status"], "repair")
+        self.assertFalse(got["stockListed"], "★수리 상태인데 재고반영이 켜진 채 저장됐다")
+
+
+class TestPaidSync(unittest.TestCase):
+    """★입금 4칸은 TMS가 원본(2026-08-09) — 부분입금 뒤 추가 입금이 굳지 않아야 한다."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-ps-"))
+        self.app = create_app(db_path=self.tmp / "t.db")
+        self.app.testing = True
+        self.c = self.app.test_client()
+        auth_mod._login_failures.clear()
+        self.c.post("/api/auth/setup", json={
+            "username": "admin", "displayName": "대표", "password": PW})
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _apply(self, rows):
+        from app.db import tx
+        from app.purchase.sales import apply_sale_slips
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                return apply_sale_slips(conn, rows, actor="자동반영")
+
+    def _slip(self):
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT paid_amount, paid_confirmed, paid_status, customer "
+                         "FROM sale_slips WHERE slip_no='S260809-001'").fetchone()
+        conn.close()
+        return dict(r)
+
+    def test_추가_입금이_최신값으로_따라간다(self):
+        # 미수금 파일(입금확인 칸이 있는 쪽) — 처음엔 부분입금
+        self._apply([{"판매전표": "S260809-001", "거래처명": "테스트상사", "판매일": "2026-08-01",
+                      "판매금액": "500000", "입금액": "200000", "입금확인": "0",
+                      "납부확인": "미수"}])
+        self.assertEqual(self._slip()["paid_amount"], 200000)
+        # 다음 주기 — 완납으로 갱신돼 왔다
+        self._apply([{"판매전표": "S260809-001", "거래처명": "테스트상사", "판매일": "2026-08-01",
+                      "판매금액": "500000", "입금액": "500000", "입금확인": "1",
+                      "납부확인": "완납"}])
+        got = self._slip()
+        self.assertEqual(got["paid_amount"], 500000, "★추가 입금이 옛값에 굳었다")
+        self.assertEqual(got["paid_confirmed"], 1)
+        self.assertEqual(got["paid_status"], "완납")
+
+    def test_OWS에서_고친_전표만_일반_칸을_지킨다(self):
+        """2026-09-03 규칙: 안 고친 연동 전표는 TMS 값을 따라간다(헤더 수량·금액이 굳던 결함).
+        사람이 OWS에서 고친 전표(ows_edited_at)만 일반 칸을 지키고 입금 4칸은 계속 따라간다."""
+        self._apply([{"판매전표": "S260809-001", "거래처명": "테스트상사", "판매일": "2026-08-01",
+                      "판매금액": "500000", "입금액": "0", "입금확인": "0", "납부확인": "미수"}])
+        # 아무도 안 고쳤다 — 거래처명이 바뀌어 오면 TMS 값을 따라간다
+        self._apply([{"판매전표": "S260809-001", "거래처명": "딴이름", "판매일": "2026-08-01",
+                      "판매금액": "500000", "입금액": "100000", "입금확인": "0",
+                      "납부확인": "미수"}])
+        got = self._slip()
+        self.assertEqual(got["customer"], "딴이름", "★안 고친 연동 전표는 TMS 값을 따라가야 한다")
+        self.assertEqual(got["paid_amount"], 100000, "입금액은 따라가야 한다")
+        # 사람이 OWS에서 고쳤다(ows_edited_at) — 이제 일반 칸은 불가침, 입금 4칸만 따라간다
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.execute("UPDATE sale_slips SET customer='OWS이름', ows_edited_at='2026-09-03T10:00:00+09:00' "
+                     "WHERE slip_no='S260809-001'")
+        conn.commit(); conn.close()
+        self._apply([{"판매전표": "S260809-001", "거래처명": "또딴이름", "판매일": "2026-08-01",
+                      "판매금액": "500000", "입금액": "500000", "입금확인": "1",
+                      "납부확인": "완납"}])
+        got = self._slip()
+        self.assertEqual(got["customer"], "OWS이름", "★OWS에서 고친 칸이 덮였다")
+        self.assertEqual((got["paid_amount"], got["paid_confirmed"], got["paid_status"]), (500000, 1, "완납"))
+
+
+class TestApprovedFeatures(Base):
+    """2026-08-09 대표 승인 6종 — 복귀 대기열·코드 병합·정합 점검·미수금·리포트 전표매출."""
+
+    def _sync(self, rows):
+        from app.db import tx
+        from app.purchase.migration import _prepare, apply_rows
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                ready, dup, errors, updates, _lk = _prepare(conn, rows, fill_blanks=True)
+                return apply_rows(conn, ready, updates, actor="자동반영")
+
+    def _mk(self, no, status="in_stock"):
+        import sqlite3
+        b = self._batch()
+        a = self._asset(b["id"], model="L480", assetNo=no).get_json()[0]
+        if status != "in_stock":
+            conn = sqlite3.connect(self.tmp / "t.db")
+            conn.execute("UPDATE assets SET status=? WHERE id=?", (status, a["id"]))
+            conn.commit(); conn.close()
+        return a["id"]
+
+    # ---- ② 복귀 대기열 ----
+    def test_복귀후보가_목록에_뜨고_복귀하면_사라진다(self):
+        aid = self._mk("260809-0001", "shipped")
+        self._sync([{"관리번호": "260809-0001", "모델명": "L480", "재고상태": "반입"}])
+        d = self.c.get("/api/assets/revert-candidates").get_json()
+        self.assertEqual(d["count"], 1, d)
+        self.assertEqual(d["rows"][0]["assetNo"], "260809-0001")
+        self.assertEqual(d["rows"][0]["tmsLabel"], "반입")
+        r = self.c.post(f"/api/assets/{aid}/restock", json={"action": "restock"})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        got = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertEqual(got["status"], "in_stock")
+        self.assertEqual(got["tier"], "실재고")
+        self.assertFalse(got["stockListed"], "복귀했다고 재고반영이 저절로 켜지면 안 된다")
+        self.assertTrue(any(e["action"] == "재고복귀" for e in got["events"]))
+        self.assertEqual(self.c.get("/api/assets/revert-candidates").get_json()["count"], 0)
+
+    def test_무시하면_다시_알리지_않는다(self):
+        aid = self._mk("260809-0002", "shipped")
+        row = [{"관리번호": "260809-0002", "모델명": "L480", "재고상태": "반입"}]
+        self._sync(row)
+        self.c.post(f"/api/assets/{aid}/restock", json={"action": "dismiss"})
+        self.assertEqual(self.c.get("/api/assets/revert-candidates").get_json()["count"], 0)
+        self._sync(row)                       # 2시간 뒤 또 와도
+        self.assertEqual(self.c.get("/api/assets/revert-candidates").get_json()["count"], 0,
+                         "★무시했는데 다시 알림이 쌓였다")
+
+    def test_출고_폐기가_아니면_복귀를_거부한다(self):
+        aid = self._mk("260809-0003", "ready")
+        r = self.c.post(f"/api/assets/{aid}/restock", json={"action": "restock"})
+        self.assertEqual(r.status_code, 400)
+
+    # ---- ③ 유사 제품코드 ----
+    def test_유사코드를_찾고_병합한다(self):
+        a1 = self._mk("260809-0011")
+        a2 = self._mk("260809-0012")
+        self.c.patch(f"/api/assets/{a1}", json={"productCode": "840 G3_i7-6_내장"})
+        self.c.patch(f"/api/assets/{a2}", json={"productCode": "840 g3_i7-6_내장"})
+        d = self.c.get("/api/assets/code-variants").get_json()
+        self.assertEqual(d["count"], 1, d)
+        g = d["groups"][0]
+        self.assertEqual(len(g["variants"]), 2)
+        # 병합 — 대표 코드로
+        v = g["variants"][1]
+        r = self.c.post("/api/assets/product-code",
+                        json={"ids": v["ids"], "productCode": g["canonical"]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(self.c.get("/api/assets/code-variants").get_json()["count"], 0)
+
+    # ---- ④ 정합 점검 ----
+    def test_정합_점검_숫자가_맞는다(self):
+        import sqlite3
+        aid = self._mk("260809-0021")
+        # 유령: 반영 켜짐 + 수리 상태 (자동해제를 우회해 직접 만든 과거 데이터 흉내)
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.execute("UPDATE assets SET stock_listed=1, product_code='X_1_1', "
+                     "status='repair' WHERE id=?", (aid,))
+        conn.commit(); conn.close()
+        d = self.c.get("/api/assets/integrity").get_json()
+        self.assertGreaterEqual(d["ghostListed"], 1, d)
+
+    # ---- ⑥ 미수금 ----
+    def test_미수금_잔액과_연령이_집계된다(self):
+        from datetime import timedelta
+
+        from app import config
+        from app.db import tx
+        from app.purchase.sales import apply_sale_slips
+        # ★날짜는 상대값으로 — '2026-08-01' 하드코딩이 30일 경계를 넘던 2026-09-01에
+        #   자연 파손됐다(연령 집계는 오늘 기준 상대 계산이므로 시드도 상대여야 한다).
+        recent = (config.now() - timedelta(days=5)).strftime("%Y-%m-%d")
+        old120 = (config.now() - timedelta(days=120)).strftime("%Y-%m-%d")
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                apply_sale_slips(conn, [
+                    {"판매전표": "S260809-001", "거래처명": "가나상사", "판매일": recent,
+                     "판매금액": "500000", "입금액": "200000", "입금확인": "0", "납부확인": "미수"},
+                    {"판매전표": "S260809-002", "거래처명": "가나상사", "판매일": old120,
+                     "판매금액": "300000", "입금액": "0", "입금확인": "0", "납부확인": "미수"},
+                    {"판매전표": "S260809-003", "거래처명": "다라상사", "판매일": recent,
+                     "판매금액": "100000", "입금액": "100000", "입금확인": "1", "납부확인": "완납"},
+                ], actor="시험")
+        d = self.c.get("/api/sale-slips/receivables").get_json()
+        self.assertEqual(d["total"], 600000, d)      # 300000 + 300000 (완납 제외)
+        self.assertEqual(d["count"], 1)              # 가나상사만
+        c = d["customers"][0]
+        self.assertEqual(c["customer"], "가나상사")
+        self.assertEqual(c["d30"], 300000, "최근 판매분")
+        self.assertEqual(c["over90"], 300000, "90일 넘은 미수")
+
+    # ---- ⑤ 리포트 전표 매출 ----
+    def test_리포트에_전표_매출이_별도로_잡힌다(self):
+        from app.db import tx
+        from app.purchase.sales import apply_sale_slips
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                apply_sale_slips(conn, [
+                    {"판매전표": "S260809-011", "판매채널": "방문구매", "판매일": "2026-08-02",
+                     "판매수량": "3", "판매금액": "900000", "순이익액": "200000",
+                     "진행상태": "판매완료"},
+                    {"판매전표": "S260809-012", "판매채널": "방문구매", "판매일": "2026-08-03",
+                     "판매수량": "1", "판매금액": "100000", "순이익액": "10000",
+                     "진행상태": "판매취소"},          # 취소는 빠져야 한다
+                ], actor="시험")
+        s = self.c.get("/api/reports/summary?from=2026-08-01&to=2026-08-31").get_json()
+        self.assertEqual(s["slipSales"]["amount"], 900000, s["slipSales"])
+        self.assertEqual(s["slipSales"]["slips"], 1)
+        ch = self.c.get("/api/reports/slip-channels?from=2026-08-01&to=2026-08-31").get_json()
+        self.assertEqual(len(ch), 1, ch)
+        self.assertEqual(ch[0]["channel"], "방문구매")
+        m = self.c.get("/api/reports/monthly").get_json()
+        aug = next(x for x in m if x["month"] == "2026-08")
+        self.assertEqual(aug["slipRevenue"], 900000)
+
+
+class TestShipTodayAssets(Base):
+    """★[금일 출고 확인] 자산 추적(2026-08-09 전체 추적 검증에서 발견·수정).
+
+    예전엔 주문만 마감돼 자산이 '주문매칭'으로 영영 남았다 — 재고가 부풀고
+    자산 이력에 출고 기록·고객 정보가 없었다.
+    """
+
+    def _to_inspection(self, recipient="금일고객"):
+        b = self._batch()
+        a = self._asset(b["id"], model="L480").get_json()[0]
+        self.c.patch(f"/api/assets/{a['id']}",
+                     json={"productCode": "TST_1_1", "stockListed": True, "status": "ready"})
+        o = self.c.post("/api/orders", json={
+            "recipient": recipient, "productName": "노트북", "phone": "010-2222-3333",
+            "address": "서울시 강남구 2", "postalCode": "06000", "amount": 550000,
+            "receiveMethod": "방문수령"}).get_json()
+        r = self.c.patch(f"/api/orders/{o['id']}",
+                         json={"action": "assets", "assetIds": [a["id"]]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        for act in ("preparing", "production", "softwareInspection"):
+            self.assertEqual(self.c.patch(f"/api/orders/{o['id']}",
+                             json={"action": act, "value": True}).status_code, 200)
+        return a["id"], o["id"]
+
+    def test_금일_출고확인이_자산까지_출고_처리한다(self):
+        aid, oid = self._to_inspection()
+        r = self.c.post("/api/orders/ship-today", json={"ids": [oid]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["shipped"], 1)
+        got = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertEqual(got["status"], "shipped", "★주문만 마감되고 자산이 남았다")
+        self.assertFalse(got["stockListed"], "출고된 자산이 몰 재고에 남았다")
+        ship = next((e for e in got["events"] if e["action"] == "출고"), None)
+        self.assertIsNotNone(ship, "자산 이력에 출고 기록이 없다")
+        self.assertEqual(ship["detail"]["수취인"], "금일고객", "고객 정보가 이력에 없다")
+        self.assertTrue(ship["detail"].get("출고일"), "출고일이 이력에 없다")
+
+    def test_건별_출고도_재고반영을_끈다(self):
+        aid, oid = self._to_inspection(recipient="건별고객")
+        r = self.c.patch(f"/api/orders/{oid}", json={"action": "shipping", "value": True})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        got = self.c.get(f"/api/assets/{aid}").get_json()
+        self.assertEqual(got["status"], "shipped")
+        self.assertFalse(got["stockListed"], "출고된 자산이 몰 재고에 남았다")
+
+
+class TestSlipTotalTrueUp(Base):
+    """★[TMS 이관] 전표 금액 따라가기(2026-08-10 대표 승인).
+
+    수집이 자산을 늦게 붙이면 전표 금액이 옛값에 남아 '자산 합계가 더 큼' 경고가
+    떴다 — 기계가 만든 전표만 자산 합으로 따라가고, 사람 전표는 안 건드린다.
+    """
+
+    def _batch_with_memo(self, memo, total, prices):
+        import sqlite3
+        b = self._batch(totalAmount=total)
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.execute("UPDATE purchase_batches SET memo=?, total_amount=? WHERE id=?",
+                     (memo, total, b["id"]))
+        conn.commit(); conn.close()
+        for p in prices:
+            self._asset(b["id"], model="L480", purchasePrice=p)
+        return b["id"]
+
+    def _true_up(self):
+        from app.db import tx
+        from app.purchase.autosync import _true_up_tms_batch_totals
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                return _true_up_tms_batch_totals(conn)
+
+    def _total(self, bid):
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "t.db")
+        t = conn.execute("SELECT total_amount FROM purchase_batches WHERE id=?",
+                         (bid,)).fetchone()[0]
+        conn.close()
+        return t
+
+    def test_기계_전표는_자산합으로_따라간다(self):
+        bid = self._batch_with_memo("[TMS 이관]", 297000, [300000, 200000, 100000])
+        n = self._true_up()
+        self.assertGreaterEqual(n, 1)
+        self.assertEqual(self._total(bid), 600000, "★전표 금액이 자산합을 안 따라간다")
+
+    def test_사람_전표는_건드리지_않는다(self):
+        bid = self._batch_with_memo("직접 협의한 금액", 297000, [300000, 200000])
+        self._true_up()
+        self.assertEqual(self._total(bid), 297000, "★사람이 적은 전표 금액이 덮였다")
+
+
+class TestQcLinkExisting(unittest.TestCase):
+    """★QC 이관 — 이미 있는 주문에도 관리번호 자산을 연결한다(2026-08-10 대표 승인)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-ql-"))
+        self.app = create_app(db_path=self.tmp / "t.db")
+        self.app.testing = True
+        self.c = self.app.test_client()
+        auth_mod._login_failures.clear()
+        self.c.post("/api/auth/setup", json={
+            "username": "admin", "displayName": "대표", "password": PW})
+        self.cat = self.c.get("/api/categories").get_json()[0]["id"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _qc_run(self, orders):
+        import io as _io
+        import json as _json
+        data = {"files": (_io.BytesIO(_json.dumps(orders, ensure_ascii=False).encode()),
+                          "orders.json")}
+        return self.c.post("/api/migrate/qc", data=data,
+                           content_type="multipart/form-data")
+
+    def test_기존_주문에_관리번호_자산이_연결된다(self):
+        # OWS가 먼저 수집해 둔 주문(미매칭) + 자산
+        a = self.c.post("/api/assets", json={
+            "categoryId": self.cat, "qty": 1, "assetNo": "260810-0001"}).get_json()[0]
+        o = self.c.post("/api/orders", json={
+            "recipient": "큐씨고객", "productName": "노트북", "phone": "010-3333-4444",
+            "address": "서울시 1", "postalCode": "06000", "amount": 500000}).get_json()
+        import sqlite3
+        conn = sqlite3.connect(self.tmp / "t.db")
+        conn.execute("UPDATE orders SET import_key='qc-e2e-1' WHERE id=?", (o["id"],))
+        conn.commit(); conn.close()
+        # QC 파일에는 같은 주문에 관리번호가 적혀 있다
+        r = self._qc_run([{"importKey": "qc-e2e-1", "orderNumber": "QC-001",
+                           "recipient": "큐씨고객", "managementNumber": "260810-0001",
+                           "managementNumberBy": "셋팅직원"}])
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["assets"]["linkedExisting"], 1, r.get_json())
+        got = self.c.get(f"/api/assets/{a['id']}").get_json()
+        self.assertTrue(any(x["orderId"] == o["id"] for x in got["orders"]),
+                        "★기존 주문에 자산이 연결되지 않았다")
+        ev = next((e for e in got["events"] if e["action"] == "주문매칭"), None)
+        self.assertIsNotNone(ev, "매칭 이력이 없다")
+        self.assertEqual(ev["detail"]["수취인"], "큐씨고객")
+        # 재실행해도 중복 연결은 안 된다
+        r2 = self._qc_run([{"importKey": "qc-e2e-1", "orderNumber": "QC-001",
+                            "recipient": "큐씨고객", "managementNumber": "260810-0001"}])
+        self.assertEqual(r2.get_json()["assets"]["linkedExisting"], 0, "★재실행에 중복 연결")
+
+
 class TestTierHelp(Base):
     """재고 구분 설명 — 담당자가 구분을 몰라 잘못 넣는 일을 막는다(대표 2026-08-04)."""
 
     def test_서버가_설명을_내려준다(self):
         m = self.c.get("/api/purchase-meta").get_json()
         h = m["tierHelp"]
-        self.assertIn("SSD", h["양품"])
-        self.assertIn("도색", h["실재고"])
-        self.assertIn("바로 판매가 불가능", h["가재고"])
+        # 2026-08-08 대표 확정 문구
+        self.assertIn("바로 판매 가능", h["가용"])
+        self.assertIn("시트지", h["실재고"])
+        self.assertIn("판매 가능 재고로 잡지 않는", h["가재고"])
         self.assertEqual(set(h), set(m["tiers"]), "설명이 빠진 구분이 있으면 안 된다")
 
-    def test_화면이_그_설명을_쓴다(self):
+    def test_재고_구분_칸이_화면에서_사라졌다(self):
+        """★상태 하나로 정한다(2026-08-24 대표 확인) — 재고 구분 칸을 전부 없앴다.
+
+        가용·실재고는 재고·출고 동작이 이미 같았고, 가재고가 하던 출고 차단은
+        '수리' 상태가 대신한다(라이브 가재고 0대). DB의 tier 칸과 서버 로직은
+        그대로 둔다 — 화면에서만 뺐으므로 숫자가 움직이지 않고 되돌리기도 쉽다.
+        """
         js = (ROOT / "static" / "js" / "purchase.js").read_text("utf-8")
-        self.assertIn("tierHelp", js, "설명을 안 쓰면 문구가 화면마다 갈린다")
-        self.assertIn("function tierOptions", js)
-        for sel in ("ad-tier", "ar-tier", "sa-tier", "uc-tier"):
-            self.assertIn(sel, js, f"{sel} 에 재고 구분 선택칸이 있어야 한다")
+        for sel in ("ad-tier", "ar-tier", "sa-tier", "uc-tier", "cr-tier"):
+            self.assertNotIn(sel, js, f"{sel} 가 아직 남아 있다 — 축이 두 개로 보인다")
 
 class TestSlipFormFlow(Base):
     """전표 등록 흐름(대표 2026-08-04) — 전표와 자산을 한 번에, 시리얼은 연속 스캔."""
@@ -2094,14 +3606,14 @@ class TestSlipFormFlow(Base):
 
     def test_같은_시리얼_두_번은_전표째로_거부된다(self):
         """한 줄이라도 겹치면 전부 되돌아간다 — 반쪽 저장이 없어야 한다."""
-        before = len(self.c.get("/api/assets").get_json())
+        before = len(self.c.get("/api/assets").get_json()["rows"])
         r = self.c.post("/api/purchase-batches", json={
             "stage": "purchased", "supplierId": self.sid, "purchaseDate": "2026-08-04",
             "totalAmount": 0, "assets": [
                 {"categoryId": self.cat, "qty": 1, "model": "L480", "serial": "DUP-1"},
                 {"categoryId": self.cat, "qty": 1, "model": "L480", "serial": "DUP-1"}]})
         self.assertGreaterEqual(r.status_code, 400)
-        self.assertEqual(len(self.c.get("/api/assets").get_json()), before,
+        self.assertEqual(len(self.c.get("/api/assets").get_json()["rows"]), before,
                          "실패했는데 자산이 남으면 안 된다")
 
 
@@ -2116,7 +3628,13 @@ class TestSlipFormUI(unittest.TestCase):
         """구획이 없어 어디까지가 한 덩어리인지 헷갈린다는 지적."""
         for cls in (".slip-form", ".sf-step", ".sf-step-head", ".sf-no"):
             self.assertIn(cls, self.css, f"{cls} 규칙이 없다")
-        self.assertEqual(self.js.count('class="sf-step"'), 3, "1)전표 2)자산담기 3)담긴자산")
+        # ★2026-08-26 부품 등록이 같은 골격(sf-step)을 재사용한다 — 함수별로 센다
+        asset_form = self.js.split("function renderSlipForm(stage)", 1)[1]
+        asset_form = asset_form.split("async function renderPartForm", 1)[0]
+        self.assertEqual(asset_form.count('class="sf-step"'), 3, "제품: 1)전표 2)자산담기 3)담긴자산")
+        part_form = self.js.split("async function renderPartForm", 1)[1].split(
+            chr(10) + "}" + chr(10), 1)[0]
+        self.assertEqual(part_form.count('class="sf-step"'), 2, "부품: 1)전표 2)부품담기")
         block = self.css.split(".sf-step {", 1)[1].split("}", 1)[0]
         self.assertIn("border", block, "테두리가 없으면 구획이 안 보인다")
 
@@ -2194,13 +3712,15 @@ class TestSlipFormSpecUI(unittest.TestCase):
                       "칸만 있고 담지 않으면 값이 사라진다")
 
     def test_금액_대조를_보여준다(self):
-        # 매입금액은 이제 자동 계산이라 '맞추기' 버튼이 필요 없다(2026-08-04).
-        # 대신 담은 합계가 그대로 금액이 된다는 사실을 보여 준다.
+        """★2026-08-24 양방향으로 바뀜: 합계 모드 안내와 분할 모드 안내가 둘 다 있어야 한다."""
         self.assertIn("sa-sum", self.js)
-        self.assertIn("자산을 담으면 자동으로 맞춰집니다", self.js)
+        self.assertIn("총액을 직접 적으면 대당 균등분할로 바뀝니다", self.js,
+                      "합계 모드에서 분할 모드로 가는 길을 안 알려 준다")
+        self.assertIn("균등분할 — 줄 합계", self.js, "분할 모드 안내가 없다")
 
     def test_대당인지_총액인지_적어_둔다(self):
-        self.assertIn("자산 매입가 합계 — 자동", self.js)
+        # ★2026-08-24: 총액 칸 안내가 '적으면 분할·비우면 합계'로 바뀌었다
+        self.assertIn("적으면 대당 균등분할 · 비우면 합계 자동", self.js)
         self.assertIn("한 대 값", self.js)
 
 class TestRepairVat(Base):
@@ -2251,9 +3771,9 @@ class TestRepairVat(Base):
         """고쳐 놓고 가재고로 남으면 출고가 막힌 채다."""
         a = self._asset_one()
         self.c.post(f"/api/assets/{a['id']}/repairs", json={
-            "description": "수리 완료", "cost": 11000, "tier": "양품"})
+            "description": "수리 완료", "cost": 11000, "tier": "가용"})
         d = self.c.get(f"/api/assets/{a['id']}").get_json()
-        self.assertEqual(d["tier"], "양품")
+        self.assertEqual(d["tier"], "가용")
         self.assertTrue(any(e["action"] == "재고구분" for e in d["events"]))
 
     def test_없는_구분으로는_못_올린다(self):
@@ -2271,16 +3791,16 @@ class TestRepairVat(Base):
 class TestConvertList(Base):
     """실재고/가재고 전환 목록 — 카테고리별로 묶어 보여준다."""
 
-    def test_양품이_아닌_것만_카테고리별로_준다(self):
+    def test_가용이_아닌_것만_카테고리별로_준다(self):
         b = self._batch()
-        self._asset(b["id"], model="양품것", tier="양품")
+        self._asset(b["id"], model="가용것", tier="가용")
         self._asset(b["id"], model="가재고것", tier="가재고")
         self._asset(b["id"], model="실재고것", tier="실재고")
         d = self.c.get("/api/assets/to-convert").get_json()
-        self.assertEqual(d["total"], 2, "양품은 빠져야 한다")
+        self.assertEqual(d["total"], 2, "가용은 빠져야 한다")
         self.assertEqual(d["byTier"], {"가재고": 1, "실재고": 1})
         models = [a["model"] for g in d["groups"] for a in g["assets"]]
-        self.assertNotIn("양품것", models)
+        self.assertNotIn("가용것", models)
 
     def test_출고완료는_빠진다(self):
         b = self._batch()
@@ -2307,7 +3827,7 @@ class TestConvertList(Base):
 
     def test_재고구분_설명도_함께_준다(self):
         d = self.c.get("/api/assets/to-convert").get_json()
-        self.assertIn("양품", d["tierHelp"])
+        self.assertIn("가용", d["tierHelp"])
 
 
 class TestRepairVatInReports(Base):
@@ -2334,18 +3854,21 @@ class TestConvertUI(unittest.TestCase):
     def setUp(self):
         self.js = (ROOT / "static" / "js" / "purchase.js").read_text("utf-8")
 
-    def test_전환_보기가_있다(self):
-        """2026-08-04 탭 통합 — 별도 탭이 아니라 [자산] 탭 안의 보기가 됐다."""
-        self.assertIn("실재고 / 가재고", self.js)
-        self.assertIn("function renderConvert", self.js)
-        self.assertIn('"convert", "🔧 실재고 / 가재고"', self.js)
+    def test_전환_보기는_없앴다(self):
+        """★재고 구분을 상태로 합치면서 이 보기는 뜻을 잃었다(2026-08-24 대표 확인).
+
+        옛 북마크(purchaseTab=convert)로 들어와도 빈 화면이 되지 않게 자산 목록으로 보낸다.
+        """
+        self.assertNotIn("function renderConvert", self.js)
+        self.assertNotIn('"convert", "🔧 실재고 / 가재고"', self.js)
+        self.assertIn('convert: ["assets", "list"]', self.js, "옛 북마크가 빈 화면으로 간다")
 
     def test_수리_패널에_부가세_자동계산이_있다(self):
         self.assertIn("function openRepairPanel", self.js)
         block = self.js.split("function openRepairPanel", 1)[1]
         self.assertIn("total * 10 / 110", block, "서버와 같은 식이어야 숫자가 어긋나지 않는다")
         self.assertIn("cr-parts", block, "교체 부품 칸")
-        self.assertIn("cr-tier", block, "구분 전환 칸")
+        self.assertNotIn("cr-tier", block, "재고 구분 칸은 없앴다 — 상태가 그 일을 한다")
 
     def test_이력이_함께_보인다(self):
         block = self.js.split("function openRepairPanel", 1)[1]
@@ -2353,7 +3876,8 @@ class TestConvertUI(unittest.TestCase):
         self.assertIn("a.events", block, "입고부터 판매까지 이어져야 한다")
 
     def test_재무_화면이_매입세액을_보여준다(self):
-        js = (ROOT / "static" / "js" / "reports.js").read_text("utf-8")
+        # 8/31 리포트 통합 — 손익 구성은 설정 ▸ 매출/실적 ▸ 기간 실적(app.js)이 담당한다
+        js = (ROOT / "static" / "js" / "app.js").read_text("utf-8")
         self.assertIn("repairVat", js)
         self.assertIn("매입세액", js)
 
@@ -2412,11 +3936,31 @@ class TestSlipFormCleanup(unittest.TestCase):
     def test_매입금액은_읽기전용이다(self):
         block = self.js.split("function slipFieldsHtml", 1)[1].split("</div>", 1)[0]
         self.assertIn('id="sl-amount"', block)
-        self.assertIn("readonly", block, "손으로 고치면 자산 합계와 어긋난다")
+        # ★2026-08-24 대표: 매입금액도 입력할 수 있다(적으면 균등분할·비우면 합계 자동).
+        #   readonly 로 되돌리면 분할 모드가 통째로 죽는다.
+        self.assertNotIn("readonly", block, "매입금액 입력(균등분할 모드)이 막혔다")
 
     def test_담을_때마다_금액을_채운다(self):
         self.assertIn('const amt = $("#sl-amount");', self.js)
-        self.assertIn("amt.value = total", self.js)
+        # ★2026-08-24: 합계 모드에서만 자동으로 채운다 — 분할 모드(사람이 총액을 적음)에선
+        #   그 값이 기준이라 덮으면 안 된다.
+        self.assertIn("if (amt && !totalManual) amt.value = fmtNum(total)", self.js)
+
+    def test_금액_칸은_콤마로_보이고_숫자로_보낸다(self):
+        """대표 2026-08-14: "20000원 → 20,000원". 표기만 바뀌고 저장값은 숫자여야 한다."""
+        self.assertIn("input[data-money]", self.js, "금액 칸 서식 리스너가 없다")
+        # ★금액 가림(2026-08-27) 뒤로 ad-price 는 비활성(•••) 변형이 하나 더 있다 —
+        #   '어딘가에 data-money 판이 있다'로 본다(첫 등장만 보면 가림판에 걸린다)
+        for sel in ('id="pb-price"', 'id="ad-price"', 'id="sa-price"',
+                    'id="ar-price"', 'id="cr-cost"', 'id="rp-cost"'):
+            self.assertTrue(any(sel in x and "data-money" in x
+                                for x in self.js.splitlines()),
+                            f"{sel} 에 콤마 서식이 안 붙었다")
+        # 제출 경로는 콤마를 뗀다 — 자산 상세 두 칸은 빈 값 폴백까지 있어야 한다
+        # (칸을 통째로 지우면 ''가 되어 서버가 400을 내고 같은 저장의 다른 수정까지 날아갔다)
+        for key in ("#ad-price", "#ad-saleprice"):
+            line = next(x for x in self.js.splitlines() if key in x and "replaceAll" in x)
+            self.assertIn("|| 0", line, f"{key} 빈 값 폴백이 없다")
 
     def test_화면에_들어올_때_열린_상세를_닫는다(self):
         # 권한 없음 early-return 뒤, 탭을 그리기 전에 지워야 한다
@@ -2506,11 +4050,11 @@ class TestDupCardCollapse(unittest.TestCase):
 
 class TestTierForGrade(unittest.TestCase):
     """등급 → 재고구분 기준(대표 지시 2026-08-04):
-       등급 매겨짐 = 양품 / 미정 = 실재고 / 가재고는 사람이 직접."""
+       등급 매겨짐 = 가용 / 미정 = 실재고 / 가재고는 사람이 직접."""
 
-    def test_등급이_있으면_양품(self):
+    def test_등급이_있으면_가용(self):
         for g in ("A급", "SS", "S+A", "AA", "B급", "NU", "AS"):
-            self.assertEqual(tier_for_grade(g), "양품", g)
+            self.assertEqual(tier_for_grade(g), "가용", g)
 
     def test_미정이면_실재고(self):
         self.assertEqual(tier_for_grade("미정"), "실재고")
@@ -2551,7 +4095,7 @@ class TestSaleSlips(Base):
 
     def _rows_master(self):
         return [{
-            "판매전표": "S260101-001", "판매채널": "쿠팡", "판매처명": "하프북판매",
+            "판매전표": "S260101-001", "판매채널": "쿠팡", "판매처명": "업무관리판매",
             "판매일": "2026-01-01", "출고일": "2026-01-02", "송장번호": "1234",
             "수량": "3", "판매수량": "5", "매입금액": "100000",
             "판매금액": "500000", "판매가": "450000", "판매차이금액": "50000",
@@ -2562,7 +4106,7 @@ class TestSaleSlips(Base):
 
     def _rows_paid(self):
         return [{
-            "판매전표": "S260101-001", "판매채널": "쿠팡", "거래처명": "하프북판매",
+            "판매전표": "S260101-001", "판매채널": "쿠팡", "거래처명": "업무관리판매",
             "판매일": "2026-01-01", "납부확인": "완납", "입금일시": "2026-01-03",
             "입금액": "500000", "입금확인": "1",
             "매입금액": "0", "부가세": "0", "수수료": "0", "판매금액": "0",
@@ -2615,7 +4159,8 @@ class TestSaleSlips(Base):
         self.assertEqual(r["item_profit"], 35000)
 
     def test_값을_덮어쓰지_않는다(self):
-        """사람이 HMS에서 고친 값이 다음 이관에 되돌아가면 고칠 이유가 없어진다."""
+        """사람이 OWS에서 고친 값(ows_edited_at — 판매 전표 화면의 모든 수정이 찍는다)이 다음 이관에
+        되돌아가면 고칠 이유가 없어진다. 반대로 아무도 안 고친 전표는 TMS 값을 따라간다(2026-09-03)."""
         from app.db import tx
         from app.purchase.sales import apply_sale_slips
         with self.app.app_context():
@@ -2625,8 +4170,15 @@ class TestSaleSlips(Base):
                     "UPDATE sale_slips SET sale_amount=999 WHERE slip_no='S260101-001'")
                 res = apply_sale_slips(conn, self._rows_master())
                 r = conn.execute("SELECT sale_amount FROM sale_slips").fetchone()
+                self.assertEqual(r["sale_amount"], 500000, "안 고친 연동 전표는 TMS 값을 따라가야 한다")
+                self.assertEqual(res["updated"], 1)
+                conn.execute(
+                    "UPDATE sale_slips SET sale_amount=999, ows_edited_at='2026-09-03T10:00:00+09:00' "
+                    "WHERE slip_no='S260101-001'")
+                res = apply_sale_slips(conn, self._rows_master())
+                r = conn.execute("SELECT sale_amount FROM sale_slips").fetchone()
         self.assertEqual(r["sale_amount"], 999, "사람이 고친 값을 이관이 덮어썼다")
-        self.assertEqual(res["updated"], 0)
+        self.assertEqual((res["updated"], res["protected"]), (0, 1))
 
     def test_날짜_시리얼이_풀린다(self):
         """엑셀 날짜는 숫자로 온다 — 그대로 넣으면 '46238.46'이 된다."""
@@ -2676,7 +4228,7 @@ class TestSaleSlips(Base):
         self.assertIn("쿠팡", d["channels"])
 
     def test_자동반영이_판매전표를_가져간다(self):
-        """예전엔 '자산 표가 아님'으로 버려서 매출·정산이 HMS에 안 들어왔다."""
+        """예전엔 '자산 표가 아님'으로 버려서 매출·정산이 OWS에 안 들어왔다."""
         src = (ROOT / "app" / "purchase" / "autosync.py").read_text("utf-8")
         self.assertIn("is_sale_slip_sheet", src)
         self.assertIn("apply_sale_slips", src)
@@ -2688,7 +4240,7 @@ class TestMigrationBatchAmount(Base):
     """이관이 새 전표를 만들 때 죽지 않아야 하고, 남의 전표를 건드리면 안 된다.
 
     2026-08-04: created_batches 정의가 빠진 채 참조돼 NameError로 자동반영이 통째로
-    죽어 있었다(재고항목현황 반영 실패, hms.log 18:01:46).
+    죽어 있었다(재고항목현황 반영 실패, ows.log 18:01:46).
     """
 
     def _rows(self, slip, no, price):
@@ -2703,7 +4255,7 @@ class TestMigrationBatchAmount(Base):
         from app.purchase.migration import _prepare, apply_rows
         with self.app.app_context():
             with tx(write=True) as conn:
-                ready, dup, errors, updates = _prepare(conn, rows, fill_blanks=True)
+                ready, dup, errors, updates, _lk = _prepare(conn, rows, fill_blanks=True)
                 return apply_rows(conn, ready, updates, actor="테스트"), errors
 
     def test_새_전표를_만들어도_죽지_않는다(self):
@@ -2758,11 +4310,14 @@ class TestPurchaseTabConsolidation(unittest.TestCase):
         self.block = self.js.split("function renderPurchaseView", 1)[1].split(
             chr(10) + "}", 1)[0]
 
-    def test_상위_탭은_셋뿐(self):
-        """2026-08-04 판매 전표를 설정 › 매출/실적으로 옮겨 매입은 3탭이 됐다."""
-        import re
-        keys = re.findall(r'\["(\w+)", "', self.block)
-        self.assertEqual(sorted(set(keys)), ["assets", "base", "slips"])
+    def test_상위_탭_구성(self):
+        """8/4 판매전표→설정, 8/25 미지급금 추가, 8/27 미지급금은 금액 권한 조건부."""
+        blk = self.block.split("const tabs = [", 1)[1].split("];", 1)[0]
+        self.assertIn('["slips", "매입 작업"]', "[" + blk)
+        self.assertIn('["assets", "자산"]', blk)
+        # 미지급금은 금액 권한이 있어야 보인다(2026-08-27 대표 — 접근과 금액은 별도)
+        self.assertIn('canMoney ? [["payables"', blk, "미지급금 탭 금액 게이트가 사라졌다")
+        self.assertIn('tabs.push(["base"', self.block)   # 기준정보는 편집 권한 시에만
 
     def test_판매전표를_찾아오면_새_자리로_보낸다(self):
         """옛 링크·이전 상태가 'saleslips'로 들어올 수 있다."""
@@ -2776,21 +4331,28 @@ class TestPurchaseTabConsolidation(unittest.TestCase):
         for old in ("summary", "uncoded", "convert", "suppliers", "migrate"):
             self.assertIn(old + ":", self.block, f"{old} 이동 규칙 없음")
 
-    def test_네_보기가_모두_살아_있다(self):
+    def test_보기가_모두_살아_있다(self):
+        """★convert(🔧 실재고/가재고)는 2026-08-24에 없앴다 — 재고 구분을 상태로 합쳤다."""
         for key, fn in (("summary", "renderStockSummary"), ("list", "renderAssetList"),
-                        ("uncoded", "renderUncoded"), ("convert", "renderConvert")):
+                        ("uncoded", "renderUncoded"), ("revert", "renderRevertQueue"),
+                        ("conflict", "renderConflictQueue")):
             self.assertIn(f'"{key}"', self.js)
             self.assertIn(f"function {fn}", self.js)
+        self.assertNotIn("function renderConvert", self.js)
         self.assertIn("function renderAssetsTab", self.js)
         self.assertIn("function renderBaseTab", self.js)
 
     def test_치울_일은_배지로_보인다(self):
-        """제품코드 없음·가재고가 보기 안에 숨으면 영영 안 치운다."""
+        """치워야 할 일이 보기 안에 숨으면 영영 안 치운다.
+
+        ★가재고 배지는 없앴다(2026-08-24) — 재고 구분 자체가 사라졌다.
+        """
         self.assertIn("subtab-badge", self.js)
         self.assertIn("function fillAssetBadges", self.js)
         blk = self.js.split("function fillAssetBadges", 1)[1].split(chr(10) + "}", 1)[0]
         self.assertIn("/api/assets/uncoded", blk)
-        self.assertIn("/api/assets/to-convert", blk)
+        self.assertIn("/api/assets/number-conflicts", blk)
+        self.assertNotIn("/api/assets/to-convert", blk)
         # 배지가 실패해도 화면은 떠야 한다
         self.assertIn("catch", blk)
 
@@ -2799,7 +4361,21 @@ class TestPurchaseTabConsolidation(unittest.TestCase):
         self.assertIn('style.display = n ? "" : "none"', blk)
 
     def test_조회권한만_있으면_수정용_보기는_안_보인다(self):
-        self.assertIn("canEdit || (k !== \"uncoded\" && k !== \"convert\")", self.js)
+        """★보기 이름을 박아 두지 않는다 — 보기가 늘 때마다 이 시험이 거짓으로 깨졌다.
+
+        지킬 것은 하나다: 집계·목록을 뺀 나머지(치워야 할 일 목록)는 전부
+        편집 권한이 있어야 보인다. 하나라도 빠지면 조회 전용 계정에 노출된다.
+        """
+        block = self.js.split("const ASSET_VIEWS = [", 1)[1].split("];", 1)[0]
+        keys = re.findall(r'\["(\w+)",', block)
+        self.assertIn("summary", keys)
+        line = next(x for x in self.js.splitlines() if "canEdit || (k !==" in x)
+        for k in keys:
+            if k in ("summary", "list"):
+                self.assertNotIn(f'k !== "{k}"', line, f"{k}는 조회 전용도 봐야 한다")
+            else:
+                self.assertIn(f'k !== "{k}"', line,
+                              f"편집 전용 보기 [{k}]가 조회 권한에도 보인다")
 
     def test_중복카드에서_자산으로_갈_때_목록_보기로_간다(self):
         """집계 화면으로 가면 누른 관리번호가 어디에도 없다."""
@@ -2842,7 +4418,7 @@ class TestAssetSlipLink(Base):
         b = self._batch()
         r = self._asset(batch_id=b["id"])
         self.assertIn(r.status_code, (200, 201), r.get_data(as_text=True))
-        rows = self.c.get("/api/assets").get_json()
+        rows = self.c.get("/api/assets").get_json()["rows"]
         self.assertTrue(rows)
         self.assertEqual(rows[0]["slipNo"], b["slipNo"])
         self.assertEqual(rows[0]["batchId"], b["id"])
@@ -2850,7 +4426,7 @@ class TestAssetSlipLink(Base):
     def test_전표에_안_묶인_자산도_목록에_남는다(self):
         """LEFT JOIN이 아니면 이관·수기 자산이 통째로 사라진다."""
         self._asset()                       # batchId 없이
-        rows = self.c.get("/api/assets").get_json()
+        rows = self.c.get("/api/assets").get_json()["rows"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["slipNo"], "")
 
@@ -2875,7 +4451,8 @@ class TestAssetSlipLink(Base):
     # ---- 화면 ----
     def test_상세_맨_위에_전표줄이_있다(self):
         self.assertIn("function slipBarHtml", self.js)
-        blk = self.js.split("function renderAssetDetail", 1)[1][:2000]
+        blk = self.js.split("function renderAssetDetail", 1)[1].split(
+            "\nasync function ", 1)[0]
         self.assertIn("slipBarHtml(a.batch)", blk)
         # 닫기 버튼(맨 위) 바로 다음에 와야 '상단'이다
         self.assertLess(blk.index("slipBarHtml(a.batch)"), blk.index("form-grid"))
@@ -2916,7 +4493,7 @@ class TestQcRefresh(Base):
     """QC 주문 파일 재투입 = '목록 최신화'(대표 요청 2026-08-04).
 
     예전에는 이미 들어온 주문이면 통째로 건너뛰어서, 첫 취입 뒤 QC에서 셋팅·검수·출고를
-    끝내도 HMS는 옛날 상태 그대로였다(실측 745건 중 37건 56플래그 어긋남).
+    끝내도 OWS는 옛날 상태 그대로였다(실측 745건 중 37건 56플래그 어긋남).
     ★전진만 반영한다 — 끝난 일을 안 끝난 것으로 되돌리는 사고는 복구할 방법이 없다.
     """
 
@@ -2993,10 +4570,10 @@ class TestQcRefresh(Base):
         self.assertEqual(r["shipping_done"], 0, "미리보기가 데이터를 바꿨다")
 
     def test_취소는_건드리지_않는다(self):
-        """취소는 HMS 쪽 판단이라 파일이 뒤집으면 안 된다.
+        """취소는 OWS 쪽 판단이라 파일이 뒤집으면 안 된다.
 
         ★보관(archived_at)은 2026-08-04 감사 결과 예외로 두었다 —
-          QC에서 마감한 주문이 HMS에선 계속 열려 있어 '한쪽만 닫힌 주문'이 쌓였다.
+          QC에서 마감한 주문이 OWS에선 계속 열려 있어 '한쪽만 닫힌 주문'이 쌓였다.
           단 '전진만'(빈 칸 → 채움)이고 해제는 안 한다(test_보관을_해제하지는_않는다).
         """
         src = (ROOT / "app" / "settings" / "qc_import.py").read_text("utf-8")
@@ -3048,7 +4625,7 @@ class TestAuditFixes20260804(Base):
             with tx(write=True) as conn:
                 conn.execute("UPDATE purchase_batches SET cancelled_at='2026-08-04' WHERE id=?",
                              (b["id"],))
-        r = self.c.get("/api/assets").get_json()
+        r = self.c.get("/api/assets").get_json()["rows"]
         self.assertTrue(r[0]["slipCancelled"], "취소된 전표인데 목록이 모른다")
         self.assertFalse(r[0]["slipReturned"])
 
@@ -3108,10 +4685,11 @@ class TestAuditFixes20260804(Base):
         self.assertNotIn('"capped": len(rows) >= 500', src)
 
     # ---- 배지가 실제 손댈 것만 세게 ----
-    def test_배지는_가재고만_센다(self):
+    def test_배지에_가재고가_없다(self):
+        """★재고 구분을 없앴다(2026-08-24) — 가재고 배지도 함께 사라져야 한다."""
         blk = self.js.split("function fillAssetBadges", 1)[1].split(chr(10) + "}", 1)[0]
-        self.assertIn('c.byTier["가재고"]', blk)
-        self.assertNotIn('put("convert", c.total', blk)
+        self.assertNotIn("가재고", blk)
+        self.assertNotIn('put("convert"', blk)
 
     # ---- 제품코드 적용 후 숫자·배지 갱신 ----
     def test_적용후_제대로_다시_그린다(self):
@@ -3330,7 +4908,8 @@ class TestPagers(unittest.TestCase):
     def test_묶음별로_따로_넘어간다(self):
         """모델 묶음이 여럿인데 key가 같으면 한 묶음을 넘길 때 다 같이 넘어간다."""
         self.assertIn('"uc:" + g.model', self.pur)
-        self.assertIn('"cv:" + g.category', self.pur)
+        # "cv:"(실재고/가재고 보기)는 2026-08-24에 보기와 함께 없앴다
+        self.assertNotIn('"cv:" + g.category', self.pur)
 
     def test_조건이_바뀌면_1쪽으로(self):
         """3쪽을 보다 검색해 2건만 남으면 빈 화면이 된다."""
@@ -3392,7 +4971,7 @@ class TestProductCodeLookup(Base):
 
     def test_출고가능_대수를_함께_준다(self):
         """코드만 봐선 지금 팔 수 있는지 모른다."""
-        self._asset_with_code("X_i5_내장", tier="양품")
+        self._asset_with_code("X_i5_내장", tier="가용")
         self._asset_with_code("X_i5_내장", tier="가재고")
         d = self.c.get("/api/product-codes?q=X_i5").get_json()
         c = d["codes"][0]
@@ -3419,6 +4998,43 @@ class TestProductCodeLookup(Base):
         r = self.c.get("/api/product-codes")
         self.assertEqual(r.status_code, 200)
 
+    # ---- 몰 확인 (대표 요청 2026-08-07) ----
+    def test_몰_확인은_매입_조회권한으로_된다(self):
+        """/malls/<code>/goods 는 orders.edit 이라 매입만 보는 사람은 못 쓴다."""
+        r = self.c.get("/api/mall-product-codes?q=840G3")
+        self.assertEqual(r.status_code, 200)
+
+    def test_몰이_안_켜져_있어도_오류를_내지_않는다(self):
+        """★글자마다 부르는 자리다. 여기서 400/502를 내면 화면이 빨간 토스트로 덮인다.
+
+        몰을 안 켰으면 ok:false 로 조용히 알려 주고, 매입 화면의 기존 자동완성은
+        그대로 돌아야 한다.
+        """
+        r = self.c.get("/api/mall-product-codes?q=840G3")
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertFalse(d["ok"])
+        self.assertEqual(d["codes"], [])
+        self.assertFalse(d["exact"])
+        self.assertTrue(d.get("reason"))
+
+    def test_두_글자_미만은_몰에_묻지_않는다(self):
+        d = self.c.get("/api/mall-product-codes?q=8").get_json()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["codes"], [])
+        self.assertIn("두 글자", d["message"])
+
+    def test_몰_확인은_읽기만_한다(self):
+        """TMS든 몰이든, 조회 화면이 남의 시스템에 무언가를 쓰면 안 된다."""
+        import inspect
+
+        from app.malls import collect
+
+        src = inspect.getsource(collect.mall_product_codes)
+        for bad in ("tx(write=True)", "INSERT", "UPDATE", "DELETE", "audit.log"):
+            self.assertNotIn(bad, src, f"몰 확인이 {bad} 를 한다")
+        self.assertIn('field="code"', src)          # 상품명이 아니라 코드로만 찾는다
+
     # ---- 화면 ----
     def test_공용_도구가_하나뿐이다(self):
         self.assertEqual(self.js_app.count("function attachCodeLookup("), 1)
@@ -3427,11 +5043,24 @@ class TestProductCodeLookup(Base):
             self.assertNotIn("function attachCodeLookup(", src)
 
     def test_제품코드_칸_전부에_붙었다(self):
-        # 수기 주문(신설) · 자산 상세 · 전표에 자산 담기 · 제품코드 일괄
+        # 수기 주문(신설) · 자산 상세 · 전표에 자산 담기 · 전표 일괄 · 코드없음 일괄
+        # ★호출 모양이 아니라 '어느 칸에 붙었나'만 본다 — 옵션이 늘어도 이 시험이
+        #   깨지지 않게. 2026-08-07에 { mall: true }가 붙으며 한 번 깨졌다.
         self.assertIn('attachCodeLookup("no-sku"', self.js_ord)
-        self.assertIn('attachCodeLookup("ad-productcode")', self.js_pur)
-        self.assertIn('attachCodeLookup("sa-productcode")', self.js_pur)
-        self.assertIn("attachCodeLookup(codeIn.id)", self.js_pur)
+        for tgt in ('"ad-productcode"', '"sa-productcode"', '"sd-code-input"'):
+            self.assertIn("attachCodeLookup(" + tgt, self.js_pur)
+        self.assertIn("attachCodeLookup(codeIn.id", self.js_pur)
+
+    def test_매입_제품코드_칸은_몰_확인까지_켠다(self):
+        """대표 요청 2026-08-07 — 그 코드가 고도몰에 실제로 있는지 확인하고 매칭한다.
+
+        매입 화면의 코드칸 4곳 전부 { mall: true } 여야 한다. 하나라도 빠지면
+        거기서만 오타가 그대로 저장되고, 몰 재고 연동이 그 코드에서 끊긴다.
+        """
+        for tgt in ('"ad-productcode"', '"sa-productcode"', '"sd-code-input"', "codeIn.id"):
+            blk = self.js_pur.split("attachCodeLookup(" + tgt, 1)
+            self.assertEqual(len(blk), 2, f"{tgt} 에 자동완성이 안 붙었다")
+            self.assertIn("mall: true", blk[1][:120], f"{tgt} 에 몰 확인이 안 켜졌다")
 
     def test_수기_주문에_제품코드_칸이_있다(self):
         self.assertIn('codeLookupField("no-sku"', self.js_ord)
@@ -3465,8 +5094,24 @@ class TestProductCodeLookup(Base):
         self.assertIn("if (my !== seq) return;", blk)
 
     def test_없는_코드도_새로_적을_수_있다(self):
-        blk = self.js_app.split("function attachCodeLookup", 1)[1][:2500]
+        # ★글자 수로 자르지 않는다 — 함수가 길어지면 시험이 조용히 거짓 통과하거나
+        #   엉뚱하게 깨진다(2026-08-07 몰 확인이 붙으며 실제로 깨졌다).
+        #   다음 함수 정의 전까지를 통째로 본다.
+        blk = self.js_app.split("function attachCodeLookup", 1)[1]
+        blk = blk.split("\nfunction ", 1)[0]
         self.assertIn("새로 적으셔도 됩니다", blk)
+
+    def test_몰이_죽어도_코드칸은_돌아간다(self):
+        """★몰 조회는 곁다리다. 몰이 꺼져 있거나 느려도 우리 자산 기준 목록은 떠야 한다.
+
+        매입은 몰과 무관하게 계속 돌아야 하는 일이다. 여기서 await 로 몰을 기다리면
+        고도몰이 느린 날 제품코드 칸이 통째로 멈춘다.
+        """
+        blk = self.js_app.split("function attachCodeLookup", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("/api/mall-product-codes", blk)
+        # 몰 호출에 await 를 걸지 않았는가 — .then/.catch 로만 처리해야 한다
+        self.assertNotIn('await api("/api/mall-product-codes', blk)
+        self.assertIn(".catch(", blk.split("/api/mall-product-codes", 1)[1][:400])
 
 class TestReceiveMethod(Base):
     """수령방식 — 택배가 아닌 건(방문수령·퀵)이 있다(대표 2026-08-05).
@@ -3568,7 +5213,10 @@ class TestSetupBoardDoneView(unittest.TestCase):
 
     def test_완료포함이면_출고분도_보인다(self):
         self.assertIn('const mode = ($("#sf-view") || {}).value || "todo";', self.js)
-        self.assertIn('all.filter((o) => !o.shippingDone)', self.js)
+        # 기본(todo) 보기는 '아직 안 나간 것 + 나갔지만 배송 중인 것'이다(대표 2026-09-04)
+        self.assertIn("(!o.shippingDone || inShippingBucket(o))", self.js)
+        self.assertIn("o.shippingDone && !o.cancelledAt", self.js,
+                      "[출고 완료 고객] 보기가 출고분을 안 고른다")
 
     def test_완료포함은_보관분까지_가져온다(self):
         """끝난 주문은 대부분 '보관'까지 돼 있어 view=active로는 안 잡힌다
@@ -3578,7 +5226,7 @@ class TestSetupBoardDoneView(unittest.TestCase):
 
     def test_출고완료_고객_보기가_있다(self):
         """대표 2026-08-05 — QC는 출고 확인을 누르면 목록에서 빼 버려 이력이 남지 않는다.
-        HMS의 이 보기가 그 이력 화면이 된다."""
+        OWS의 이 보기가 그 이력 화면이 된다."""
         self.assertIn('<option value="shipped">', self.js)
         self.assertIn("출고 완료 고객", self.js)
         self.assertIn('all.filter((o) => o.shippingDone && !o.cancelledAt)', self.js)
@@ -3705,7 +5353,7 @@ class TestQcWatch(Base):
     def test_검증서버에서는_끌_수_있다(self):
         init = (ROOT / "app" / "__init__.py").read_text("utf-8")
         blk = init.split("start_qc_watch", 1)[0][-400:]
-        self.assertIn('HMS_NO_TMS_SYNC', blk)
+        self.assertIn('OWS_NO_TMS_SYNC', blk)
 
     def test_상태_API가_있다(self):
         r = self.c.get("/api/qc-watch/status")
@@ -3734,7 +5382,7 @@ class TestQcWatch(Base):
         self.assertIn("되돌리지는 않습니다", self.js)
 
 class TestSetupRowDetail(Base):
-    """셋팅/QC 행 상세 보기 — QC 프로그램(192.168.0.185:3000)과 같은 4칸.
+    """셋팅/QC 행 상세 보기 — QC 프로그램(127.0.0.1:3000)과 같은 4칸.
 
     대표 지시(2026-08-05): 각 행에서 상품정보 / 결제정보 / 구매자·배송지 / 처리이력을
     펼쳐 볼 수 있게. 재고 칩은 채널/주문 칸 아래로.
@@ -3799,10 +5447,16 @@ class TestSetupRowDetail(Base):
             self.assertIn(sel, self.css)
 
     def test_칸수가_표_칸수와_같다(self):
-        """colspan이 어긋나면 표가 통째로 틀어진다."""
+        """colspan이 어긋나면 표가 통째로 틀어진다.
+
+        ★칸 수 자체(8이냐 9냐)는 여기서 정하지 않는다 — 단계가 늘고 줄 때마다
+          이 시험이 거짓으로 깨졌다. 지킬 것은 '머리글 == colspan' 하나다.
+        """
         heads = self.js.split("<thead>", 1)[1].split("</thead>", 1)[0]
-        self.assertEqual(heads.count("<th"), 8)
-        self.assertIn('colspan="8"', self.blk)
+        n = heads.count("<th")
+        self.assertGreaterEqual(n, 8, "셋팅 보드 머리글이 통째로 사라졌다")
+        self.assertIn(f'colspan="{n}"', self.blk,
+                      f"머리글 {n}칸과 상세줄 colspan이 다르다")
 
     # ---- 화면이 쓰는 값이 실제로 내려오는지 ----
     def test_필요한_값이_목록에_실려_온다(self):
@@ -3946,8 +5600,8 @@ class TestQcShipped(Base):
 
     ★왜 자동으로 안 이어졌나 (실측)
       같은 주문이 두 개의 키로 존재한다 — QC는 엑셀 수집분 "주문수집:…",
-      HMS는 몰 API 주문번호. import_key만 보는 qc_watch로는 영영 못 만난다.
-      그래서 QC에서는 출고가 끝났는데 HMS 보드에는 계속 남는다(잔여 166건 중 83건).
+      OWS는 몰 API 주문번호. import_key만 보는 qc_watch로는 영영 못 만난다.
+      그래서 QC에서는 출고가 끝났는데 OWS 보드에는 계속 남는다(잔여 166건 중 83건).
     """
 
     def setUp(self):
@@ -4254,7 +5908,7 @@ class TestQcShippedDuplicateGuard(Base):
     """같은 주문이 우리 쪽에 두 줄이면 출고 처리하지 않는다(2026-08-05 사고 재발 방지).
 
     ★무슨 일이 있었나
-      1차 반영 83건 중 **67건**은 그 QC 주문이 이미 HMS에 주문 행으로 들어와 있던 것이었다
+      1차 반영 83건 중 **67건**은 그 QC 주문이 이미 OWS에 주문 행으로 들어와 있던 것이었다
       (QC 이관분 import_key='주문수집:고도몰:수집-XXXX' + 몰 API 수집분 = 같은 주문 두 줄).
       한쪽은 이미 출고완료였는데 두 번째 줄까지 출고완료로 찍어
       **매출 12,980,300원과 출고 건수가 그대로 이중계상**됐다(출고시각이 짝과 완전히 동일).
@@ -4580,6 +6234,31 @@ class TestQcDupAuto(Base):
         self.assertEqual(r.status_code, 200)
         self.assertIn("dupArchived", r.get_json())
 
+    # ---- 연동 해제 (대표 지시 2026-08-07) ----
+    def test_감시_스레드는_이제_안_뜬다(self):
+        """"셋팅 및 QC는 OWS를 바로 관련 사람들이 사용할 예정이니까."
+
+        ★원본이 둘이면 반드시 싸운다. 앱을 띄울 때 아예 스레드를 만들지 않는다.
+        """
+        init = (ROOT / "app" / "__init__.py").read_text("utf-8")
+        head = init.split("start_qc_watch", 1)[0]
+        self.assertIn('os.getenv("OWS_QC_WATCH") == "1"', head,
+                      "감시 스레드가 조건 없이 뜬다")
+
+    def test_저장된_설정이_켬이어도_안_돈다(self):
+        """설정 화면에서 예전에 켜 둔 값이 남아 있어도 '꺼 달라'는 지시가 이긴다."""
+        from app.db import tx
+        from app.settings import qc_watch
+        self.c.post("/api/qc-watch", json={"enabled": True, "path": r"\\x\y"})
+        with self.app.app_context():
+            with tx() as conn:
+                self.assertFalse(qc_watch._cfg(conn)["enabled"])
+
+    def test_꺼져_있으면_한_바퀴_돌아도_아무것도_안_한다(self):
+        from app.settings import qc_watch
+        self.c.post("/api/qc-watch", json={"enabled": True, "path": r"\\x\y"})
+        self.assertEqual(qc_watch.sync_once(self.app, force=True), (0, 0))
+
     # ---- 실제 흐름 ----
     def test_감시가_돌면_중복이_사라진다(self):
         import json
@@ -4616,7 +6295,10 @@ class TestQcDupAuto(Base):
         try:
             from app.settings import qc_shipped, qc_watch
             self.c.post("/api/qc-watch", json={"enabled": True, "path": os.path.dirname(path)})
-            with mock.patch.object(qc_watch, "_orders_file", return_value=path), \
+            # ★QC_LIVE 는 2026-08-07부터 기본 꺼짐이다(대표 지시). 정리 로직 자체는
+            #   계속 시험한다 — 되살릴 날이 오면 그때 이게 맞아야 한다.
+            with mock.patch.object(qc_watch, "QC_LIVE", True), \
+                 mock.patch.object(qc_watch, "_orders_file", return_value=path), \
                  mock.patch.object(qc_shipped, "_load_nas", return_value=(nas, 1, 1)):
                 qc_watch.sync_once(self.app, force=True)
         finally:
@@ -4648,23 +6330,51 @@ class TestShipFlow2026_08_05(Base):
         return self.c.post("/api/orders", json=base).get_json()["id"]
 
     def _ready(self, oid):
-        """자산까지 붙여 송장을 뽑을 수 있는 상태로 만든다."""
+        """자산까지 붙여 송장을 뽑을 수 있는 상태로 만든다.
+
+        ★2026-09-04 대표 정정으로 송장은 **SW 검수 완료**부터 나간다 —
+          제작 완료만으로는 안 되므로 여기서 검수까지 켠다(2026-08-05에는 제작만으로 됐다).
+        """
         b = self._batch()
         a = self._asset(b["id"]).get_json()[0]
         r = self.c.patch(f"/api/orders/{oid}", json={"action": "assets", "assetIds": [a["id"]]})
         self.assertIn(r.status_code, (200, 201), r.get_data(as_text=True))
         self.c.patch(f"/api/orders/{oid}", json={"action": "production", "value": True})
+        self.c.patch(f"/api/orders/{oid}", json={"action": "softwareInspection", "value": True})
 
     # ---- 이름 ----
     def test_표_머리글이_출고_확인이다(self):
+        """마지막 단계 이름은 '출고 확인'이다(대표 2026-08-05).
+
+        ★'SW 검수'라는 말 자체를 금지하던 시험이었는데, 그 뒤 SW 검수가
+          **독립 단계**로 되살아났다(서버 상태머신도 4단계:
+          preparing → productionDone → softwareInspectionDone → shippingDone).
+          그래서 금지가 아니라 '순서'를 지킨다 — SW 검수 다음이 출고 확인.
+        """
         head = self.js.split("<thead>", 1)[1].split("</thead>", 1)[0]
         self.assertIn("출고 확인", head)
-        self.assertNotIn("SW 검수", head)
+        stages = [x.split("</th>", 1)[0] for x in head.split('<th class="stage-th">')[1:]]
+        self.assertEqual(stages[-1], "출고 확인", f"마지막 단계가 출고 확인이 아니다: {stages}")
+        if any("SW 검수" in x for x in stages):
+            self.assertLess(stages.index(next(x for x in stages if "SW 검수" in x)),
+                            stages.index("출고 확인"), "SW 검수는 출고 확인보다 앞이어야 한다")
 
-    def test_상세_이력도_출고_확인이다(self):
+    def test_상세_이력_단계_이름이_표_머리글과_같다(self):
+        """처리 이력 줄 이름 = 표 머리글 이름(대표 승인 2026-08-18).
+
+        ★2026-08-05엔 3·4단계를 둘 다 '출고 확인'이라 불러 처리 이력에 같은 이름이
+          두 줄 찍혔다 — 어디까지 갔는지 화면만 봐선 알 수 없었다.
+          SW 검수가 독립 칸으로 되살아난 지금은 머리글과 같은 이름을 쓴다.
+        """
         blk = self.js.split("function setupDetailRow", 1)[1].split("\nfunction ", 1)[0]
-        self.assertIn('"출고 확인"', blk)
-        self.assertNotIn('"SW 검수"', blk)
+        head = self.js.split("<thead>", 1)[1].split("</thead>", 1)[0]
+        stages = [x.split("</th>", 1)[0] for x in head.split('<th class="stage-th">')[1:]]
+        for name in stages:
+            self.assertIn(f'"{name}"', blk, f"머리글 [{name}]이 처리 이력에 없다")
+        names = [ln.split('"', 2)[1] for ln in blk.splitlines()
+                 if ln.strip().startswith('["')]
+        self.assertEqual(len(names), len(set(names)),
+                         f"처리 이력에 같은 이름이 두 번 나온다: {names}")
 
     def test_주문_화면_라벨도_같다(self):
         js = (ROOT / "static" / "js" / "orders.js").read_text("utf-8")
@@ -4689,9 +6399,18 @@ class TestShipFlow2026_08_05(Base):
         self.assertIn("출고 기록 조회", blk)
 
     def test_숫자는_전체_기준이다(self):
-        """걸러 놓고 숫자까지 줄면 지금 몇 건인지 알 수 없다."""
-        self.assertIn("renderSetupRows(setupOrder(filterByStage(orders)), canWork)", self.js)
-        self.assertIn("renderSetupKpi(orders)", self.js)
+        """걸러 놓고 숫자까지 줄면 지금 몇 건인지 알 수 없다.
+
+        ★거르는 함수 이름을 박지 않는다 — 판매유형·채널 필터가 얹히면서
+          filterByStage → filterSetupOrders 로 한 겹 감싸졌다(2026-08-24).
+          지킬 것은 '표는 거른 것, 숫자는 전체'라는 짝이다.
+        """
+        rows = [x for x in self.js.splitlines() if "renderSetupRows(setupOrder(" in x]
+        self.assertTrue(rows, "표를 정렬 없이 그린다")
+        for line in rows:
+            self.assertIn("filter", line, f"표를 거르지 않고 그린다: {line.strip()}")
+        self.assertIn("renderSetupKpi(orders)", self.js, "숫자가 전체 기준이 아니다")
+        self.assertNotIn("renderSetupKpi(setupOrder(", self.js)
 
     def test_단계별로_거른다(self):
         blk = self.js.split("function filterByStage", 1)[1].split("\n}", 1)[0]
@@ -4713,16 +6432,27 @@ class TestShipFlow2026_08_05(Base):
         oid = self._order()
         r = self.c.post(f"/api/orders/{oid}/waybill", json={"boxQty": 1})
         self.assertEqual(r.status_code, 400)
-        self.assertIn("제작 완료", r.get_json()["error"])
+        self.assertIn("SW 검수", r.get_json()["error"])
 
-    def test_송장을_뽑으면_출고_확인이_켜진다(self):
+    def test_제작만_끝나도_송장은_아직_막힌다(self):
+        """★대표 2026-09-04: 송장은 SW 검수 완료부터. 제작만 끝난 단계는
+        아직 어떤 기계가 나갈지 확정되지 않았다(2026-08-05에는 여기서 나갔다)."""
+        oid = self._order()
+        self.c.patch(f"/api/orders/{oid}", json={"action": "production", "value": True})
+        r = self.c.post(f"/api/orders/{oid}/waybill", json={"boxQty": 1})
+        self.assertEqual(r.status_code, 400, "제작 완료만으로 송장이 나갔다")
+        self.assertIn("SW 검수", r.get_json()["error"])
+
+    def test_송장을_뽑아도_단계를_앞당기지_않는다(self):
+        """★송장이 SW 검수를 자동으로 켜던 것을 2026-09-03에 뗐다 — 이제 송장은
+        검수가 끝난 뒤에만 나오므로 켤 것이 없고, 켜면 사람이 안 한 검수가 찍힌다."""
         oid = self._order()
         self._ready(oid)
-        self.assertFalse(self.c.get(f"/api/orders/{oid}").get_json()["softwareInspectionDone"])
+        before = self.c.get(f"/api/orders/{oid}").get_json()
         self.c.post(f"/api/orders/{oid}/waybill", json={"boxQty": 1})
-        d = self.c.get(f"/api/orders/{oid}").get_json()
-        self.assertTrue(d["softwareInspectionDone"], "손으로 또 체크하게 하면 빠뜨린다")
-        self.assertTrue(d["softwareInspectionBy"])
+        after = self.c.get(f"/api/orders/{oid}").get_json()
+        self.assertFalse(after["shippingDone"], "송장이 출고 확인을 앞당겼다")
+        self.assertEqual(after["softwareInspectionAt"], before["softwareInspectionAt"])
 
     def test_이미_확인한_담당자를_덮어쓰지_않는다(self):
         oid = self._order()
@@ -4732,18 +6462,22 @@ class TestShipFlow2026_08_05(Base):
         self.c.post(f"/api/orders/{oid}/waybill", json={"boxQty": 1})
         self.assertEqual(self.c.get(f"/api/orders/{oid}").get_json()["softwareInspectionAt"], before)
 
-    def test_화면도_제작_완료면_송장_버튼을_보여준다(self):
+    def test_화면도_SW_검수완료면_송장_버튼을_보여준다(self):
         blk = self.js.split("function waybillCell", 1)[1].split("\n}", 1)[0]
-        self.assertIn("!o.productionDone", blk)
-        self.assertNotIn("!o.softwareInspectionDone", blk)
+        self.assertIn("!o.productionDone", blk, "제작 전 라벨 버튼 분기가 사라졌다")
+        self.assertIn("if (!o.softwareInspectionDone && !done) {", blk,
+                      "SW 검수 완료 단계에서 송장 버튼이 안 나온다")
 
     # ---- 금일 출고 확인 ----
 
     def test_출고_마감된_건에는_송장_발급이_없다(self):
-        """기록을 보는 화면이다 — 나간 건에 새 송장을 뽑으면 안 된다."""
+        """기록을 보는 화면이다 — 나간 건에 새 송장을 뽑으면 안 된다.
+        (2026-08-31 대표: 옵션라벨 재인쇄 버튼만 남는다 — 라벨 분실 대비)"""
         blk = self.js.split("function waybillCell", 1)[1].split(chr(10) + "}", 1)[0]
-        self.assertIn("o.shippingDone", blk)
-        self.assertIn("if (done) return \"\";", blk)
+        self.assertIn("const done = o.shippingDone;", blk)
+        # 이미 발급된 송장이 있으면 그 분기에서 인쇄(🖨)만 남고 새 발급 버튼은 안 나온다
+        self.assertLess(blk.index("data-wbprint"), blk.index("data-wbpreview"),
+                        "발급된 송장이 있는데도 새 발급 버튼이 먼저 뜬다")
 
     def test_끝난_주문은_체크를_되돌릴_수_없다(self):
         blk = self.js.split("function stageCell", 1)[1].split(chr(10) + "}", 1)[0]
@@ -4765,7 +6499,11 @@ class TestShipFlow2026_08_05(Base):
         self.assertEqual(d["count"], 1)
         self.assertEqual(d["orders"][0]["id"], a)
 
-    def test_출고_마감하면_목록에서_사라진다(self):
+    def test_출고_마감해도_보관하지_않는다(self):
+        """★대표 2026-09-04: "출고확인에서 배송완료가 되어야만 출고기록 조회로 넘어가게."
+        보관(archived_at)은 주문관리 상태 산식이 '배송완료'로 읽는다 — 여기서 같이
+        찍으면 이제 막 나간 물건이 배송완료로 잡히고 [출고 확인] 칸에 머물지 못한다.
+        보관은 CJ 배달완료(91)의 _auto_delivered 몫이다(행 체크박스 경로와 같아졌다)."""
         oid = self._order()
         self._ready(oid)
         self.c.post(f"/api/orders/{oid}/waybill", json={"boxQty": 1})
@@ -4774,8 +6512,19 @@ class TestShipFlow2026_08_05(Base):
         self.assertEqual(r.get_json()["shipped"], 1)
         d = self.c.get(f"/api/orders/{oid}").get_json()
         self.assertTrue(d["shippingDone"])
-        self.assertTrue(d["archivedAt"], "보관까지 돼야 준비 목록에서 내려간다")
+        self.assertFalse(d["archivedAt"], "출고 확인만으로 보관하면 배송완료로 잡힌다")
         self.assertTrue(d["shippingBy"])
+
+    def test_빈_목록을_보내면_아무것도_마감하지_않는다(self):
+        """화면이 '보이는 목록'을 보내는데 그게 비어 있으면 할 일이 없다.
+        예전에는 ids 가 없으면 조건에 맞는 주문을 전량 마감해, 단계 카드로 목록을
+        좁혀 놓고 눌러도 화면 밖 건까지 나갔다."""
+        oid = self._order()
+        self._ready(oid)
+        r = self.c.post("/api/orders/ship-today", json={"ids": []})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["shipped"], 0, "빈 목록인데 전량 마감했다")
+        self.assertFalse(self.c.get(f"/api/orders/{oid}").get_json()["shippingDone"])
 
     def test_출고_확인_안_된_건은_안_나간다(self):
         oid = self._order()
@@ -4810,8 +6559,18 @@ class TestShipFlow2026_08_05(Base):
 
     def test_화면에_버튼과_확인이_있다(self):
         self.assertIn('id="sf-shipout"', self.js)
-        self.assertIn("/api/orders/ship-today/preview", self.js)
-        self.assertIn("confirm(", self.js.split('#sf-shipout"', 1)[1][:1200])
+        self.assertIn("confirm(", self.js.split('#sf-shipout"', 1)[1][:2600])
+
+    def test_버튼이_보이는_목록만_마감한다(self):
+        """★옆의 [송장 일괄 인쇄]와 같은 규칙 — 한 줄에 있는 두 버튼이 정반대로
+        동작하면 안 된다(2026-09-04). 안내문 건수도 화면 줄 수와 같아야 한다."""
+        blk = self.js.split('#sf-shipout"', 1)[1][:2600]
+        self.assertIn("setupOrder(filterSetupOrders(state.setupOrders", blk,
+                      "화면 필터를 안 보고 마감한다")
+        self.assertIn("picked.size", blk, "고른 건만 마감하는 처리가 없다")
+        self.assertIn("body: { ids: targets.map((o) => o.id) }", blk,
+                      "ids 를 안 보내면 서버가 전량을 집는다")
+        self.assertNotIn('body: {} ', blk + " ", "옛 전량 마감 호출이 남아 있다")
 
 class TestQcMergeDuplicates(Base):
     """같은 주문 두 줄을 합쳐 매출을 한 건만 남긴다(대표 2026-08-05).
@@ -5013,9 +6772,16 @@ class TestSetupSortOldestFirst(Base):
         self.assertIn('resetPage("setup")', blk, "3쪽을 보던 중 정렬을 바꾸면 엉뚱한 곳이 나온다")
 
     def test_표를_그릴_때_정렬을_거친다(self):
-        self.assertIn("renderSetupRows(setupOrder(filterByStage(orders)), canWork)", self.js)
-        self.assertIn("renderSetupRows(setupOrder(filterByStage(state.setupOrders)), canWork)",
-                      self.js)
+        """★함수 이름을 박지 않는다 — 필터가 늘 때마다 이 시험이 거짓으로 깨졌다.
+        지킬 것은 '표를 그리기 전에 setupOrder(정렬)를 지난다'뿐이다."""
+        calls = [x.strip() for x in self.js.splitlines() if "renderSetupRows(" in x
+                 and "function renderSetupRows" not in x]
+        self.assertTrue(calls, "renderSetupRows 를 부르는 곳이 없다")
+        sorted_calls = [c for c in calls if "setupOrder(" in c]
+        self.assertGreaterEqual(len(sorted_calls), 2,
+                                f"정렬을 거치는 호출이 너무 적다: {calls}")
+        for c in sorted_calls:
+            self.assertIn("filter", c, f"정렬만 하고 거르지 않는다: {c}")
 
     def test_출고_기록_카드로_가면_최신순으로_바뀐다(self):
         blk = self.js.split("function renderSetupKpi", 1)[1]
@@ -5043,11 +6809,11 @@ class TestQcShippedFlag(Base):
     """'QC에서는 이미 출고됨'을 보드 행에 알려 준다(대표 2026-08-05).
 
     "출고 완료인 제품인데 왜 제작대기에 있는지 알 수 있나?"
-    ★HMS와 QC는 금액을 다르게 적는다 —
-       · HMS = 주문 단위 **합계**(여러 상품·여러 대를 한 줄로)
+    ★OWS와 QC는 금액을 다르게 적는다 —
+       · OWS = 주문 단위 **합계**(여러 상품·여러 대를 한 줄로)
        · QC  = 상품/대수 단위 **개별 금액**
-      실측: 조용원 HMS 660,000원(2대) ↔ QC 340,000원(1대 단가, 관리번호 2개)
-            김병엽 HMS 259,000원(키보드+노트북) ↔ QC 10,000원(키보드만)
+      실측: 조용원 OWS 660,000원(2대) ↔ QC 340,000원(1대 단가, 관리번호 2개)
+            김병엽 OWS 259,000원(키보드+노트북) ↔ QC 10,000원(키보드만)
       금액이 크게 달라 자동 반영에서 빠지는 게 맞지만, 작업자에게는 보여 줘야
       이미 나간 물건을 또 만들지 않는다.
     """
@@ -5077,10 +6843,37 @@ class TestQcShippedFlag(Base):
     def _flags(self, nas):
         from unittest import mock
         from app.settings import qc_shipped
-        with mock.patch.object(qc_shipped, "_load_nas", return_value=(nas, 1, 1)):
+        # ★2026-08-07부터 QC 연동은 기본 꺼짐이다(대표 지시). 그래도 매칭 로직 자체는
+        #   계속 시험한다 — 마지막 대조를 손으로 할 날이 오면 그때 이게 맞아야 한다.
+        with mock.patch.object(qc_shipped, "qc_live", return_value=True), \
+             mock.patch.object(qc_shipped, "_load_nas", return_value=(nas, 1, 1)):
             r = self.c.get("/api/qc-shipped/flags")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         return r.get_json()
+
+    # ---- 꺼져 있는 게 기본 (대표 지시 2026-08-07) ----
+    def test_기본은_꺼져_있어서_아무것도_안_준다(self):
+        """"셋팅 및 QC는 OWS를 바로 쓸 예정이니까. 앞으로 OWS에서 데이터가 쌓일거야."
+
+        ★원본이 둘이면 여기서 한 일이 그쪽 파일에 밀려 되살아난다.
+          2026-08-05에 실제로 그랬다(정리한 줄을 20초마다 되살려 794회 병합).
+        """
+        self._order()
+        r = self.c.get("/api/qc-shipped/flags")
+        self.assertEqual(r.status_code, 200)
+        d = r.get_json()
+        self.assertEqual(d["count"], 0)
+        self.assertEqual(d["flags"], {})
+        self.assertFalse(d["live"])
+
+    def test_꺼져_있으면_남의_폴더를_읽지도_않는다(self):
+        """빈 값을 돌려주는 것으로는 부족하다 — 아예 안 읽어야 한다."""
+        from unittest import mock
+        from app.settings import qc_shipped
+        self._order()
+        with mock.patch.object(qc_shipped, "_load_nas") as spy:
+            self.c.get("/api/qc-shipped/flags")
+        spy.assert_not_called()
 
     # ---- 판정 ----
     def test_금액이_달라도_표시는_붙는다(self):
@@ -5160,9 +6953,19 @@ class TestQcShippedFlag(Base):
         self.assertIn("주문 합계", blk)
         self.assertIn("상품별", blk)
 
-    def test_보드를_열_때_받아_온다(self):
-        self.assertIn('api("/api/qc-shipped/flags")', self.js)
-        self.assertIn("state.qcShippedFlags = r.flags", self.js)
+    def test_보드는_이제_QC를_부르지_않는다(self):
+        """대표 지시 2026-08-07 — 셋팅 보드에서 QC 실시간 조회를 전부 뗐다.
+
+        ★화면이 QC를 부르면 서버를 아무리 꺼 놔도 '실시간으로 불러오는' 상태가 된다.
+          부르는 자리 자체를 없애야 끝난다.
+        """
+        board = self.js.split("function renderSetup", 1)[1].split("\nfunction ", 1)[0]
+        for gone in ('api("/api/qc-shipped/flags")', "renderShippedWarn()", "renderQcWatchWarn()"):
+            self.assertNotIn(gone, board, f"셋팅 보드가 아직 {gone} 를 부른다")
+
+    def test_행에서_QC_칩이_빠졌다(self):
+        rows = self.js.split("function renderSetupRows", 1)[1].split("\nfunction ", 1)[0]
+        self.assertNotIn("qcShippedChip(o)", rows)
 
     def test_스타일이_있다(self):
         css = (ROOT / "static" / "css" / "app.css").read_text("utf-8")
@@ -5206,7 +7009,7 @@ class TestCoupangMoneyObject(Base):
 class TestCoupangRentalFilter(Base):
     """쿠팡에도 렌탈 분류를 붙인다(대표 2026-08-05).
 
-    같은 계정에 렌탈(RMS)·판매(HMS) 상품이 함께 있다. 렌탈 주문이 HMS로 들어오면
+    같은 계정에 렌탈(RMS)·판매(OWS) 상품이 함께 있다. 렌탈 주문이 OWS로 들어오면
     판매 출고 사고가 난다. 스마트스토어에 이미 있던 분류를 그대로 옮겼다 —
     두 몰이 다르게 굴면 한쪽에만 구멍이 생긴다.
     """
@@ -5353,7 +7156,7 @@ class TestAutoSearch(Base):
 class TestMarkRental(Base):
     """화면에서 렌탈 주문을 한 번에 내리고, 그 상품번호를 몰 설정에 등록한다.
 
-    ★대표 지시(2026-08-05): "RMS로 들어가는 렌탈 상품이 HMS에 뜬다 — 상품번호로 안 뜨게."
+    ★대표 지시(2026-08-05): "RMS로 들어가는 렌탈 상품이 OWS에 뜬다 — 상품번호로 안 뜨게."
     ★수집 필터만으로는 부족하다 — 그건 앞으로 들어올 것만 막는다.
       이미 떠 있는 건(실측 #663, 8일째 제작 대기)은 화면에서 내려야 한다.
       상품번호를 몰에서 찾아 손으로 옮겨 적지 않아도 되게 등록까지 함께 한다.
@@ -5615,7 +7418,10 @@ class TestQcWatchNoLoop(Base):
         try:
             from app.settings import qc_shipped, qc_watch
             self.c.post("/api/qc-watch", json={"enabled": True, "path": os.path.dirname(path)})
-            with mock.patch.object(qc_watch, "_orders_file", return_value=path), \
+            # ★QC_LIVE 는 2026-08-07부터 기본 꺼짐이다(대표 지시). 정리 로직 자체는
+            #   계속 시험한다 — 되살릴 날이 오면 그때 이게 맞아야 한다.
+            with mock.patch.object(qc_watch, "QC_LIVE", True), \
+                 mock.patch.object(qc_watch, "_orders_file", return_value=path), \
                  mock.patch.object(qc_shipped, "_load_nas", return_value=(nas, 1, 1)):
                 qc_watch.sync_once(self.app, force=True)
         finally:

@@ -1,198 +1,182 @@
 # Operations Workflow System
 
-> 중고 PC 유통사의 반복 운영 업무를 하나의 흐름으로 묶은 사내 업무 관리 시스템
+> GPT와 Claude를 활용해 기획부터 구현·검증·운영까지 단독으로 개발한 사내 업무 자동화 웹 도구
 
-![실제 대시보드 화면](docs/assets/portfolio-real-dashboard.png)
+![가상 데이터로 실행한 대시보드](docs/assets/portfolio-real-dashboard.png)
 
-## 한 줄 소개
+## 프로젝트 소개
 
-Operations Workflow System은 중고 노트북/PC 유통 과정에서 발생하는 **매입, 자산 관리, 주문 수집, QC, 송장 발급, A/S, 정산** 업무를 통합한 Flask 기반 사내 운영 시스템입니다.
+중고 PC 유통 업무의 **매입, 재고, 주문, 셋팅·검수, 배송, A/S, 정산**을 연결하는 Flask 기반 웹 도구입니다. 자산번호를 기준으로 제품과 업무 이력을 연결하고, 쇼핑몰 주문 수집과 기존 관리 시스템 연동을 처리합니다.
 
-기존에는 엑셀, 쇼핑몰 관리자, 택배 시스템, 별도 QC 프로그램에 흩어져 있던 업무를 한 화면에서 추적할 수 있도록 설계했습니다.
+현업의 요청을 업무 조건과 예외 상황으로 구체화하고, AI 코딩 도구를 활용해 화면·API·DB·테스트·운영 구성을 만들었습니다. 이 저장소는 회사 및 서비스 식별정보를 익명화한 포트폴리오 공개본입니다.
 
-## 담당 역할
+## 담당 역할과 AI 활용
 
-| 구분 | 내용 |
-|---|---|
-| 기획 | 실제 운영 흐름 분석, 화면 구조 설계, 권한 체계 정의 |
-| 백엔드 | Flask API, SQLite 스키마, 트랜잭션 처리, 백업/감사 로그 구현 |
-| 프론트엔드 | Vanilla JS 기반 단일 페이지 업무 화면 구현 |
-| 연동 | 쇼핑몰 주문 수집, CJ대한통운 송장, SMS/알림 구조 설계 |
-| 데이터 | 기존 주문/QC/TMS 데이터 이관 및 중복 처리 로직 구현 |
-| 운영 | Windows 로컬/LAN 실행, watchdog, 자동 백업 흐름 구성 |
+**단독 개발**로 기획, 백엔드, 프론트엔드, 데이터 연동, 테스트, 운영을 담당했습니다. 개발 과정에서 **GPT와 Claude**를 사용했습니다.
 
-## 사용 기술
+| 영역 | 담당 범위 |
+| --- | --- |
+| 업무 분석·기획 | 업무 흐름 정리, 단계별 처리 조건, 화면 및 권한 설계 |
+| 구현 | Flask API, SQLite 스키마, JavaScript 업무 화면 |
+| 자동화·연동 | 쇼핑몰 주문, 배송, A/S 알림, 기존 시스템 데이터 연결 |
+| 검증 | 업무 상태, 데이터 중복, 권한, 외부 연동 예외 테스트 |
+| 운영 | Windows 실행, 워치독, 로그, 백업과 재시작 구성 |
 
-![실제 주문관리 화면](docs/assets/portfolio-real-orders.png)
+AI 활용 경험은 요구사항을 구체화하고 결과를 확인한 사례로 설명합니다. 모델별 작업 분담이나 실제 프롬프트 원문은 이 문서에 포함하지 않습니다.
 
-| 영역 | 기술 |
-|---|---|
-| Backend | Python, Flask |
-| Database | SQLite WAL, schema migration, transactional writes |
-| Frontend | HTML, CSS, Vanilla JavaScript |
-| Runtime | Waitress, Windows batch scripts |
-| Integration | Requests, marketplace APIs, CJ Logistics API |
-| Test | Python unittest |
+## 면접용 데모
 
-## 해결한 문제
+로컬 환경을 설치한 Windows PC에서는 `DEMO-START.bat`을 더블클릭하면 가상 데이터가 채워진 데모가 열립니다.
 
-### 1. 주문과 재고 상태가 여러 시스템에 흩어지는 문제
+- 관리자: `demo` / `Demo-2026!`
+- 제한 계정: `viewer` / `Demo-2026!`
+- 처음 상태로 복구: `DEMO-RESET.bat`
+- 종료: `DEMO-STOP.bat`
 
-쇼핑몰 주문, 수기 주문, QC 상태, 송장 발급 상태가 서로 다른 화면에 흩어져 있으면 출고 누락과 중복 처리가 발생하기 쉽습니다.
+데모는 실행할 때마다 새 임시 DB를 만들고 자동 수집·문자 발송·외부 HTTP 호출을 차단합니다. 시연 순서와 5분 설명 대본은 [면접 시연 가이드](docs/INTERVIEW_GUIDE.md)에 정리했습니다.
 
-이 프로젝트에서는 주문을 `입금대기 → 준비중 → 배송중 → 배송완료` 흐름으로 정리하고, 자산 매칭과 송장 상태를 같은 화면에서 확인할 수 있게 만들었습니다.
+## 업무 흐름
 
-### 2. 쇼핑몰별 API 구조가 모두 다른 문제
+```mermaid
+flowchart LR
+    P[매입·자산 등록] --> S[재고 관리]
+    S --> O[주문·자산 매칭]
+    O --> Q[셋팅·검수]
+    Q --> D[배송·출고]
+    D --> A[회수·A/S]
+    M[쇼핑몰] -->|주문 수집| O
+    D -->|운송장 연동| C[CJ]
+    T[기존 관리 시스템] -->|데이터 수신| S
+    A -->|수리비 반영 큐| T
+```
 
-쿠팡, 스마트스토어, 11번가, ESM, 롯데온, 카카오쇼핑, 토스쇼핑, 테무, 고도몰은 인증 방식과 응답 구조가 다릅니다.
+## 최근 확장한 기능
 
-이를 몰별 어댑터로 분리해 내부 주문 구조는 동일하게 유지했습니다. 덕분에 새 쇼핑몰을 추가해도 주문 처리 화면과 중복 제거 로직은 그대로 재사용할 수 있습니다.
+2026-09-08 로컬 소스 기준입니다. 외부 연동의 실제 사용에는 별도 계약·설정이 필요합니다.
 
-### 3. 운영 DB를 안전하게 유지해야 하는 문제
+| 업무 | 추가·확장한 기능 | 코드 |
+| --- | --- | --- |
+| 매입·재고 | 기준정보, 자산번호 관리, 카테고리 재분류 | [purchase](app/purchase/) |
+| 판매·정산 | 판매 전표 입력, 원가 스냅샷, 미수금·마진 관리 | [sale_entry.py](app/purchase/sale_entry.py) |
+| 기존 시스템 연동 | 증분 수신, 수리비 전송 큐, 실패·충돌 상태 관리 | [tms_link.py](app/purchase/tms_link.py), [tms_push.py](app/purchase/tms_push.py) |
+| A/S | 유상 미결제 출고 제한, 회수 구성품 입력·추가, 문자 반영 | [asvc](app/asvc/), [notify](app/notify/) |
+| 배송 | 운송장 도구, 배송 일정, 쇼핑몰 송장 전송 보완 | [cj](app/cj/), [invoice_push.py](app/malls/invoice_push.py) |
+| 작업 관리 | 셋팅·검수, 담당자 작업량·실적 화면 확장 | [prep](app/prep/), [reports](app/reports/) |
 
-로컬 사내 시스템은 작은 장애도 업무 중단으로 이어질 수 있습니다.
+## 문제 해결 사례
 
-SQLite WAL, 트랜잭션, 주기 백업, 종료 백업, 감사 로그, watchdog 프로세스를 적용해 운영 안정성을 높였습니다.
+### 1. 금액 미입력 상태의 유상 A/S 출고 방지
+
+무상에서 유상으로 변경했지만 청구 금액을 입력하지 않으면, 미수금 0원을 결제 불필요 상태로 해석할 수 있었습니다.
+
+유상 여부와 결제 확인 기록으로 `payment_pending()`을 판단하고, 청구액 계산은 별도로 처리했습니다. 같은 판단을 작업 보드와 반송·종료 제어에 사용해, 금액 미입력이 결제 단계를 건너뛰는 이유가 되지 않도록 했습니다.
+
+**업무 요청을 명확한 상태 규칙으로 바꾸고 여러 실행 경로에 적용한 사례입니다.**
+
+[구현](app/asvc/__init__.py) · [송장 발급 제어](app/orders/waybill.py) · [테스트](tests/test_phase456.py)
+
+### 2. 양방향 연동의 수리비 중복 합산 방지
+
+내부에서 입력한 수리비를 외부 시스템에 보낸 뒤 다시 받아오면, 같은 비용이 새로운 비용으로 인식될 수 있습니다.
+
+변경을 전송 큐에 기록하고 대기·반영·실패·충돌 상태를 관리합니다. 이미 전송한 금액과 비용 출처를 구분해, 다시 수신한 데이터가 원가에 중복 반영되는 경로를 제어합니다.
+
+**자동화를 연결한 이후 발생하는 재처리와 데이터 일관성까지 고려한 사례입니다.**
+
+[전송 큐](app/purchase/tms_push.py) · [원가 동기화](app/purchase/migration.py) · [테스트](tests/test_asset_costs.py)
+
+### 3. 쇼핑몰별 응답 차이와 호출 제한 대응
+
+쇼핑몰별 어댑터에서 주문을 공통 형태로 변환합니다. 프로세스 공통 토큰 캐시와 HTTP 429 이후 호출 대기 처리를 두어, 수집이 반복되어도 인증과 호출 제한 상태를 유지합니다.
+
+**외부 서비스별 차이를 분리하고 공통 업무 처리를 재사용한 사례입니다.**
+
+[공통 어댑터](app/malls/base.py) · [주문 수집](app/malls/collect.py) · [테스트](tests/test_call_budget.py)
 
 ## 주요 화면
 
-### 대시보드
+아래 이미지는 공개본을 가상 데이터로 실행한 화면입니다. 실제 고객·주문·운영 실적을 나타내지 않습니다.
 
-![실제 대시보드 화면](docs/assets/portfolio-real-dashboard.png)
+### 주문 관리
 
-재고, 진행 중 주문, 오늘 출고, 서버 상태를 요약합니다. 운영자가 오늘 처리해야 할 업무를 빠르게 확인할 수 있도록 구성했습니다.
+![주문 관리](docs/assets/portfolio-real-orders.png)
 
-### 주문관리
+### 매입·자산 관리
 
-![실제 주문관리 화면](docs/assets/portfolio-real-orders.png)
+![매입 관리](docs/assets/portfolio-real-purchase.png)
 
-쇼핑몰별 주문을 수집하고, 상태별로 필터링하며, 준비/QC/배송 흐름을 관리합니다. 엑셀 가져오기와 쇼핑몰 새로고침 기능을 함께 제공합니다.
+### 셋팅·검수
 
-### 매입 관리
+![셋팅·검수](docs/assets/portfolio-real-setup.png)
 
-![실제 매입 화면](docs/assets/portfolio-real-purchase.png)
+### 배송·송장
 
-전표, 거래처, 자산, 기준정보를 분리해 관리합니다. 중고 PC의 입고부터 판매 가능 상태까지 이어지는 재고 흐름을 추적합니다.
-
-### 관리자 설정
-
-![실제 설정 화면](docs/assets/portfolio-real-settings.png)
-
-사용자 권한, API 키, 재고연동, 정산, 데이터 이관, 감사 로그, 백업을 관리합니다. 직원별로 접근 가능한 메뉴와 기능을 제한할 수 있습니다.
-
-### 배송 / 송장
-
-![실제 배송 송장 화면](docs/assets/portfolio-real-shipping.png)
-
-QC가 끝난 주문을 송장 발급 대기, 포장 대기, 출고 확인 단계로 나누어 관리합니다. CJ대한통운 송장 발급과 운송장 출력 흐름을 이 화면에서 처리하도록 설계했습니다.
+![배송 관리](docs/assets/portfolio-real-shipping.png)
 
 ### A/S
 
-![실제 A/S 화면](docs/assets/portfolio-real-as.png)
+![A/S 관리](docs/assets/portfolio-real-as.png)
 
-접수, 회수, 수리, 반송 단계를 따로 추적합니다. 자산번호와 연결하면 해당 제품의 이력에도 A/S 기록이 남도록 구성했습니다.
+금액을 아직 입력하지 않은 유상 수리 완료 건도 결제 전 단계에서 관리합니다.
 
-### 리포트
+![A/S 결제 대기와 회수 구성품](docs/assets/portfolio-real-as-board.png)
 
-![실제 리포트 화면](docs/assets/portfolio-real-reports.png)
+### 설정
 
-매입, 판매, 마진, 재고 현황을 기간 기준으로 확인합니다. 판매 금액, 수수료, 환불, 원가, 수리비, 택배비를 분리해 손익을 추적할 수 있게 했습니다.
+![설정](docs/assets/portfolio-real-settings.png)
 
-## 핵심 기능
+### 매출·실적
 
-- 매입 전표 및 자산번호 관리
-- 자산 등급, 분류, 재고 상태, 수리 이력 관리
-- 쇼핑몰 주문 API 수집
-- 엑셀 주문 가져오기
-- 주문 중복 제거 및 상태 병합
-- QC 단계별 작업 체크
-- CJ대한통운 송장 발급 및 PDF 출력
-- A/S 접수, 회수, 반송, 고객 알림
-- 매출, 원가, 수수료, 마진 리포트
-- 사용자 권한, 감사 로그, 백업 관리
+![매출·실적](docs/assets/portfolio-real-reports.png)
 
-## 기술적으로 신경 쓴 부분
+## 기술과 운영
 
-### 권한 설계
+| 영역 | 구성 |
+| --- | --- |
+| Backend | Python, Flask, Blueprint |
+| Database | SQLite WAL, 명시적 쓰기 트랜잭션, 스키마 마이그레이션 |
+| Frontend | HTML, CSS, Vanilla JavaScript |
+| Integration | Requests, 쇼핑몰 어댑터, CJ, 외부 데이터 창구 |
+| Runtime | Waitress, Windows 실행 스크립트, 워치독 |
+| Quality | unittest, 업무별 회귀 테스트 |
 
-관리자와 직원 권한을 분리하고, 메뉴 접근과 기능 실행 권한을 따로 관리했습니다. 사용자가 보지 않아야 할 메뉴는 화면에서 숨기고, API에서도 다시 검증합니다.
+전역 API 인증 게이트와 기능별 권한 검사, 감사로그, 트랜잭션 롤백, SQLite 온라인 백업 API를 사용합니다. 단일 프로세스로 운영하는 사내 도구 구조입니다.
 
-### 데이터 무결성
-
-주문과 자산 매칭, 출고 취소, 회수 입고처럼 상태가 여러 테이블에 걸치는 작업은 트랜잭션으로 처리했습니다. 일부만 저장되어 데이터가 꼬이는 상황을 막는 데 집중했습니다.
-
-### 민감 정보 처리
-
-API 키, 토큰, 비밀번호성 필드는 화면 응답에서 마스킹하고, 기존 키를 유지한 채 일부 설정만 수정할 수 있게 했습니다.
-
-### 실제 운영 환경 대응
-
-Windows PC에서 바로 실행할 수 있도록 batch 파일과 watchdog 서버를 구성했습니다. 서버가 종료되거나 PC가 재시작되어도 다시 띄울 수 있는 구조를 고려했습니다.
-
-## 포트폴리오 포인트
-
-- 단순 CRUD가 아니라 실제 사내 운영 흐름을 기준으로 설계한 업무 시스템입니다.
-- 프레임워크를 크게 늘리지 않고 Flask와 Vanilla JS로 유지보수 가능한 구조를 만들었습니다.
-- 운영 데이터 보호를 위해 GitHub 공개용 소스와 실제 DB/백업/엑셀 파일을 분리했습니다.
-- 테스트 DB에서 앱을 직접 실행해 README 화면 캡처를 생성했습니다.
-- 화면, API, DB, 외부 연동, 운영 스크립트까지 한 프로젝트 안에서 구현했습니다.
-
-## 이름에 대해
-
-공개용 프로젝트명은 **Operations Workflow System**으로 정리했습니다. README의 화면 캡처 안에 보이는 `HMS` 표기는 실제 운영 앱에 남아 있는 내부 코드명/브랜드명입니다.
-
-## 프로젝트 구조
-
-```text
-app/
-  auth/           로그인, 세션, 권한
-  purchase/       매입, 자산, 재고, 데이터 이관
-  orders/         주문, QC, 자산 매칭, 송장 처리
-  malls/          쇼핑몰 API 어댑터와 자동 수집
-  cj/             CJ대한통운 연동과 운송장 PDF
-  settings/       관리자 설정, QC 이관/감시 도구
-  reports/        운영 리포트
-static/           Vanilla JS 단일 페이지 화면
-tests/            업무 흐름 회귀 테스트
-scripts/          유지보수/캡처/마이그레이션 스크립트
-```
-
-## 실행 방법
+## 실행
 
 ```bat
-python -m venv venv
-venv\Scripts\pip install -r requirements.txt
-venv\Scripts\python.exe run.py
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+set OWS_HOST=127.0.0.1
+set OWS_NO_TRACKER=1
+set OWS_NO_TMS_SYNC=1
+.venv\Scripts\python.exe run.py
 ```
 
-접속 주소:
+`http://localhost:5100`에서 최초 관리자 계정을 만듭니다. 위 명령은 포트폴리오 확인용으로 자동 수집과 동기화를 끕니다. 운영 DB, 계정, 외부 API 인증정보는 포함하지 않습니다.
 
-```text
-http://localhost:5100
-```
+환경변수 접두사는 `OWS_`이며, 별도 DB는 `OWS_DB`, 포트는 `OWS_PORT`로 지정합니다. Windows 관리 스크립트는 `OWS-SETUP.bat`, `OWS-START.bat`, `OWS-STATUS.bat`, `OWS-STOP.bat`입니다. 해당 스크립트는 `venv` 폴더를 사용하므로 스크립트 실행 시 `OWS-SETUP.bat`부터 시작합니다.
 
-테스트:
+## 검증
 
 ```bat
-venv\Scripts\python.exe -m unittest discover -s tests -v
+set OWS_DB=%TEMP%\ows-tests\test.db
+set OWS_NO_TRACKER=1
+set OWS_NO_FILE_LOG=1
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+최신 실행 결과와 알려진 한계는 [검증 기록](docs/VALIDATION.md)에 정리합니다. 테스트 개수를 커버리지 또는 업무 개선율로 환산하지 않습니다.
+
+화면 재생성은 [캡처 스크립트](scripts/capture_real_ui.py)를 사용합니다. 별도로 Playwright 패키지와 Microsoft Edge가 필요하며, 임시 DB에서 데모 데이터를 생성합니다.
+
+```bat
+.venv\Scripts\python.exe -m pip install playwright
+.venv\Scripts\python.exe scripts\capture_real_ui.py
 ```
 
 ## 공개 범위
 
-이 저장소는 포트폴리오 공개용으로 정리한 소스 버전입니다.
+회사·서비스 식별정보는 중립적인 명칭으로 바꾸고, 계약번호·연락처·주소 기본값은 예시 값으로 대체했습니다. 운영 DB, 고객 파일, 로그, 백업, 인증정보, 내부 인수인계서는 최신 코드 반영 대상에서 제외했습니다.
 
-포함하지 않은 항목:
-
-- 실제 운영 DB
-- 고객/주문 엑셀 파일
-- 백업 파일
-- 로그 파일
-- 가상환경
-- `.env` 및 API 키
-
-## 검증
-
-- Python 3.12 가상환경에서 의존성 설치 확인
-- `/api/health` 스모크 테스트 통과
-- 테스트 DB로 실제 앱 실행 후 화면 캡처 생성
-- 전체 테스트는 3분 제한까지 다수 통과했으나 완료 전 타임아웃
+출고 확인 시 판매 전표 자동 생성은 향후 개선 대상으로, 이번에 완료한 기능에 포함하지 않습니다. 업무 시간 절감률과 실제 이용자 수는 측정 근거가 없어 기재하지 않았습니다.

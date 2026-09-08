@@ -3,11 +3,11 @@
 원가 = 자산 매입가 + 그 자산의 수리비 합계(A/S 무상 건 포함).
 마진 = 주문 금액 − 매칭된 자산들의 원가.
 """
-from flask import Blueprint, abort, jsonify, request
+from flask import Blueprint, abort, g, jsonify, request
 
 from .. import config
-from ..auth.perms import require
-from ..db import get_db
+from ..auth.perms import require, require_any
+from ..db import get_db, sale_only
 from ..purchase import scope_clause
 
 bp = Blueprint("reports", __name__, url_prefix="/api")
@@ -52,7 +52,7 @@ _ASSET_ORDER_COUNT = (
 @bp.get("/reports/summary")
 def summary():
     """기간 요약 — 매입/출고/마진/재고 한눈에."""
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     frm, to = _period()
     conn = get_db()
     to_end = _to_end(to)
@@ -114,10 +114,20 @@ def summary():
     stock = conn.execute(
         "SELECT COUNT(*) AS cnt, COALESCE(SUM(a.purchase_price),0) AS amount FROM assets a "
         "WHERE a.status NOT IN ('shipped','scrapped','cancelled','returned') "
-        "AND a.received = 1" + scope, sparams).fetchone()
+        "AND a.received = 1" + sale_only("a") + scope, sparams).fetchone()
+    # ★A/S 돈(대표 2026-09-02 확정): 유상 A/S 수입은 판매 매출과 **합치지 않고 나란히** 본다.
+    #   부품 원가는 A/S 비용으로만 잡는다(자산 원가에 안 얹음 — 지난달 마진을 흔들지 않으려고).
     as_stats = conn.execute(
-        "SELECT COUNT(*) AS cnt, COALESCE(SUM(CASE WHEN charge_to='company' THEN cost ELSE 0 END),0) AS company_cost "
-        "FROM as_tickets WHERE received_at BETWEEN ? AND ?", (frm, to)).fetchone()
+        "SELECT COUNT(*) AS cnt, "
+        "  COALESCE(SUM(CASE WHEN charge_to='company' THEN cost ELSE 0 END),0) AS company_cost, "
+        "  COALESCE(SUM(CASE WHEN charge_to='customer' THEN cost + COALESCE(extra_charge,0) "
+        "    ELSE 0 END),0) AS income "
+        "FROM as_tickets WHERE received_at BETWEEN ? AND ? AND status != 'cancelled'",
+        (frm, to)).fetchone()
+    as_part_cost = conn.execute(
+        "SELECT COALESCE(SUM(i.cost),0) AS c FROM as_ticket_items i "
+        "JOIN as_tickets t ON t.id = i.ticket_id "
+        "WHERE t.received_at BETWEEN ? AND ? AND t.status != 'cancelled'", (frm, to)).fetchone()["c"]
 
     # 원가가 비어 있으면 마진이 실제보다 높게 나온다 — 얼마나 못 믿을 숫자인지 함께 알려준다
     gaps = conn.execute(
@@ -135,10 +145,21 @@ def summary():
         "AND o.amount=0 AND o.shipping_at BETWEEN ? AND ?" + _NOT_RETURNED,
         (frm, to_end)).fetchone()["c"]
 
+    # ★TMS 전표 매출(2026-08-09 대표 승인) — 몰 주문(orders)만 집계하면 방문구매·B2B
+    #   묶음 판매가 통째로 빠진다. 같은 채널명이 겹칠 수 있어 몰 매출과 '합산하지 않고'
+    #   나란히 보여만 준다(이중계상 방지).
+    slip = conn.execute(
+        "SELECT COUNT(*) AS cnt, COALESCE(SUM(qty),0) AS qty, "
+        "  COALESCE(SUM(sale_amount),0) AS amount, COALESCE(SUM(profit),0) AS profit "
+        "FROM sale_slips WHERE stage NOT IN ('판매취소','반입') "
+        "AND sale_date BETWEEN ? AND ?", (frm, to)).fetchone()
+
     return jsonify({
         "from": frm, "to": to,
         "purchase": {"slips": purchase["cnt"], "amount": purchase["amount"],
                      "assets": purchased_assets["cnt"], "assetAmount": purchased_assets["amount"]},
+        "slipSales": {"slips": slip["cnt"], "qty": slip["qty"],
+                      "amount": slip["amount"], "profit": slip["profit"]},
         "sales": {"orders": shipped["cnt"], "revenue": revenue,
                   "fee": fee, "refund": refund, "netRevenue": net_revenue,
                   "cost": total_cost, "buyCost": cost["buy"], "repairCost": cost["repair"],
@@ -148,17 +169,166 @@ def summary():
                   "margin": net_revenue - total_cost,
                   "marginRate": round((net_revenue - total_cost) / revenue * 100, 1) if revenue else 0},
         "stock": {"assets": stock["cnt"], "amount": stock["amount"]},
-        "as": {"tickets": as_stats["cnt"], "companyCost": as_stats["company_cost"]},
+        "as": {"tickets": as_stats["cnt"], "companyCost": as_stats["company_cost"],
+               # 유상 A/S 수입 / 나간 부품 원가 / 남는 돈 — 판매 매출과 별도 줄
+               "income": as_stats["income"], "partCost": as_part_cost,
+               "profit": (as_stats["income"] or 0) - (as_part_cost or 0)},
         # 이 숫자들이 크면 위의 마진은 실제보다 부풀려진 값이다
         "dataGaps": {"units": gaps["units"] or 0, "noBuyPrice": gaps["no_buy"] or 0,
                      "ordersWithoutAsset": no_asset, "ordersWithoutAmount": no_amount},
     })
 
 
+# ---------------------------------------------------------------- 기간 실적(일/주/월/분기/연)
+#   (2026-08-24 대표) "매출/부가세/순이익 한눈에, 일·주·월·분기·연 단위로".
+#   ★계산은 /reports/summary 와 같은 코드를 쓴다 — 두 화면이 다른 숫자를 말하면 안 된다.
+
+PERIOD_UNITS = ("day", "week", "month", "quarter", "year")
+
+
+def _period_range(unit, at):
+    """단위와 기준일로 (시작일, 종료일, 보여줄 이름)."""
+    from datetime import date, timedelta
+    y, m, d = (int(x) for x in at.split("-"))
+    base = date(y, m, d)
+    if unit == "day":
+        return base, base, f"{base.year}년 {base.month}월 {base.day}일"
+    if unit == "week":
+        start = base - timedelta(days=base.weekday())      # 월요일 시작
+        end = start + timedelta(days=6)
+        return start, end, f"{start.month}/{start.day} ~ {end.month}/{end.day} (주)"
+    if unit == "month":
+        start = base.replace(day=1)
+        end = (start.replace(year=start.year + 1, month=1) if start.month == 12
+               else start.replace(month=start.month + 1)) - timedelta(days=1)
+        return start, end, f"{start.year}년 {start.month}월"
+    if unit == "quarter":
+        q = (base.month - 1) // 3
+        start = date(base.year, q * 3 + 1, 1)
+        end = (date(base.year + 1, 1, 1) if q == 3
+               else date(base.year, q * 3 + 4, 1)) - timedelta(days=1)
+        return start, end, f"{base.year}년 {q + 1}분기"
+    start, end = date(base.year, 1, 1), date(base.year, 12, 31)
+    return start, end, f"{base.year}년"
+
+
+def _shift(unit, at, step):
+    """이전/다음 기간의 기준일 — 화면의 ◀ ▶ 버튼이 쓴다."""
+    from datetime import date, timedelta
+    y, m, d = (int(x) for x in at.split("-"))
+    base = date(y, m, d)
+    if unit == "day":
+        return base + timedelta(days=step)
+    if unit == "week":
+        return base + timedelta(weeks=step)
+    if unit == "year":
+        return base.replace(year=base.year + step, day=1, month=base.month)
+    months = 1 if unit == "month" else 3
+    total = (base.year * 12 + base.month - 1) + step * months
+    return date(total // 12, total % 12 + 1, 1)
+
+
+@bp.get("/reports/period")
+def period_report():
+    """?unit=day|week|month|quarter|year&at=YYYY-MM-DD — 그 기간의 매출·부가세·순이익."""
+    require_any("reports.view", "settings.manage", "purchase.money")
+    from ..purchase import split_vat
+    unit = (request.args.get("unit") or "month").strip().lower()
+    if unit not in PERIOD_UNITS:
+        abort(400, description="단위는 day/week/month/quarter/year 중 하나여야 합니다.")
+    # ★config.today_str() 은 'YYYYMMDD'(대시 없음)라 여기 쓰면 안 된다 — 기간 파서가 거부한다
+    # `date` was used by the earlier report screen; keep it as a compatible alias.
+    at = (request.args.get("at") or request.args.get("date")
+          or config.now().strftime("%Y-%m-%d")).strip()
+    try:
+        start, end, label = _period_range(unit, at)
+    except (ValueError, TypeError):
+        abort(400, description="기준일은 YYYY-MM-DD 형식이어야 합니다.")
+    frm, to = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    data = _sales_block(frm, to)
+    # ★매출 부가세 — 판매가는 부가세 포함 총액이다(매입·수리비와 같은 규약).
+    supply, vat = split_vat(data["revenue"])
+    data.update({
+        "supply": supply, "vat": vat,
+        # 낼 세금 = 매출세액 − 매입세액(수리비에 포함된 부가세)
+        "vatPayable": vat - data["repairVat"],
+    })
+    return jsonify({
+        "unit": unit, "at": at, "from": frm, "to": to, "label": label,
+        "prev": _shift(unit, at, -1).strftime("%Y-%m-%d"),
+        "next": _shift(unit, at, 1).strftime("%Y-%m-%d"),
+        **data,
+    })
+
+
+def _sales_block(frm, to):
+    """출고 기준 매출·원가·순이익 — /reports/summary 와 같은 잣대."""
+    conn = get_db()
+    to_end = _to_end(to)
+    shipped = conn.execute(
+        "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount),0) AS amount, "
+        "       COALESCE(SUM(fee_amount),0) AS fee, "
+        "       COALESCE(SUM(refund_amount),0) AS refund, "
+        "       COALESCE(SUM(shipping_cost),0) AS ship "
+        "FROM orders o WHERE shipping_done=1 AND cancelled_at='' "
+        "AND shipping_at BETWEEN ? AND ?" + _NOT_RETURNED, (frm, to_end)).fetchone()
+    units = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(a.purchase_price),0) AS buy FROM order_assets oa "
+        "JOIN orders o ON o.id = oa.order_id JOIN assets a ON a.id = oa.asset_id "
+        "WHERE o.shipping_done=1 AND o.cancelled_at='' AND o.shipping_at BETWEEN ? AND ?"
+        + _NOT_RETURNED, (frm, to_end)).fetchone()
+    repair = conn.execute(
+        "SELECT COALESCE(SUM(r.cost * 1.0 / MAX(1, "
+        + _ASSET_ORDER_COUNT.format(alias="a") + ")),0) AS repair, "
+        "COALESCE(SUM((CASE WHEN r.vat > 0 THEN r.vat ELSE ROUND(r.cost * 10.0 / 110) END)"
+        " * 1.0 / MAX(1, " + _ASSET_ORDER_COUNT.format(alias="a") + ")),0) AS repair_vat "
+        "FROM asset_repairs r JOIN order_assets oa ON oa.asset_id = r.asset_id "
+        "JOIN assets a ON a.id = r.asset_id JOIN orders o ON o.id = oa.order_id "
+        "WHERE o.shipping_done=1 AND o.cancelled_at='' AND o.shipping_at BETWEEN ? AND ?"
+        + _NOT_RETURNED, (frm, to_end)).fetchone()
+    revenue = shipped["amount"] or 0
+    fee, refund = shipped["fee"] or 0, shipped["refund"] or 0
+    buy = units["buy"] or 0
+    rep = round(repair["repair"] or 0)
+    ship = shipped["ship"] or 0
+    cost = buy + rep + ship
+    net_revenue = revenue - fee - refund
+    # ── TMS 수기 판매(2026-08-25 대표 "자산번호로 매출을 매칭") — 자사몰·B2B 전화 등
+    #    OWS 주문이 없는 판매를 합산한다. ★자산번호가 OWS 주문에 매칭된 판매는 뺀다:
+    #    자산은 한 번에 한 대만 나가므로 자산번호가 곧 중복 제거 열쇠다.
+    #    판매가 0 기재 행(금액이 TMS 판매등록 칸에만 있는 행)도 뺀다 — 0을 더하면 왜곡만 된다.
+    tms = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(t.sale_price),0) AS sale, "
+        "  COALESCE(SUM(CASE WHEN t.asset_id IS NOT NULL AND COALESCE(a.purchase_price,0) > 0 "
+        "    THEN a.purchase_price + COALESCE((SELECT SUM(r.cost) FROM asset_repairs r "
+        "         WHERE r.asset_id=t.asset_id),0) "
+        "    ELSE t.purchase_price END),0) AS cost "
+        "FROM tms_sales t LEFT JOIN assets a ON a.id=t.asset_id "
+        "WHERE substr(t.sale_date,1,10) BETWEEN ? AND ? "
+        "AND t.stage NOT LIKE '%취소%' AND t.sale_price > 0 "
+        "AND (t.asset_id IS NULL OR NOT EXISTS("
+        "     SELECT 1 FROM order_assets oa WHERE oa.asset_id=t.asset_id))",
+        (frm, to)).fetchone()
+    tms_units, tms_rev, tms_cost = tms["n"] or 0, tms["sale"] or 0, tms["cost"] or 0
+    return {
+        "orders": shipped["cnt"], "units": units["n"] or 0,
+        "revenue": revenue, "fee": fee, "refund": refund, "netRevenue": net_revenue,
+        "buyCost": buy, "repairCost": rep, "repairVat": round(repair["repair_vat"] or 0),
+        "shippingCost": ship, "cost": cost,
+        "profit": net_revenue - cost,
+        "profitRate": round((net_revenue - cost) / revenue * 100, 1) if revenue else 0,
+        # TMS 수기 판매(중복 제거 후) — 화면은 이걸 별도 줄로 보여 주고 합산액도 준다
+        "tmsUnits": tms_units, "tmsRevenue": tms_rev, "tmsCost": tms_cost,
+        "tmsProfit": tms_rev - tms_cost,
+        "combinedRevenue": revenue + tms_rev,
+        "combinedProfit": (net_revenue - cost) + (tms_rev - tms_cost),
+    }
+
+
 @bp.get("/reports/monthly")
 def monthly():
     """월별 매입·출고·마진 추이(최근 12개월)."""
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     conn = get_db()
     rows = conn.execute(
         "SELECT substr(purchase_date,1,7) AS ym, COUNT(*) AS slips, "
@@ -173,13 +343,23 @@ def monthly():
         " GROUP BY ym ORDER BY ym DESC LIMIT 12").fetchall()
     sales = {r["ym"]: {"orders": r["orders"], "revenue": r["revenue"]} for r in rows}
 
-    months = sorted(set(purchase) | set(sales), reverse=True)[:12]
+    # TMS 전표 매출 — 몰 주문과 별도 집계(합산 금지, summary 주석 참조)
+    rows = conn.execute(
+        "SELECT substr(sale_date,1,7) AS ym, COUNT(*) AS slips, "
+        " COALESCE(SUM(sale_amount),0) AS revenue FROM sale_slips "
+        "WHERE stage NOT IN ('판매취소','반입') AND sale_date != '' "
+        "GROUP BY ym ORDER BY ym DESC LIMIT 12").fetchall()
+    slips = {r["ym"]: {"slips": r["slips"], "revenue": r["revenue"]} for r in rows}
+
+    months = sorted(set(purchase) | set(sales) | set(slips), reverse=True)[:12]
     return jsonify([
         {"month": m,
          "purchaseSlips": purchase.get(m, {}).get("slips", 0),
          "purchaseAmount": purchase.get(m, {}).get("amount", 0),
          "orders": sales.get(m, {}).get("orders", 0),
-         "revenue": sales.get(m, {}).get("revenue", 0)}
+         "revenue": sales.get(m, {}).get("revenue", 0),
+         "slipCount": slips.get(m, {}).get("slips", 0),
+         "slipRevenue": slips.get(m, {}).get("revenue", 0)}
         for m in months
     ])
 
@@ -187,7 +367,7 @@ def monthly():
 @bp.get("/reports/channels")
 def channels():
     """채널별 판매 실적."""
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     frm, to = _period()
     rows = get_db().execute(
         "SELECT channel, COUNT(*) AS orders, COALESCE(SUM(amount),0) AS revenue FROM orders o "
@@ -195,6 +375,20 @@ def channels():
         " GROUP BY channel ORDER BY revenue DESC", (frm, _to_end(to))).fetchall()
     return jsonify([{"channel": r["channel"] or "(미지정)", "orders": r["orders"],
                      "revenue": r["revenue"]} for r in rows])
+
+
+@bp.get("/reports/slip-channels")
+def slip_channels():
+    """TMS 전표 채널별 판매 — 몰 주문 채널표와 별도(합산 금지, summary 주석 참조)."""
+    require_any("reports.view", "settings.manage", "purchase.money")
+    frm, to = _period()
+    rows = get_db().execute(
+        "SELECT channel, COUNT(*) AS slips, COALESCE(SUM(qty),0) AS qty, "
+        "  COALESCE(SUM(sale_amount),0) AS revenue FROM sale_slips "
+        "WHERE stage NOT IN ('판매취소','반입') AND sale_date BETWEEN ? AND ? "
+        "GROUP BY channel ORDER BY revenue DESC", (frm, to)).fetchall()
+    return jsonify([{"channel": r["channel"] or "(미지정)", "slips": r["slips"],
+                     "qty": r["qty"], "revenue": r["revenue"]} for r in rows])
 
 
 @bp.get("/reports/staff")
@@ -228,14 +422,14 @@ def staff():
 @bp.get("/reports/aging")
 def aging():
     """재고 체류 기간 — 오래 묵은 자산을 찾는다."""
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     conn = get_db()
     scope, sparams = scope_clause("a")
     rows = conn.execute(
         "SELECT a.id, a.asset_no, a.maker, a.model, a.grade, a.status, a.purchase_price, "
         " a.created_at, c.name AS category_name "
         "FROM assets a LEFT JOIN categories c ON c.id=a.category_id "
-        "WHERE a.status NOT IN ('shipped','scrapped')" + scope +
+        "WHERE a.status NOT IN ('shipped','scrapped')" + sale_only("a") + scope +
         " ORDER BY a.created_at LIMIT 100", sparams).fetchall()
     now = config.now()
     out = []
@@ -292,7 +486,7 @@ def _ledger_line(r):
 @bp.get("/reports/ledger")
 def ledger():
     """매출 대장 — 한 줄에 판매가·수수료·환불·원가·마진까지. 세무·정산에 그대로 쓴다."""
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     frm, to = _period()
     rows = [_ledger_line(r) for r in _ledger_rows(get_db(), frm, _to_end(to))]
     totals = {k: sum(x[k] for x in rows) for k in
@@ -305,7 +499,7 @@ def ledger():
 @bp.get("/reports/ledger/export")
 def ledger_export():
     """매출 대장 엑셀 — 세무사에게 그대로 넘길 수 있는 형태."""
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     from flask import Response
 
     from ..importers import write_xlsx
@@ -323,7 +517,7 @@ def ledger_export():
     return Response(
         write_xlsx(headers, data),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=hms-ledger-{frm}_{to}.xlsx"})
+        headers={"Content-Disposition": f"attachment; filename=ows-ledger-{frm}_{to}.xlsx"})
 
 
 @bp.get("/reports/profitability")
@@ -332,7 +526,7 @@ def profitability():
 
     ?by=model|grade|supplier (기본 model)
     """
-    require("reports.view")
+    require_any("reports.view", "settings.manage", "purchase.money")
     frm, to = _period()
     by = (request.args.get("by") or "model").strip()
     if by not in ("model", "grade", "supplier"):
@@ -384,4 +578,111 @@ def profitability():
 
 
 # 서브모듈 라우트 등록 (bp 정의 이후에 import해야 함)
+@bp.get("/reports/purchase-dashboard")
+def purchase_dashboard():
+    """매입 대시보드(2026-08-13 대표, 매입대시보드.hwpx — 토스쇼핑 달력 참고).
+
+    매입일 기준 '일별 코호트': 그날 매입한 자산이 몇 대·얼마이고, 그 자산들이
+    지금까지 실현한 판매액·순수익이 얼마인가(그날 판 금액이 아니다 — 매입 관점).
+    순수익 = 자산별 배분 실입금(주문금액−수수료−환불, 자산 수로 나눔) − 배분 택배비
+             − 매입가 − 수리·부품비(회수는 음수라 자동 가산).
+    ★권한 분리(대표 지정): 매입 숫자는 매입 담당(purchase.view)까지, 판매액·순수익은
+      관리자 전용 — reports.view 없으면 응답에서 아예 뺀다(0으로 주면 진짜 0과 헷갈린다).
+    """
+    require("purchase.view")
+    require("purchase.money")   # 매입 금액 화면(2026-08-27 대표)
+    frm = (request.args.get("from") or "").strip()[:10]
+    to = (request.args.get("to") or "").strip()[:10]
+    if not frm or not to:
+        abort(400, description="조회 기간(from/to)을 지정하세요.")
+    if frm > to:
+        abort(400, description=f"시작일({frm})이 종료일({to})보다 늦습니다.")
+
+    clause, params = scope_clause("a")
+    # 매입일 = 전표 매입일(없으면 자산 등록일). 취소·반품 전표와 매입취소·반품 자산은 제외.
+    buy_date = "COALESCE(NULLIF(b.purchase_date,''), substr(a.created_at,1,10))"
+    sql = (
+        # ★전표 단위까지 쪼개서 준다(2026-08-14 대표) — 달력 칸의 색·툴팁('어떤 매입처에
+        #   어떤 매입')과, 칸을 눌렀을 때 뜨는 그날 매입 목록이 같은 숫자를 쓰게 하기 위해서다.
+        "SELECT " + buy_date + " AS d, b.id AS bid, b.slip_no AS slip_no, "
+        "  COALESCE(rep.name, sp.name, '') AS supplier, COUNT(*) AS qty, "
+        "  COALESCE(SUM(a.purchase_price),0) AS buy, "
+        "  SUM(CASE WHEN s.revenue IS NOT NULL THEN 1 ELSE 0 END) AS sold_qty, "
+        "  COALESCE(SUM(s.revenue),0) AS sale, "
+        "  COALESCE(SUM(CASE WHEN s.revenue IS NOT NULL THEN "
+        "    s.revenue - s.ship - a.purchase_price - COALESCE(rp.rc,0) END),0) AS profit "
+        "FROM assets a "
+        "LEFT JOIN purchase_batches b ON b.id = a.batch_id "
+        "LEFT JOIN suppliers sp ON sp.id = b.supplier_id "
+        "LEFT JOIN suppliers rep ON rep.id = sp.alias_of "   # 별칭 거래처는 대표 이름(2026-09-03)
+        "LEFT JOIN (SELECT oa.asset_id, "
+        "         SUM((o.amount - o.fee_amount - o.refund_amount) * 1.0 / cnt.n) AS revenue, "
+        "         SUM(o.shipping_cost * 1.0 / cnt.n) AS ship "
+        "       FROM order_assets oa "
+        "       JOIN orders o ON o.id = oa.order_id "
+        "       JOIN (SELECT order_id, COUNT(*) AS n FROM order_assets GROUP BY order_id) cnt "
+        "         ON cnt.order_id = oa.order_id "
+        "       WHERE o.shipping_done=1 AND o.cancelled_at=''" + _NOT_RETURNED +
+        "       GROUP BY oa.asset_id) s ON s.asset_id = a.id "
+        "LEFT JOIN (SELECT asset_id, SUM(cost) AS rc FROM asset_repairs "
+        "           GROUP BY asset_id) rp ON rp.asset_id = a.id "
+        "WHERE a.status NOT IN ('cancelled','returned') "
+        "  AND (b.id IS NULL OR (b.cancelled_at='' AND b.returned_at='' "
+        "                        AND b.stage='purchased')) "
+        "  AND " + buy_date + " BETWEEN ? AND ?" + clause)
+    args = [frm, to] + list(params)
+    supplier = (request.args.get("supplierId") or "").strip()
+    if supplier:
+        try:
+            sql += " AND b.supplier_id = ?"
+            args.append(int(supplier))
+        except (TypeError, ValueError):
+            abort(400, description="거래처 선택이 올바르지 않습니다.")
+    for key, op in (("priceMin", ">="), ("priceMax", "<=")):
+        v = (request.args.get(key) or "").strip().replace(",", "")
+        if v:
+            try:
+                sql += f" AND a.purchase_price {op} ?"
+                args.append(int(v))
+            except (TypeError, ValueError):
+                abort(400, description="매입가 범위가 올바르지 않습니다.")
+    sql += " GROUP BY d, b.id ORDER BY d, b.id"
+    rows = get_db().execute(sql, args).fetchall()
+
+    # 판매액·순수익은 관리자(리포트 권한) 전용 — 매입 담당 응답에는 키 자체가 없다
+    show_money = g.user["is_admin"] or "reports.view" in g.perms
+    by_day, order = {}, []
+    totals = {"qty": 0, "buy": 0, "soldQty": 0, "sale": 0, "profit": 0}
+    for r in rows:
+        day = by_day.get(r["d"])
+        if day is None:
+            day = {"date": r["d"], "qty": 0, "buy": 0, "slips": []}
+            if show_money:
+                day.update({"soldQty": 0, "sale": 0, "profit": 0})
+            by_day[r["d"]] = day
+            order.append(r["d"])
+        day["qty"] += r["qty"]
+        day["buy"] += r["buy"]
+        slip = {"batchId": r["bid"], "slipNo": r["slip_no"] or "",
+                "supplier": r["supplier"] or "", "qty": r["qty"], "buy": r["buy"]}
+        totals["qty"] += r["qty"]
+        totals["buy"] += r["buy"]
+        totals["soldQty"] += r["sold_qty"] or 0
+        totals["sale"] += round(r["sale"] or 0)
+        totals["profit"] += round(r["profit"] or 0)
+        if show_money:
+            day["soldQty"] += r["sold_qty"] or 0
+            day["sale"] += round(r["sale"] or 0)
+            day["profit"] += round(r["profit"] or 0)
+            slip["sale"] = round(r["sale"] or 0)
+            slip["profit"] = round(r["profit"] or 0)
+        day["slips"].append(slip)
+    if not show_money:
+        for k in ("soldQty", "sale", "profit"):
+            totals.pop(k)
+    return jsonify({"from": frm, "to": to, "days": [by_day[d] for d in order],
+                    "totals": totals, "showProfit": show_money})
+
+
 from . import setup_stats  # noqa: E402,F401
+from . import workload  # noqa: E402,F401

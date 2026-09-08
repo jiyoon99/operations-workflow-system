@@ -12,7 +12,26 @@ from . import bp
 from .spec_catalog import CATALOG
 
 # 자동완성을 지원하는 자산 컬럼
-SUPPORTED = {"cpu", "gpu", "ram", "ssd", "inch", "battery", "charger", "location", "maker", "model"}
+SUPPORTED = {"cpu", "gpu", "ram", "ssd", "inch", "battery", "charger", "location", "maker", "model",
+             # ★거래처(2026-08-24 대표: "cpu, 램처럼 입력하고 자동완성") — 자산 컬럼이 아니라
+             #   suppliers 표에서 온다. TMS 이관 거래처가 2,000곳이 넘어 select 로는 못 고른다.
+             "supplier",
+             # ★판매처(2026-09-02 마스터) — 판매 전표의 판매처명 칸. 거래처 마스터의 '판매' 구분만(자유 입력 유지).
+             "customer"}
+
+
+def _supplier_values(q, limit):
+    """거래처 이름 — 전표에 많이 쓰인 곳 먼저(자주 거래하는 곳이 위로)."""
+    sql = ("SELECT s.name AS v, COUNT(b.id) AS c FROM suppliers s "
+           "LEFT JOIN purchase_batches b ON b.supplier_id = s.id "
+           "WHERE s.enabled = 1 AND s.alias_of IS NULL")      # 별칭 행은 대표 이름으로만 고르게(2026-09-02 마스터)
+    params = []
+    if q:
+        sql += " AND s.name LIKE ?"
+        params.append("%" + q + "%")
+    sql += " GROUP BY s.id ORDER BY c DESC, s.name LIMIT ?"
+    params.append(limit)
+    return [r["v"] for r in get_db().execute(sql, params).fetchall()]
 
 
 def _used_values(field, q, limit):
@@ -58,18 +77,31 @@ def spec_options():
     except ValueError:
         limit = 30
 
-    used = _match(_used_values(field, q, limit * 2), q, limit)
-    catalog = _match(CATALOG.get(field, []), q, limit * 2)
+    master = []               # 모델 마스터 후보(2026-09-02) — 맨 위에 '마스터' 꼬리표로
+    if field == "supplier":
+        used = _match(_supplier_values(q, limit * 2), q, limit)
+        catalog = []          # 거래처에 카탈로그는 없다 — 등록된 곳이 전부다
+    elif field == "customer":
+        from . import masters
+        used = masters.supplier_names(q, limit, kind="판매")
+        catalog = []
+    else:
+        used = _match(_used_values(field, q, limit * 2), q, limit)
+        catalog = _match(CATALOG.get(field, []), q, limit * 2)
+        if field == "model":
+            from . import masters
+            master = masters.model_names(q, limit)
 
-    # 이미 쓰던 값을 위로, 그 다음 카탈로그. 중복 제거(대소문자 무시)
+    # 마스터 → 이미 쓰던 값 → 카탈로그 순. 중복 제거(대소문자 무시)
     out, seen = [], set()
-    for group, source in (("used", used), ("catalog", catalog)):
+    for group, source in (("master", master), ("used", used), ("catalog", catalog)):
         for v in source:
-            key = v.lower()
+            item = v if isinstance(v, dict) else {"value": v, "source": group}
+            key = item["value"].lower()
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"value": v, "source": group})
+            out.append(item)
             if len(out) >= limit:
                 break
         if len(out) >= limit:

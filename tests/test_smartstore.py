@@ -164,7 +164,7 @@ if __name__ == "__main__":
 
 
 class TestRentalFilter(unittest.TestCase):
-    """렌탈/판매 분류 — 같은 스토어의 렌탈(RMS) 주문이 HMS로 새면 판매 출고 사고가 난다.
+    """렌탈/판매 분류 — 같은 스토어의 렌탈(RMS) 주문이 OWS로 새면 판매 출고 사고가 난다.
 
     RMS의 분류 원칙(화이트리스트 + 미분류는 버리지 않고 표시)의 거울상.
     """
@@ -190,7 +190,7 @@ class TestRentalFilter(unittest.TestCase):
                       self._item("PO2", "ORD2", "판매 노트북", pid="S111")),
             {"rental_product_ids": "R777", "sale_product_ids": "S111"})
         self.assertEqual([o["orderNumber"] for o in orders], ["ORD2"],
-                         "렌탈 등록 상품 주문이 HMS로 들어왔다")
+                         "렌탈 등록 상품 주문이 OWS로 들어왔다")
         self.assertEqual(len(ad.skipped_rental), 1)
         self.assertIn("그램 노트북", ad.skipped_rental[0])
         self.assertIn("R777", ad.skipped_rental[0])

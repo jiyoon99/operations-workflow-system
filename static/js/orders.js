@@ -1,4 +1,4 @@
-/* HMS 주문관리 — 주문 데이터 관리(엑셀 가져오기/수기 등록/수정/취소). QC 작업은 '셋팅' 탭. */
+/* OWS 주문관리 — 주문 데이터 관리(엑셀 가져오기/수기 등록/수정/취소). QC 작업은 '셋팅' 탭. */
 "use strict";
 
 const CHANNEL_LIST = ["고도몰", "쿠팡", "카카오", "토스", "11번가", "롯데온", "지마켓", "옥션", "테무", "수기", "전화", "방문"];
@@ -8,8 +8,10 @@ function orderStatusInfo(o) {
   if (o.cancelledAt) return { key: "cancelled", label: "취소", chip: "chip-red" };
   if (o.archivedAt) return { key: "archived", label: "보관", chip: "chip-slate" };
   if (o.shippingDone) return { key: "shipped", label: "출고 확인", chip: "chip-green" };
-  // 대표 2026-08-05: 'SW 검수/검수 완료' → '출고 확인'(송장이 나가면 자동으로 켜진다)
-  if (o.softwareInspectionDone) return { key: "inspected", label: "출고 확인", chip: "chip-green" };
+  // ★2026-08-18 대표 승인: 이름을 셋팅 보드에 맞춘다. 2026-08-05엔 3·4단계를 둘 다
+  //   '출고 확인'으로 불렀는데, 그 뒤 SW 검수가 독립 칸으로 되살아나 같은 칩이 두 상태를
+  //   가리키게 됐다 — 어디까지 갔는지 목록만 봐선 알 수 없었다.
+  if (o.softwareInspectionDone) return { key: "inspected", label: "SW 검수 완료", chip: "chip-teal" };
   if (o.productionDone) return { key: "produced", label: "제작 완료", chip: "chip-violet" };
   if (o.preparing) return { key: "preparing", label: "준비 중", chip: "chip-blue" };
   return { key: "waiting", label: "제작 대기", chip: "chip-slate" };
@@ -29,8 +31,18 @@ function isEditingInput() {
   return el && ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
 }
 
+/* 채널별 색(대표 2026-08-24: "실제 API 입력하는 몰마다 색상이 다르게").
+   ★모든 화면(셋팅·주문·배송)이 이 함수 하나를 쓴다 — 색은 CSS .ch-* 에서만 정한다. */
+const CHANNEL_CLASS = {
+  "고도몰": "ch-godo", "쿠팡": "ch-coupang", "카카오": "ch-kakao",
+  "스마트스토어": "ch-naver", "네이버": "ch-naver", "토스": "ch-toss",
+  "11번가": "ch-st11", "롯데온": "ch-lotte", "지마켓": "ch-gmarket",
+  "옥션": "ch-auction", "테무": "ch-temu", "수기": "ch-manual",
+  "전화": "ch-manual", "방문": "ch-manual", "b2b": "ch-b2b", "B2B": "ch-b2b",
+};
 function chBadge(ch) {
-  return `<span class="chip chip-blue">${escapeHtml(ch || "-")}</span>`;
+  const cls = CHANNEL_CLASS[(ch || "").trim()] || "chip-blue";
+  return `<span class="chip ${cls}">${escapeHtml(ch || "-")}</span>`;
 }
 
 /* ---------------- 여러 건 선택 → 일괄 처리 ---------------- */
@@ -79,25 +91,21 @@ function renderBulkBar() {
     document.body.classList.remove("has-bulkbar");
     return;
   }
-  const canWork = hasPerm("orders.work"), canShip = hasPerm("orders.ship");
+  const canWork = hasPerm("orders.work"), canEdit = hasPerm("orders.edit");
   bar.style.display = "block";
   // ★화면 아래에 붙여 둔다 — 목록 위에만 그리면 아래쪽 주문을 체크했을 때
-  //   버튼 7개가 통째로 화면 밖에 있어 '아무 일도 안 일어난' 것처럼 보인다.
+  //   버튼이 통째로 화면 밖에 있어 '아무 일도 안 일어난' 것처럼 보인다.
   bar.className = "bulk-dock";
   document.body.classList.add("has-bulkbar");
+  // ★2026-08-31 대표: 일괄 단계변경·송장·배송완료·보관·취소 버튼은 여기서 뺐다 —
+  //   "그 외 기능은 셋팅/QC쪽에서 쓰니까". 백엔드 /api/orders/bulk 액션은 그대로 있다.
   bar.innerHTML = `
     <div class="inline-row" style="background:var(--primary-soft); border-radius:8px; padding:10px 12px; margin:8px 0;">
       <b>${n}건 선택됨</b>
-      ${canWork ? `<button class="btn btn-sm" data-bulk="preparing">준비 시작</button>
-        <button class="btn btn-sm" data-bulk="shipping">출고 확인</button>` : ""}
-      ${canShip ? `<button class="btn btn-sm btn-primary" data-bulk="issue">🧾 송장 일괄 발급</button>
-        <button class="btn btn-sm" data-bulk="print">🖨 송장 일괄 인쇄</button>` : ""}
-      ${hasPerm("orders.edit") ? `<button class="btn btn-sm" data-bulk="review" title="체험단·리뷰용 출고로 표시합니다. 셋팅·QC 화면에 크게 뜹니다">🎁 리뷰어 지정</button>
-        <button class="btn btn-sm" data-bulk="delivered">배송완료 처리</button>
-        ${state.orderFilter.view === "archived"
-          ? `<button class="btn btn-sm" data-bulk="unarchive">보관 해제</button>`
-          : `<button class="btn btn-sm" data-bulk="archive" title="끝난 주문을 목록에서 치웁니다(지우는 게 아닙니다)">📦 보관</button>`}` : ""}
-      ${hasPerm("orders.cancel") ? `<button class="btn btn-sm btn-danger" data-bulk="cancel">선택 취소</button>` : ""}
+      ${canWork || canEdit ? `<button class="btn btn-sm btn-primary" data-bulk="optlabel"
+        title="선택 중 아직 안 뽑은 주문만 옵션라벨(제품코드·주문자·모델명·옵션표·제공옵션)을 인쇄합니다.
+전부 이미 뽑은 선택이면 다시 인쇄할지 물어봅니다(라벨을 잃어버린 경우)">🏷 옵션라벨</button>` : ""}
+      ${canEdit ? `<button class="btn btn-sm" data-bulk="review" title="체험단·리뷰용 출고로 표시합니다. 셋팅·QC 화면에 크게 뜹니다">🎁 리뷰어 지정</button>` : ""}
       <span style="flex:1"></span>
       <button class="btn btn-ghost btn-sm" data-bulk="clear">선택 해제</button>
     </div>`;
@@ -133,16 +141,10 @@ async function runBulk(action) {
   }
   if (!ids.length) return;
 
-  if (action === "print" || action === "issue") return bulkWaybill(action, ids);
+  if (action === "optlabel") return bulkOptionLabels(ids);
 
   let body = { action, ids, value: true };
-  if (action === "cancel") {
-    const reason = prompt(`${ids.length}건을 취소합니다. 사유를 입력하세요.`, "");
-    if (!reason) return;
-    body.reason = reason;
-  } else if (action === "delivered") {
-    if (!confirm(`${ids.length}건을 배송완료(구매확정)로 처리할까요?`)) return;
-  } else if (action === "review") {
+  if (action === "review") {
     // ★[취소]는 '그만두기'여야 한다. 예전엔 [취소]가 곧 '해제'라서, 잘못 눌러 빠져나오려다
     //   멀쩡한 리뷰어 표시가 풀렸다(2026-07-29 전수조사). 지정/해제는 선택한 주문 상태로 판단한다.
     const picked = (state.orders || []).filter((o) => ids.includes(o.id));
@@ -158,8 +160,6 @@ async function runBulk(action) {
       if (note === null) return;
       body.reason = note.trim();
     }
-  } else if (action === "archive") {
-    if (!confirm(`${ids.length}건을 보관합니다.\n목록에서만 치워지고 데이터는 그대로 남습니다([보관] 보기에서 볼 수 있습니다).`)) return;
   }
   try {
     const r = await api("/api/orders/bulk", { method: "POST", body });
@@ -169,48 +169,44 @@ async function runBulk(action) {
   } catch (err) { toast(err.message, true); }
 }
 
-/* 송장은 CJ를 건별로 불러야 해서 화면이 순차로 진행한다(진행률 표시) */
-async function bulkWaybill(action, ids) {
-  const host = $("#of-bulkresult");
-  if (action === "print") {
-    const wids = state.orders.filter((o) => ids.includes(o.id))
-      .flatMap((o) => (o.waybills || []).filter((w) => w.type !== "recall" && ["issued", "test"].includes(w.status))
-        .map((w) => w.wid));
-    if (!wids.length) { toast("선택한 주문에 발행된 송장이 없습니다.", true); return; }
-    try {
-      const res = await fetch("/api/waybills/print", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ wids }),
-      });
-      if (!res.ok) throw new Error((await res.json()).error || "인쇄 실패");
-      const url = URL.createObjectURL(await res.blob());
-      window.open(url, "_blank");
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-      bulkReport("송장 일괄 인쇄", wids.length, []);
-    } catch (err) { toast(err.message, true); }
+/* 옵션라벨 일괄 인쇄(대표 2026-08-31) — 셋팅·QC가 작업대에 붙이는 옵션표.
+   기본은 '아직 안 뽑은 주문만'(한 번 뽑은 걸 또 뽑을 필요는 없다). 선택이 전부
+   이미 뽑은 주문이면(라벨 분실 등) 물어보고 다시 인쇄한다. 인쇄창이 실제로 열렸을
+   때만 인쇄 기록을 남긴다 — 팝업이 막혔는데 '뽑음'으로 남으면 영영 안 나온다. */
+async function bulkOptionLabels(ids) {
+  const picked = (state.orders || []).filter((o) => ids.includes(o.id));
+  if (!picked.length) return;
+  let targets = picked.filter((o) => !o.optLabelAt);
+  const skipped = picked.length - targets.length;
+  if (!targets.length) {
+    if (!confirm(`선택한 ${picked.length}건 모두 이미 옵션라벨을 뽑은 주문입니다.\n다시 인쇄할까요?`)) return;
+    targets = picked;
+  }
+  const opened = await printOptionLabels(targets);   // app.js — 레이아웃 로드 + 인쇄창
+  if (!opened) return;
+  // ★인쇄창을 띄운 것과 실제로 뽑힌 것은 다르다(2026-09-03 대표) — 사람에게 확인받는다.
+  //   [취소]면 기록하지 않아 '안 뽑은 것만' 인쇄에서 다시 잡힌다.
+  //   장수는 주문 수가 아니라 '대수 합'이다(한 사람이 4대면 4장 나간다).
+  const sheets = targets.reduce(
+    (n, o) => n + Math.max(1, (o.assets || []).length || Number(o.quantity) || 1), 0);
+  if (!(await confirmPrinted(sheets))) {
+    toast("표시하지 않았습니다 — 목록에는 '안 뽑음'으로 남습니다.");
     return;
   }
-  if (!confirm(`${ids.length}건의 송장을 발급합니다. 계속할까요?`)) return;
-  const failed = [];
-  let done = 0;
-  for (const [i, oid] of ids.entries()) {
-    if (host) host.innerHTML = `<p class="muted">송장 발급 중… ${i + 1} / ${ids.length}</p>`;
-    const o = state.orders.find((x) => x.id === oid);
-    try {
-      await api(`/api/orders/${oid}/waybill`, { method: "POST", body: {} });
-      done++;
-    } catch (err) {
-      failed.push({ id: oid, label: o ? o.recipient : `#${oid}`, reason: err.message });
-    }
-  }
-  bulkReport("송장 일괄 발급", done, failed);
-  state.orderPicked = new Set(failed.map((f) => f.id));
+  try {
+    const r = await api("/api/orders/bulk", { method: "POST",
+      body: { action: "optlabel", ids: targets.map((o) => o.id), value: true } });
+    bulkReport(`옵션라벨 인쇄${skipped ? ` (이미 뽑은 ${skipped}건 건너뜀)` : ""}`, r.ok, r.failed);
+    state.orderPicked = new Set(r.failed.map((f) => f.id));   // 실패분만 남긴다(runBulk 관례)
+  } catch (err) { toast(err.message, true); }
   $("#of-search").click();
 }
 
 /* 조회 조건 → 쿼리스트링. 목록과 엑셀 내보내기가 같은 조건을 쓰게 한 곳에서 만든다. */
 function orderQuery(f, extra) {
   const p = new URLSearchParams(Object.assign({ view: f.view }, extra || {}));
+  // '진행중' 기본 보기는 출고 전 주문만. 배송중은 상단 배송중 카드를 눌러 따로 본다.
+  if (f.view === "active" && !f.mallStatus) p.set("progressOnly", "1");
   if (f.q) p.set("q", f.q);
   if (f.channel) p.set("channel", f.channel);
   if (f.mallStatus) p.set("mallStatus", f.mallStatus);
@@ -267,7 +263,11 @@ function renderOrdersView(main) {
     <div class="card" style="padding:12px 16px;">
       <div class="inline-row" style="margin:0; flex-wrap:wrap;">
         <b class="muted" style="font-size:13px;">보기</b>
-        ${VIEW_TABS.map(([k, l]) =>
+        <button class="btn btn-sm ${f.mallStatus === "preparing" ? "btn-primary" : ""}"
+          data-preparing-only title="표의 주문상태가 준비중인 주문만 봅니다">준비중</button>
+        <button class="btn btn-sm ${f.view === "active" && f.mallStatus !== "preparing" ? "btn-primary" : ""}"
+          data-oview="active">진행중</button>
+        ${VIEW_TABS.slice(1).map(([k, l]) =>
           `<button class="btn btn-sm ${f.view === k ? "btn-primary" : ""}" data-oview="${k}">${l}</button>`).join(" ")}
         <span style="width:14px;"></span>
         <b class="muted" style="font-size:13px;">쇼핑몰</b>
@@ -370,7 +370,7 @@ function renderOrdersView(main) {
           <td>${chBadge(o.channel)}</td>
           <td>${escapeHtml(o.orderNumber || "-")}${o.pendingShippingUpdate ? ' <span class="chip chip-red" title="배송지 변경 대기">배송지!</span>' : ""}</td>
           <td class="muted">${escapeHtml((o.orderedAt || "").slice(0, 10))}</td>
-          <td style="max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(o.productName + " " + o.optionName)}">${o.isReview ? '<span class="chip chip-violet" style="font-size:11px;">🎁 리뷰어</span> ' : ""}${escapeHtml(o.productName)}${o.optionName ? ` <span class="muted">${escapeHtml(o.optionName)}</span>` : ""}
+          <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml([o.productCode, o.productName, o.optionName].filter(Boolean).join(" "))}">${o.productCode ? `<span class="order-product-code" title="자체 상품코드">${escapeHtml(o.productCode)}</span> ` : ""}${o.isReview ? '<span class="chip chip-violet" style="font-size:11px;">🎁 리뷰어</span> ' : ""}${o.optLabelAt ? `<span class="chip chip-green" style="font-size:11px;" title="옵션라벨 인쇄됨 · ${escapeHtml(String(o.optLabelAt).slice(0, 16).replace("T", " "))}${o.optLabelBy ? ` · ${escapeHtml(o.optLabelBy)}` : ""}">🏷</span> ` : ""}${escapeHtml(o.productName)}${o.optionName ? ` <span class="muted">${escapeHtml(o.optionName)}</span>` : ""}
             ${memoBadge(o)}</td>
           <td>${o.quantity}</td>
           <td>${fmtWon(o.amount)}</td>
@@ -413,7 +413,17 @@ function renderOrdersView(main) {
   $("#of-status").addEventListener("change", doSearch);   // 상태는 셀렉트/카드 양쪽에서 바꿀 수 있다
   $$("button[data-oview]", main).forEach((b) => b.addEventListener("click", () => {
     f.view = b.dataset.oview;
+    // '준비중'은 진행중 보기의 세부 필터다. 진행중 버튼을 직접 누르면 전체 진행 건으로 돌아간다.
+    if (f.view === "active" && f.mallStatus === "preparing") f.mallStatus = "";
     state.orderPicked.clear();
+    resetPage("orders");
+    renderOrdersView(main);
+  }));
+  $$("button[data-preparing-only]", main).forEach((b) => b.addEventListener("click", () => {
+    f.view = "active";
+    f.mallStatus = f.mallStatus === "preparing" ? "" : "preparing";
+    state.orderPicked.clear();
+    resetPage("orders");
     renderOrdersView(main);
   }));
   $$("button[data-dpreset]", main).forEach((b) => b.addEventListener("click", () => {
@@ -574,7 +584,7 @@ function renderImportPanel() {
   revealPanel(host);        // 다른 패널이 열려 있으면 화면 밖에 그려진다 — 눌렀으면 보여야 한다
   host.innerHTML = `
     <div style="border:1px dashed var(--border); border-radius:8px; padding:14px; margin:8px 0;">
-      <b>엑셀 가져오기</b> <span class="muted">— 주문수집/고도몰/카카오/쿠팡 양식 자동 감지 (xlsx, zip · 최대 10개/30MB)</span>
+      <b>엑셀 가져오기</b> <span class="muted">— 주문수집/고도몰/카카오/쿠팡/테무/ESM(옥션·G마켓) 양식 자동 감지 (xlsx, zip · 최대 10개/30MB)</span>
       <div class="inline-row" style="margin-top:8px;">
         <input type="file" id="imp-files" multiple accept=".xlsx,.xls,.zip">
         <button class="btn btn-sm" id="imp-preview">미리보기</button>
@@ -599,7 +609,7 @@ function renderImportPanel() {
         해석 ${data.parsed}건 · <b style="color:var(--primary)">추가 ${data.added}건</b> ·
         중복 ${data.duplicates}건 · 배송지변경 감지 ${data.shippingUpdates}건
         ${data.errors && data.errors.length ? `<br><span style="color:var(--danger)">${data.errors.map(escapeHtml).join("<br>")}</span>` : ""}
-        ${isPreview && data.preview && data.preview.length ? `<br>추가 예정: ${data.preview.slice(0, 5).map((p) => escapeHtml(`[${p.channel}] ${p.productName} (${p.recipient})`)).join(" / ")}${data.added > 5 ? " …" : ""}` : ""}`;
+        ${isPreview && data.preview && data.preview.length ? `<br>추가 예정: ${data.preview.slice(0, 5).map((p) => escapeHtml(`[${p.channel}] ${p.productName} (${p.recipient}) ${Number(p.amount || 0).toLocaleString()}원`)).join(" / ")}${data.added > 5 ? " …" : ""}` : ""}`;
       if (!isPreview) { toast(`주문 ${data.added}건을 가져왔습니다.`); $("#of-search").click(); }
     } catch (err) { toast(err.message, true); }
     finally { $("#imp-preview").disabled = $("#imp-run").disabled = false; }
@@ -611,7 +621,7 @@ function renderImportPanel() {
 
 /* ---------------- 고도몰 상품 찾기 ----------------
    수기 주문은 고도몰 자체상품코드를 그대로 쓰는 경우가 많다. 상품명·가격은
-   몰에서 수시로 바뀌므로 HMS에 저장해 두지 않고, 입력하는 그 순간 몰에 물어본다. */
+   몰에서 수시로 바뀌므로 OWS에 저장해 두지 않고, 입력하는 그 순간 몰에 물어본다. */
 
 const GOODS_DEBOUNCE_MS = 400;
 
@@ -847,7 +857,9 @@ function renderNewOrderPanel() {
                border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,.18);"></div>
         </label>
         <label>연락처<input type="text" id="no-phone"></label>
-        <label>우편번호<input type="text" id="no-zip"></label>
+        <label>우편번호<div class="inline-row" style="gap:4px; margin:0;">
+          <input type="text" id="no-zip" style="flex:1;">
+          <button class="btn btn-sm" id="no-zip-find" type="button" title="우편번호·주소를 검색해 채웁니다">🔍 주소검색</button></div></label>
       </div>
       <label class="muted" style="display:block; margin-top:8px;">주소<input type="text" id="no-addr" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg);"></label>
       <label class="muted" style="display:block; margin-top:8px;">배송메시지<input type="text" id="no-msg" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg);"></label>
@@ -858,6 +870,7 @@ function renderNewOrderPanel() {
     </div>`;
   attachGoodsLookup({ code: "no-code", name: "no-product", option: "no-option",
                       amount: "no-amount", qty: "no-qty" });
+  attachAddrSearch($("#no-zip-find"), { zip: "#no-zip", addr: "#no-addr" });
   // ★제품코드를 고르면 상품명·옵션을 그 코드로 팔던 지난 주문에서 그대로 가져온다.
   //   그래야 등록한 수기 주문이 셋팅/QC에서 몰 주문과 똑같이 보인다(대표 요청 2026-08-05).
   attachCodeLookup("no-sku", (c) => {
@@ -977,7 +990,9 @@ async function renderOrderDetail() {
     <div class="form-grid" style="margin-top:8px;">
       <label>수취인<input type="text" id="od-recipient" value="${escapeHtml(o.recipient)}" ${canEdit ? "" : "disabled"}></label>
       <label>연락처<input type="text" id="od-phone" value="${escapeHtml(o.phone)}" ${canEdit ? "" : "disabled"}></label>
-      <label>우편번호<input type="text" id="od-zip" value="${escapeHtml(o.postalCode)}" ${canEdit ? "" : "disabled"}></label>
+      <label>우편번호<div class="inline-row" style="gap:4px; margin:0;">
+        <input type="text" id="od-zip" value="${escapeHtml(o.postalCode)}" ${canEdit ? "" : "disabled"} style="flex:1;">
+        ${canEdit ? `<button class="btn btn-sm" id="od-zip-find" type="button" title="우편번호·주소를 검색해 채웁니다">🔍</button>` : ""}</div></label>
       ${goodsLookupField("od-code", "제품코드 / 상품코드 🔍", o.productCode, !canEdit)}
       <label>수령방식<select id="od-recv" ${canEdit ? "" : "disabled"}>${RECEIVE_METHODS.map((m) =>
         `<option ${(o.receiveMethod || "택배") === m ? "selected" : ""}>${m}</option>`).join("")}</select></label>
@@ -1099,18 +1114,25 @@ async function renderOrderDetail() {
   });
   const cancelBtn = $("#od-cancel");
   if (cancelBtn) cancelBtn.addEventListener("click", () => {
-    const activeWb = (o.waybills || []).find((w) => w.type !== "recall" && w.status !== "canceled");
-    if (activeWb) {
-      toast(`발행된 송장(${activeWb.wid})을 먼저 취소해야 주문을 취소할 수 있습니다.`, true);
-      return;
-    }
+    // ★출고 확인·송장 발행 뒤에도 취소할 수 있다(2026-09-03 대표) — 취소하면 매칭 자산이
+    //   자동으로 빠진다. 다만 '아직 안 움직인 송장'이면 서버가 되물어 온다(기사 헛걸음 방지).
     const reason = prompt("취소 사유를 입력하세요.");
     if (!reason) return;
-    patch({ action: "cancel", reason }).then(() => toast("주문을 취소했습니다.")).catch(() => {});
+    const run = (force) => patch({ action: "cancel", reason, ...(force ? { force: true } : {}) })
+      .then(() => toast("주문을 취소했습니다 — 매칭된 자산은 재고로 돌아갑니다."))
+      .catch((err) => {
+        if (err.data && err.data.code === "waybill_open"
+            && confirm(`${err.message}\n\n그래도 이 주문을 취소할까요?\n`
+                       + "(송장은 배송/송장 화면에서 따로 취소해야 기사가 오지 않습니다)")) {
+          run(true);
+        }
+      });
+    run(false);
   });
   const restoreBtn = $("#od-restore");
   if (restoreBtn) restoreBtn.addEventListener("click", () =>
     patch({ action: "restoreCancel" }).then(() => toast("취소를 복구했습니다.")).catch(() => {}));
+  attachAddrSearch($("#od-zip-find"), { zip: "#od-zip", addr: "#od-addr" });
   const applyBtn = $("#od-applypu");
   if (applyBtn) applyBtn.addEventListener("click", () =>
     patch({ action: "applyShippingUpdate" }).then(() => toast("배송지 변경을 반영했습니다.")).catch(() => {}));

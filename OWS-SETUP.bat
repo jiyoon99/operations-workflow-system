@@ -1,7 +1,7 @@
 @echo off
 REM ============================================================
-REM  HMS SETUP - run this ONCE on a new machine.
-REM  ASCII-only on purpose (see HMS-STOP.bat).
+REM  OWS SETUP - run this ONCE on a new machine.
+REM  ASCII-only on purpose (see OWS-STOP.bat).
 REM
 REM  A venv remembers the python it was built with, so a venv
 REM  copied from another PC does not work here. This rebuilds it
@@ -11,7 +11,7 @@ setlocal
 cd /d "%~dp0"
 
 echo.
-echo   HMS - first-time setup on this machine
+echo   OWS - first-time setup on this machine
 echo   folder: %~dp0
 echo.
 
@@ -51,16 +51,16 @@ if errorlevel 1 (
 echo   [3/4] packages installed
 
 REM --- 4) register auto-start (survives reboot) ---
-schtasks /Create /TN "HalfbookSystemAutoStart" /TR "\"%~dp0venv\Scripts\pythonw.exe\" \"%~dp0watchdog_server.py\"" /SC ONLOGON /RL HIGHEST /F >nul 2>&1
+schtasks /Create /TN "OperationsSystemAutoStart" /TR "\"%~dp0venv\Scripts\pythonw.exe\" \"%~dp0watchdog_server.py\"" /SC ONLOGON /RL HIGHEST /F >nul 2>&1
 if errorlevel 1 (
   echo   [4/4] could not register auto-start - right-click this file and
-  echo         "Run as administrator", or start manually with HMS-START.bat
+  echo         "Run as administrator", or start manually with OWS-START.bat
 ) else (
   echo   [4/4] auto-start registered
 )
 
 echo.
-echo   Setup done. Run HMS-START.bat to start the server.
+echo   Setup done. Run OWS-START.bat to start the server.
 echo.
 pause
 endlocal

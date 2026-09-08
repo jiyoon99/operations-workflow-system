@@ -1,4 +1,4 @@
-"""HMS 서버 실행 — 단일 프로세스 가드(원칙 #10) + 종료 스냅샷 백업."""
+"""OWS 서버 실행 — 단일 프로세스 가드(원칙 #10) + 종료 스냅샷 백업."""
 import atexit
 import os
 import socket
@@ -29,7 +29,7 @@ def _port_free(port: int) -> bool:
 def main():
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not _port_free(config.PORT):
-        print(f"[HMS] 포트 {config.PORT}가 이미 사용 중입니다. 서버가 이미 실행 중인지 확인하세요.")
+        print(f"[OWS] 포트 {config.PORT}가 이미 사용 중입니다. 서버가 이미 실행 중인지 확인하세요.")
         sys.exit(1)
 
     app = create_app()
@@ -47,7 +47,7 @@ def main():
 
     atexit.register(_on_shutdown)
 
-    print(f"[HMS] 하프북 관리 시스템 시작 — http://localhost:{config.PORT} (LAN: 서버IP:{config.PORT})")
+    print(f"[OWS] 사내 업무 관리 시스템 시작 — http://localhost:{config.PORT} (LAN: 서버IP:{config.PORT})")
     try:
         from waitress import serve
         serve(app, host=config.HOST, port=config.PORT, threads=8)

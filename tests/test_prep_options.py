@@ -21,7 +21,7 @@ ADMIN_PW = "admin-pass-1"
 
 class TestPrepOptions(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-prep-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-prep-"))
         self.app = create_app(db_path=self.tmp / "test.db")
         self.app.testing = True
         self.client = self.app.test_client()

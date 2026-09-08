@@ -13,6 +13,7 @@
 """
 import json
 import xml.etree.ElementTree as ET
+from datetime import date, timedelta
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -24,6 +25,7 @@ PATHS = {
     "search": "/godomall5/order/Order_Search.php",
     "status": "/godomall5/order/Order_Status.php",
     "goods": "/godomall5/goods/Goods_Search.php",
+    "code": "/godomall5/common/Code_Search.php",     # 택배사 목록(deliveryCompany) — RMS 검증
 }
 
 # 수집 대상 주문상태 (결제완료·상품준비중)
@@ -181,7 +183,7 @@ class GodomallAdapter(MallAdapter):
         body = urlencode(params, encoding="utf-8").encode("utf-8")
         req = Request(url, data=body, headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-            "User-Agent": "HMS/1.0",
+            "User-Agent": "OWS/1.0",
         })
         try:
             with urlopen(req, timeout=timeout) as r:
@@ -313,6 +315,10 @@ class GodomallAdapter(MallAdapter):
             amount = (_int(_text(node, "totalGoodsPrice"))
                       or _int(_text(node, "settlePrice", "totalPrice"))
                       or line_sum)
+            # ★주문상품 일련번호(sno) — 송장을 올릴 때 고도몰이 반드시 요구한다(2026-09-08 첫 실전송에서
+            #   898 "sno 값은 필수 값입니다"로 5건 거부). 살아 있는 줄 전부를 RMS 와 같이 '|'로 잇는다.
+            #   수집 원본(orders.raw)에 함께 저장되어 전송 때 꺼내 쓴다.
+            snos = [s for s in (_text(g, "sno") for g in goods) if s]
             out.append(self.order(
                 importKey=f"고도몰:{order_no}",
                 orderNumber=order_no,
@@ -327,8 +333,49 @@ class GodomallAdapter(MallAdapter):
                 postalCode=_text(info, "receiverZonecode", "receiverZipcode"),
                 address=addr,
                 deliveryMessage=_text(info, "orderMemo", "deliveryMemo"),
+                mallSno="|".join(snos),
             ))
         return out
+
+    def fetch_sno(self, order_no, ordered_at=""):
+        """주문 한 건의 주문상품 번호(sno, '|' 연결)를 몰에 다시 물어 온다 — 수집 원본에 없을 때(옛 수집분).
+
+        주문일 앞뒤 하루를 주문일 기준으로 훑어 주문번호가 맞는 것을 고른다(Order_Search 는 RMS 가
+        검증한 날짜 조회만 쓴다). 못 찾으면 빈 문자열 — 호출자가 사유를 남긴다.
+        """
+        order_no = (order_no or "").strip()
+        if not order_no:
+            return ""
+        try:
+            base = date.fromisoformat(str(ordered_at or "")[:10])
+        except ValueError:
+            base = date.today()
+        start, end = base - timedelta(days=1), base + timedelta(days=1)
+        seen_nos = set()
+        for page in range(1, MAX_PAGES + 1):
+            params = dict(self._auth(), **{
+                "dateType": "order",
+                "startDate": start.strftime("%Y-%m-%d"),
+                "endDate": end.strftime("%Y-%m-%d"),
+                "size": str(PAGE_SIZE),
+                "page": str(page),
+            })
+            root = self._post(self._url("search"), params)
+            nodes = self._order_nodes(root)
+            self.pace()
+            if not nodes:
+                break
+            for n in nodes:
+                if _text(n, "orderNo") == order_no:
+                    return "|".join(s for s in (_text(g, "sno") for g in self._live_lines(n)) if s)
+            page_nos = {_text(n, "orderNo") for n in nodes} - {""}
+            if page_nos and not (page_nos - seen_nos):
+                break
+            seen_nos |= page_nos
+            flag = (_text(root.find("header"), "lastOrder") or _text(root, "lastOrder") or "").lower()
+            if flag == "true" or len(nodes) < PAGE_SIZE:
+                break
+        return ""
 
     # ------------------------------------------------------------ 상품 조회
 
@@ -382,16 +429,55 @@ class GodomallAdapter(MallAdapter):
 
     # ------------------------------------------------------------ 송장 전송
 
+    # ------------------------------------------------------------ 택배사 코드(RMS 이식 2026-09-08)
+
+    def list_couriers(self):
+        """가맹점에 등록된 택배사 목록 [{sno, name}] — RMS `/api/godo/couriers` 검증 방식 그대로.
+
+        ★가맹점마다 등록한 택배사가 달라 sno 를 코드에 박아 두면 207 오류가 난다(RMS 실측).
+          그래서 매번 몰에 물어본다(어댑터 안에서 한 번 캐시).
+        """
+        root = self._post(self._url("code"), dict(self._auth(), code_type="deliveryCompany"))
+        out = []
+        for d in root.iter():            # <body><data>… / <data>… 어느 깊이에 있어도 찾는다
+            sno, name = _text(d, "invoiceCompanySno"), _text(d, "invoiceCompanyName")
+            if sno and name and not any(c["sno"] == sno for c in out):
+                out.append({"sno": sno, "name": name})
+        return out
+
+    def cj_courier_sno(self):
+        """CJ대한통운의 invoiceCompanySno. 등록이 없으면 MallError(등록된 이름을 알려 준다)."""
+        cached = getattr(self, "_cj_sno", "")
+        if cached:
+            return cached
+        couriers = self.list_couriers()
+        for c in couriers:
+            n = c["name"].replace(" ", "").upper()
+            if "CJ" in n or "대한통운" in n:
+                self._cj_sno = c["sno"]
+                return c["sno"]
+        raise MallError("고도몰에 CJ대한통운이 택배사로 등록돼 있지 않습니다 — 등록된 택배사: "
+                        + (", ".join(c["name"] for c in couriers) or "없음"))
+
     def upload_invoice(self, order_no, invoice_no, courier_code="", sno=""):
-        """송장 전송 — 주문상태를 배송중(d1)으로 바꾸면서 송장번호를 넣는다."""
+        """송장 전송 — 주문상태를 배송중(d1)으로 바꾸면서 송장번호를 넣는다.
+
+        ★택배사(invoiceCompanySno)를 반드시 같이 보낸다(2026-09-08, RMS 대조). 예전에는 비워 보냈다 —
+          그러면 몰에 송장번호만 남고 택배사가 없어 고객 화면의 배송조회가 안 붙는다.
+          설정에 코드가 없으면 몰에 물어 CJ대한통운의 sno 를 찾아 쓴다.
+        ★sno(주문상품 일련번호)는 필수다 — 2026-09-08 첫 실전송에서 없이 보낸 5건이 전부 898로 거부됐다.
+          수집이 raw 에 보관(mallSno)하고, 없으면 invoice_push 가 fetch_sno 로 몰에 다시 묻는다.
+          그래도 없으면 몰을 부르지 않고 사유를 남긴다(898 은 확정적이라 두드려 봐야 소용없다).
+        """
+        if not (sno or "").strip():
+            raise MallError("고도몰 주문상품 번호(sno)를 찾지 못해 송장을 올리지 않았습니다 — "
+                            "몰에서 이 주문번호를 못 찾았거나 상품줄이 전부 취소된 주문입니다.")
         params = dict(self._auth(), **{
             "orderNo": order_no,
             "orderStatus": "d1",
             "invoiceNo": invoice_no,
+            "invoiceCompanySno": (courier_code or "").strip() or self.cj_courier_sno(),
         })
-        if sno:
-            params["sno"] = sno
-        if courier_code:
-            params["invoiceCompanySno"] = courier_code
+        params["sno"] = sno.strip()
         self._post(self._url("status"), params)
         return True

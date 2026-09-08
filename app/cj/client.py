@@ -35,8 +35,8 @@ def _cj2_base(cj: dict) -> str:
 
 def _cj2_phone(s: str):
     """전화번호 → (NO1, NO2, NO3). 02=지역2자리, 그 외 0XX=3자리.
-    선두 0이 없는 대표번호(1566-1674 등)는 CJ 규격상 NO1='000' — 000-1566-1674.
-    (2026-07-27 CJ 개발팀 지적: '1566-1674'가 156-61674-로 잘못 분할되던 버그 정정)"""
+    선두 0이 없는 대표번호(0000-0000 등)는 CJ 규격상 NO1='000' — 000-0000-0000.
+    (대표번호를 일반 지역번호처럼 분할하던 버그 정정)"""
     d = re.sub(r'[^0-9]', '', s or '')
     if not d:
         return ('', '', '')
@@ -121,6 +121,27 @@ def cj2_addr_refine(cj: dict, address: str) -> dict:
 def cj2_track(cj: dict, invc_no: str) -> dict:
     """ReqOneGdsTrc — 운송장 번호 기준 단건 배송추적."""
     return cj2_call(cj, 'ReqOneGdsTrc', {'CLNTNUM': _cj2_cust(cj), 'INVC_NO': invc_no})
+
+
+def cj2_mss_track(cj: dict, req_dt: str, snd_yn: str = 'N') -> dict:
+    """ReqMssGdsTrc — ★'예약(접수) 정보 기준' 상품추적. 운송장번호를 몰라도 조회된다.
+
+    회수(반품)는 우리가 INVC_NO를 만들지 않고 CJ가 집화 시 채번하므로, ReqOneGdsTrc(번호 필수)로는
+    영원히 조회가 안 된다. 이 API는 CUST_USE_NO(우리 접수키)와 함께 INVC_NO를 돌려주므로
+    회수 송장번호를 뒤늦게 받아올 수 있는 유일한 경로다(지침서 V3.9.4 p.21~23, RMS 실운영 검증).
+
+    · REQ_DT = 추적데이터 등록일자(YYYYMMDD), 1회 최대 500건
+    · SND_YN='N' → '미전송' 상태를 유지해 같은 데이터를 다시 받을 수 있다(멱등·유실 방지).
+      'Y'로 보내면 CJ가 전송완료로 마킹해 **다시 못 받는다** → 처리 실패 시 영구 유실이라 기본 'N'.
+    """
+    res = cj2_call(cj, 'ReqMssGdsTrc', {'CUST_ID': _cj2_cust(cj),
+                                        'REQ_DT': re.sub(r'[^0-9]', '', req_dt or '')[:8],
+                                        'SND_YN': 'Y' if str(snd_yn).upper() == 'Y' else 'N'})
+    rows = res.get('data')
+    if isinstance(rows, dict):
+        rows = [rows]
+    return {'ok': bool(res.get('ok')), 'rows': rows if isinstance(rows, list) else [],
+            'detail': res.get('detail'), 'result_cd': res.get('result_cd'), 'http': res.get('http')}
 
 def _cj2_party(p: dict, prefix: str) -> dict:
     """보내는분/받는분/주문자 블록 생성. prefix ∈ {SENDR, RCVR, ORDRR}."""

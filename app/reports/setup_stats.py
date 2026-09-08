@@ -94,11 +94,24 @@ def setup_stats():
     # 설정 화면 탭으로도 열리므로 settings.manage도 받는다 — 탭은 보이는데 내용이
     # 권한 오류로 비어 있던 문제(2026-07-29 전수조사)
     require_any("reports.view", "setup.view", "orders.work", "settings.manage")
-    kind = (request.args.get("period") or "month").strip()
-    if kind not in PERIODS:
-        abort(400, description="기간은 day/week/month/quarter/year 중 하나여야 합니다.")
-    anchor = _parse_date(request.args.get("date"))
-    start, end, label = period_range(kind, anchor)
+    raw_from = (request.args.get("from") or "").strip()
+    raw_to = (request.args.get("to") or "").strip()
+    if bool(raw_from) != bool(raw_to):
+        abort(400, description="시작일과 종료일을 모두 입력하세요.")
+    if raw_from:
+        kind = "custom"
+        start, end = _parse_date(raw_from), _parse_date(raw_to)
+        if end < start:
+            abort(400, description="종료일은 시작일보다 빠를 수 없습니다.")
+        if (end - start).days > 366:
+            abort(400, description="조회 기간은 최대 1년입니다.")
+        label = f"{start.isoformat()} ~ {end.isoformat()}"
+    else:
+        kind = (request.args.get("period") or "month").strip()
+        if kind not in PERIODS:
+            abort(400, description="기간은 day/week/month/quarter/year 중 하나여야 합니다.")
+        anchor = _parse_date(request.args.get("date"))
+        start, end, label = period_range(kind, anchor)
 
     conn = get_db()
     rows = _rows(conn, start, end)
@@ -122,8 +135,13 @@ def setup_stats():
             d["units"] += units
             d["byStaff"][maker] = d["byStaff"].get(maker, 0) + units
 
-    # 직전 같은 기간과 비교 — 늘었는지 줄었는지 한눈에
-    p_start, p_end, p_label = period_range(kind, _prev_anchor(kind, start))
+    # 직전 같은 기간과 비교 — 직접 선택도 바로 앞의 같은 일수와 비교한다.
+    if kind == "custom":
+        p_end = start - timedelta(days=1)
+        p_start = p_end - (end - start)
+        p_label = f"{p_start.isoformat()} ~ {p_end.isoformat()}"
+    else:
+        p_start, p_end, p_label = period_range(kind, _prev_anchor(kind, start))
     prev_units = sum(_units(r) for r in _rows(conn, p_start, p_end))
 
     return jsonify({
@@ -164,4 +182,73 @@ def setup_day():
             "productionBy": r["production_by"], "inspectionBy": r["inspection_by"],
             "at": (r["inspection_at"] or "")[11:16],
         } for r in rows],
+    })
+
+
+@bp.get("/reports/prebuild-stats")
+def prebuild_stats():
+    """선제작 전용 기간 실적 — 일반 셋팅/출고 실적과 섞지 않는다."""
+    require_any("reports.view", "setup.view", "orders.work", "settings.manage")
+    kind = (request.args.get("period") or "month").strip()
+    if kind not in PERIODS:
+        abort(400, description="기간은 day/week/month/quarter/year 중 하나여야 합니다.")
+    anchor = _parse_date(request.args.get("date"))
+    start, end, label = period_range(kind, anchor)
+    frm, to = start.isoformat(), end.isoformat()
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT p.*, a.asset_no, a.maker, a.model, a.product_code, a.ram, a.ssd,
+               o.order_no AS used_order_no, o.recipient AS used_recipient
+        FROM asset_prebuilds p JOIN assets a ON a.id=p.asset_id
+        LEFT JOIN orders o ON o.id=p.used_order_id
+        WHERE p.cancelled_at='' AND (SUBSTR(p.production_at,1,10) BETWEEN ? AND ?
+           OR SUBSTR(p.inspection_at,1,10) BETWEEN ? AND ?
+           OR SUBSTR(p.ready_at,1,10) BETWEEN ? AND ?
+           OR SUBSTR(p.used_at,1,10) BETWEEN ? AND ?)
+        ORDER BY p.id DESC
+        """, (frm, to, frm, to, frm, to, frm, to)).fetchall()
+
+    totals = {"production": 0, "inspection": 0, "ready": 0, "used": 0}
+    staff = {}
+    stage_cols = (
+        ("production", "production_by", "production_at"),
+        ("inspection", "inspection_by", "inspection_at"),
+        ("ready", "ready_by", "ready_at"),
+        ("used", "used_by", "used_at"),
+    )
+    out = []
+    for r in rows:
+        included = {}
+        for key, by_col, at_col in stage_cols:
+            at = r[at_col] or ""
+            on = bool(at and frm <= at[:10] <= to
+                      and not (r["credit_voided"] and key in ("production", "inspection")))
+            included[key] = on
+            if not on:
+                continue
+            totals[key] += 1
+            who = (r[by_col] or "").strip() or "(담당자 미기록)"
+            s = staff.setdefault(who, {"name": who, "production": 0, "inspection": 0,
+                                       "ready": 0, "used": 0})
+            s[key] += 1
+        out.append({
+            "id": r["id"], "assetNo": r["asset_no"],
+            "product": " ".join(x for x in (r["maker"], r["model"]) if x),
+            "productCode": r["product_code"], "ram": r["ram"], "ssd": r["ssd"],
+            "productionBy": r["production_by"], "productionAt": r["production_at"],
+            "inspectionBy": r["inspection_by"], "inspectionAt": r["inspection_at"],
+            "readyBy": r["ready_by"], "readyAt": r["ready_at"],
+            "usedBy": r["used_by"], "usedAt": r["used_at"],
+            "usedOrderId": r["used_order_id"], "usedOrderNo": r["used_order_no"] or "",
+            "usedRecipient": r["used_recipient"] or "", "included": included,
+        })
+    current_ready = conn.execute(
+        "SELECT COUNT(*) AS n FROM asset_prebuilds WHERE ready_done=1 AND used_order_id IS NULL AND cancelled_at=''"
+    ).fetchone()["n"]
+    return jsonify({
+        "period": {"type": kind, "from": frm, "to": to, "label": label},
+        "totals": totals, "currentReady": current_ready,
+        "staff": sorted(staff.values(), key=lambda x: (-x["production"], -x["inspection"], x["name"])),
+        "rows": out,
     })

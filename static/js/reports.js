@@ -1,20 +1,22 @@
-/* HMS 리포트 — 기간 요약(매입/판매/마진), 월별 추이, 채널별, 담당자 실적, 재고 체류 */
+/* 설정 ▸ 매출/실적의 [판매 분석]·[매출 대장] 보기 — 옛 '리포트' 탭에서 이사.
+   ★2026-08-31 대표: "리포트 기능은 설정 내 매출/실적으로 통합하여 필요한 기능만".
+   가져온 것: 무엇이 남는 장사인가 · 채널별 판매 · 월별 추이 · 오래 묵은 재고 ·
+   데이터 갭 경고(→판매 분석), 매출 대장+엑셀(→매출 대장).
+   버린 것: KPI·손익 구성([📊 기간 실적]이 부가세·TMS 합산까지 상위호환),
+   담당자 실적([기간별 작업량]이 대체 — 출고 확인 단계도 그쪽에 추가). */
 "use strict";
 
-function renderReportsView(main) {
-  if (!hasPerm("reports.view")) {
-    main.innerHTML = `<h1 class="page-title">리포트</h1><div class="card placeholder"><p>통계 조회 권한이 없습니다.</p></div>`;
-    return;
-  }
+/* 공용 기간 필터 — 두 보기가 같은 state.repFilter 를 쓴다(보기를 오가도 기간 유지) */
+function repFilter() {
   const today = new Date();
-  const f = state.repFilter || (state.repFilter = {
+  return state.repFilter || (state.repFilter = {
     from: ymd(new Date(today.getFullYear(), today.getMonth(), 1)),
     to: ymd(today),
   });
-  main.innerHTML = `
-    <h1 class="page-title">리포트</h1>
-    <p class="page-desc">매입·판매·마진과 재고 현황</p>
-    <div class="card" style="padding:14px 16px;">
+}
+
+function repFilterHtml(f) {
+  return `<div class="card" style="padding:14px 16px;">
       <div class="inline-row" style="margin:0;">
         <label class="muted">기간</label>
         <input type="date" id="rp-from" value="${f.from}">
@@ -25,10 +27,12 @@ function renderReportsView(main) {
         <button class="btn btn-sm" data-quick="last">지난 달</button>
         <button class="btn btn-sm" data-quick="year">올해</button>
       </div>
-    </div>
-    <div id="rp-body"><p class="muted">불러오는 중…</p></div>`;
-  $("#rp-go").addEventListener("click", () => {
-    const from = $("#rp-from").value, to = $("#rp-to").value;
+    </div>`;
+}
+
+function wireRepFilter(host, f, reload) {
+  $("#rp-go", host).addEventListener("click", () => {
+    const from = $("#rp-from", host).value, to = $("#rp-to", host).value;
     // ★날짜를 거꾸로 넣으면 조용히 전부 0원으로 나왔다 — 매출이 없는 건지
     //   날짜를 잘못 넣은 건지 구분할 수 없었다(2026-07-29 전수조사).
     if (from && to && from > to) {
@@ -36,9 +40,9 @@ function renderReportsView(main) {
       return;
     }
     f.from = from; f.to = to;
-    loadReports();
+    reload();
   });
-  $$("button[data-quick]", main).forEach((b) => b.addEventListener("click", () => {
+  $$("button[data-quick]", host).forEach((b) => b.addEventListener("click", () => {
     const now = new Date();
     if (b.dataset.quick === "month") {
       f.from = ymd(new Date(now.getFullYear(), now.getMonth(), 1));
@@ -50,36 +54,43 @@ function renderReportsView(main) {
       f.from = ymd(new Date(now.getFullYear(), 0, 1));
       f.to = ymd(now);
     }
-    $("#rp-from").value = f.from; $("#rp-to").value = f.to;
-    loadReports();
+    $("#rp-from", host).value = f.from; $("#rp-to", host).value = f.to;
+    reload();
   }));
-  loadReports();
 }
 
-async function loadReports() {
+/* ── 판매 분석 — 무엇이 남는 장사인가 · 채널별 · 월별 추이 · 오래 묵은 재고 ── */
+function renderAnalysisView(host) {
+  const f = repFilter();
+  host.innerHTML = repFilterHtml(f) + `<div id="rp-body"><p class="muted">불러오는 중…</p></div>`;
+  wireRepFilter(host, f, () => loadAnalysis(host));
+  loadAnalysis(host);
+}
+
+async function loadAnalysis(root) {
   const seq = ++state.renderSeq;
   const f = state.repFilter;
-  const host = $("#rp-body");
+  const host = $("#rp-body", root);
   const qs = `?from=${f.from}&to=${f.to}`;
-  let sum, months, chans, staff, aging;
+  let sum, months, chans, aging, slipChans;
   try {
-    [sum, months, chans, staff, aging] = await Promise.all([
-      api("/api/reports/summary" + qs),
+    [sum, months, chans, aging, slipChans] = await Promise.all([
+      // 데이터 갭 경고용 — 마진 숫자를 보여주는 화면이니 원가 구멍을 같이 알려야 한다
+      api("/api/reports/summary" + qs).catch(() => null),
       api("/api/reports/monthly"),
       api("/api/reports/channels" + qs),
-      api("/api/reports/staff" + qs),
       api("/api/reports/aging"),
+      api("/api/reports/slip-channels" + qs).catch(() => []),
     ]);
-    if (seq !== state.renderSeq) return;
+    if (seq !== state.renderSeq || !$("#rp-body", root)) return;
   } catch (err) {
     if (host) host.innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`;
     return;
   }
   const maxRevenue = Math.max(1, ...months.map((m) => m.revenue));
   const maxPurchase = Math.max(1, ...months.map((m) => m.purchaseAmount));
-  const marginColor = sum.sales.margin >= 0 ? "var(--primary)" : "var(--danger)";
 
-  const g = sum.dataGaps || {};
+  const g = (sum && sum.dataGaps) || {};
   const gapMsgs = [];
   if (g.noBuyPrice) gapMsgs.push(`매입가가 비어 있는 자산 <b>${g.noBuyPrice}대</b>(출고 ${g.units}대 중)`);
   if (g.ordersWithoutAsset) gapMsgs.push(`자산이 매칭되지 않은 출고 주문 <b>${g.ordersWithoutAsset}건</b>`);
@@ -92,47 +103,6 @@ async function loadReports() {
       <p class="muted" style="margin:6px 0 0;">원가가 비어 있으면 그만큼 마진이 부풀려집니다.
       매입 &gt; 자산 목록에서 매입가를 채우면 숫자가 제자리를 찾습니다.</p>
     </div>` : ""}
-    <div class="kpi-row">
-      <div class="kpi"><div class="kpi-label">매입 (${sum.purchase.slips}건)</div>
-        <div class="kpi-value">${fmtWon(sum.purchase.amount)}</div>
-        <div class="muted" style="font-size:12px;">자산 ${sum.purchase.assets}대</div></div>
-      <div class="kpi"><div class="kpi-label">판매 (${sum.sales.orders}건 출고)</div>
-        <div class="kpi-value">${fmtWon(sum.sales.revenue)}</div>
-        ${sum.sales.fee || sum.sales.refund
-          ? `<div class="muted" style="font-size:12px;">실입금 ${fmtWon(sum.sales.netRevenue)}</div>` : ""}</div>
-      <div class="kpi" style="border-left-color:${marginColor};"><div class="kpi-label">마진</div>
-        <div class="kpi-value" style="color:${marginColor};">${fmtWon(sum.sales.margin)}</div>
-        <div class="muted" style="font-size:12px;">마진율 ${sum.sales.marginRate}%</div></div>
-      <div class="kpi"><div class="kpi-label">보유 재고 ${sum.stock.assets}대</div>
-        <div class="kpi-value">${fmtWon(sum.stock.amount)}</div>
-        <div class="muted" style="font-size:12px;">매입가 기준</div></div>
-    </div>
-
-    <div class="card">
-      <h3>손익 구성 <span class="muted" style="font-size:13px;">${escapeHtml(sum.from)} ~ ${escapeHtml(sum.to)}</span></h3>
-      <div class="table-wrap"><table>
-        <tbody>
-          <tr><td>판매 금액</td><td style="text-align:right;"><b>${fmtWon(sum.sales.revenue)}</b></td></tr>
-          <tr><td class="muted">− 쇼핑몰·PG 판매수수료</td><td style="text-align:right;" class="muted">${fmtWon(sum.sales.fee)}</td></tr>
-          <tr><td class="muted">− 환불</td><td style="text-align:right;" class="muted">${fmtWon(sum.sales.refund)}</td></tr>
-          <tr><td><b>= 실입금</b></td><td style="text-align:right;"><b>${fmtWon(sum.sales.netRevenue)}</b></td></tr>
-          <tr><td class="muted">− 자산 매입원가</td><td style="text-align:right;" class="muted">${fmtWon(sum.sales.buyCost)}</td></tr>
-          <tr><td class="muted">− 수리비(A/S 포함)</td><td style="text-align:right;" class="muted">${fmtWon(sum.sales.repairCost)}</td></tr>
-          ${sum.sales.repairVat ? `<tr>
-            <td class="muted" style="padding-left:16px;">그중 부가세 <span class="muted">(매입세액)</span></td>
-            <td style="text-align:right;" class="muted"
-              title="수리비 총액에 포함된 부가세입니다. 매출 부가세에서 뺄 수 있습니다.&#10;공급가 ${fmtWon(sum.sales.repairNet)} + 부가세 ${fmtWon(sum.sales.repairVat)} = ${fmtWon(sum.sales.repairCost)}"
-              >${fmtWon(sum.sales.repairVat)}</td></tr>` : ""}
-          <tr><td class="muted">− 출고 택배비</td><td style="text-align:right;" class="muted">${fmtWon(sum.sales.shippingCost)}</td></tr>
-          <tr><td><b>= 마진</b></td><td style="text-align:right;"><b style="color:${marginColor};">${fmtWon(sum.sales.margin)}</b></td></tr>
-        </tbody>
-      </table></div>
-      <p class="muted" style="margin-top:8px;">출고 확인된 주문과, 그 주문에 매칭된 자산의 원가로 계산합니다.
-      A/S 무상 처리 비용 ${fmtWon(sum.as.companyCost)}(${sum.as.tickets}건)은 해당 자산에 반영된 경우만 포함됩니다.
-      ${!sum.sales.fee && !sum.sales.shippingCost
-        ? `<br><b>수수료·택배비가 0입니다</b> — 설정 &gt; 정산에서 몰별 요율과 택배비를 넣으면 실제로 남는 돈 기준으로 바뀝니다.` : ""}</p>
-    </div>
-
     <div class="card">
       <div class="inline-row">
         <h3 style="margin:0; flex:1;">무엇이 남는 장사인가</h3>
@@ -143,18 +113,28 @@ async function loadReports() {
     </div>
 
     <div class="card">
-      <div class="inline-row">
-        <h3 style="margin:0; flex:1;">매출 대장</h3>
-        <button class="btn btn-sm" id="rp-ledger-export">📤 엑셀 내보내기</button>
-      </div>
-      <p class="muted" style="margin:4px 0 8px;">주문 한 건이 한 줄 — 판매가부터 마진까지. 세무·정산에 그대로 씁니다.</p>
-      <div id="rp-ledger"><p class="muted">불러오는 중…</p></div>
+      <h3>채널별 판매</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>채널</th><th>출고 건수</th><th>판매 금액</th></tr></thead>
+        <tbody>${chans.map((c) => `
+          <tr><td>${chBadge(c.channel)}</td><td>${c.orders}건</td><td>${fmtWon(c.revenue)}</td></tr>`).join("")
+          || `<tr><td colspan="3" class="muted">출고 내역이 없습니다.</td></tr>`}
+        </tbody></table></div>
+      ${(slipChans || []).length ? `
+      <h3 style="margin-top:14px;">TMS 전표 채널별
+        <span class="muted" style="font-size:13px;">— 방문·B2B 등, 몰 주문과 합산하지 않음</span></h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>채널</th><th>전표</th><th>수량</th><th>판매 금액</th></tr></thead>
+        <tbody>${slipChans.map((c) => `
+          <tr><td>${chBadge(c.channel)}</td><td>${c.slips}건</td><td>${c.qty}대</td>
+          <td>${fmtWon(c.revenue)}</td></tr>`).join("")}
+        </tbody></table></div>` : ""}
     </div>
 
     <div class="card">
-      <h3>월별 추이</h3>
+      <h3>월별 추이 <span class="muted" style="font-size:13px;">TMS 전표는 몰 주문과 별도 집계(합산 아님)</span></h3>
       <div class="table-wrap"><table>
-        <thead><tr><th>월</th><th>매입</th><th style="width:28%;"></th><th>판매</th><th style="width:28%;"></th></tr></thead>
+        <thead><tr><th>월</th><th>매입</th><th style="width:22%;"></th><th>판매(몰)</th><th style="width:22%;"></th><th>TMS 전표</th></tr></thead>
         <tbody>${months.map((m) => `
           <tr>
             <td><b>${escapeHtml(m.month)}</b></td>
@@ -164,28 +144,9 @@ async function loadReports() {
             <td>${fmtWon(m.revenue)}<div class="muted" style="font-size:12px;">${m.orders}건</div></td>
             <td><div style="background:var(--primary-soft); border-radius:4px; height:8px;">
               <div style="width:${Math.round(m.revenue / maxRevenue * 100)}%; background:var(--primary); height:8px; border-radius:4px;"></div></div></td>
-          </tr>`).join("") || `<tr><td colspan="5" class="muted">데이터가 없습니다.</td></tr>`}
-        </tbody></table></div>
-    </div>
-
-    <div class="card">
-      <h3>채널별 판매</h3>
-      <div class="table-wrap"><table>
-        <thead><tr><th>채널</th><th>출고 건수</th><th>판매 금액</th></tr></thead>
-        <tbody>${chans.map((c) => `
-          <tr><td>${chBadge(c.channel)}</td><td>${c.orders}건</td><td>${fmtWon(c.revenue)}</td></tr>`).join("")
-          || `<tr><td colspan="3" class="muted">출고 내역이 없습니다.</td></tr>`}
-        </tbody></table></div>
-    </div>
-
-    <div class="card">
-      <h3>담당자 실적</h3>
-      <div class="table-wrap"><table>
-        <thead><tr><th>담당자</th><th>제작 완료</th><th>출고 확인</th><th>출고 마감</th><th>합계</th></tr></thead>
-        <tbody>${staff.map((s) => `
-          <tr><td><b>${escapeHtml(s.name)}</b></td><td>${s.production}</td><td>${s.inspection}</td>
-          <td>${s.shipping}</td><td><b>${s.production + s.inspection + s.shipping}</b></td></tr>`).join("")
-          || `<tr><td colspan="5" class="muted">기록이 없습니다.</td></tr>`}
+            <td>${m.slipRevenue ? fmtWon(m.slipRevenue) : "-"}<div class="muted" style="font-size:12px;">${
+              m.slipCount ? m.slipCount + "건" : ""}</div></td>
+          </tr>`).join("") || `<tr><td colspan="6" class="muted">데이터가 없습니다.</td></tr>`}
         </tbody></table></div>
     </div>
 
@@ -206,13 +167,10 @@ async function loadReports() {
         </tbody></table></div>
     </div>`;
 
-  $("#rp-ledger-export").addEventListener("click", () =>
-    window.open(`/api/reports/ledger/export${qs}`, "_blank"));
   $$("button[data-profit]", host).forEach((b) => b.addEventListener("click", () => {
     state.profitBy = b.dataset.profit;
-    loadReports();
+    loadAnalysis(root);
   }));
-  loadLedger(qs);
   loadProfitability(qs);
 }
 
@@ -242,7 +200,26 @@ async function loadProfitability(qs) {
   } catch (err) { host.innerHTML = `<p class="muted">${escapeHtml(err.message)}</p>`; }
 }
 
-/* 매출 대장 */
+/* ── 매출 대장 — 주문 1건 1줄, 세무·정산용. 엑셀로 그대로 나간다 ── */
+function renderLedgerView(host) {
+  const f = repFilter();
+  host.innerHTML = repFilterHtml(f) + `
+    <div class="card">
+      <div class="inline-row">
+        <h3 style="margin:0; flex:1;">매출 대장</h3>
+        <button class="btn btn-sm" id="rp-ledger-export">📤 엑셀 내보내기</button>
+      </div>
+      <p class="muted" style="margin:4px 0 8px;">주문 한 건이 한 줄 — 판매가부터 마진까지. 세무·정산에 그대로 씁니다.</p>
+      <div id="rp-ledger"><p class="muted">불러오는 중…</p></div>
+    </div>`;
+  const reload = () => loadLedger(`?from=${f.from}&to=${f.to}`);
+  wireRepFilter(host, f, reload);
+  $("#rp-ledger-export", host).addEventListener("click", () =>
+    window.open(`/api/reports/ledger/export?from=${f.from}&to=${f.to}`, "_blank"));
+  reload();
+}
+
+/* 매출 대장 표 */
 async function loadLedger(qs) {
   const host = $("#rp-ledger");
   if (!host) return;

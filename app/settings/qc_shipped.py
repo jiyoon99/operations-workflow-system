@@ -1,16 +1,16 @@
-"""QC 프로그램에서 이미 출고된 고객을 HMS 셋팅/QC 보드에서 내린다.
+"""QC 프로그램에서 이미 출고된 고객을 OWS 셋팅/QC 보드에서 내린다.
 
 대표 지시(2026-08-05):
   "QC 시스템은 [금일 출고 확인 엑셀]을 누르면 작업목록에서 다 빠지고 출고처리가 된다.
-   그러다 보니 출고가 끝난 제품 이력이 없고 HMS 셋팅/QC 라인에 다 남아 있다.
-   \\\\192.168.0.185\\order-data 를 확인해 출고된 고객들을 HMS에 그대로 반영해 달라."
+   그러다 보니 출고가 끝난 제품 이력이 없고 OWS 셋팅/QC 라인에 다 남아 있다.
+   \\\\127.0.0.1\\order-data 를 확인해 출고된 고객들을 OWS에 그대로 반영해 달라."
 
 ★왜 자동으로 안 이어졌나 (2026-08-05 실측)
   같은 주문이 **두 개의 키**로 존재한다.
     · QC 프로그램 : 엑셀 수집분 → importKey "주문수집:4CDDFF703D" / 주문번호 "수집-…"
-    · HMS         : 몰 API 수집분 → 그 몰의 주문번호
+    · OWS         : 몰 API 수집분 → 그 몰의 주문번호
   qc_watch는 import_key가 같은 것만 잇는다. 키가 다르니 영영 못 만나고,
-  QC에서는 출고가 끝났는데 HMS 보드에는 계속 남는다(잔여 166건 중 46건이 이 경우).
+  QC에서는 출고가 끝났는데 OWS 보드에는 계속 남는다(잔여 166건 중 46건이 이 경우).
 
 ★매칭 규칙 — 사람이 눈으로 확인할 수 있게 근거를 함께 남긴다
   수령인은 반드시 같아야 하고, 그 위에 상품명·상품코드·금액·주문일로 점수를 매긴다.
@@ -37,7 +37,7 @@ from ..auth.perms import require
 from ..db import tx
 from . import bp
 from .qc_import import _s
-from .qc_watch import _cfg, _orders_file
+from .qc_watch import _cfg, _orders_file, qc_live
 
 # 근거 점수 — 이 값 이상이어야 '확정 후보'로 올린다.
 #   상품명 일치(2) + 주문일 근접(1) = 3 이 가장 흔한 조합이다.
@@ -46,8 +46,8 @@ NEAR_DAYS = 14
 
 # ★한쪽이 다른 쪽으로 시작하면 같은 상품으로 본다(2026-08-05 실측).
 #   같은 주문인데 표기가 다르다 —
-#     HMS 코드 'NT371B5M_i7-7_내장'  ⊂  QC 코드 'NT371B5M_i7-7_내장 AA급2'
-#     HMS 이름 'NT371B5M_i7-7_내장 AA급2' ⊂ QC 이름 'NT371B5M_i7-7_내장 AA급2 / 단일색상 …'
+#     OWS 코드 'NT371B5M_i7-7_내장'  ⊂  QC 코드 'NT371B5M_i7-7_내장 AA급2'
+#     OWS 이름 'NT371B5M_i7-7_내장 AA급2' ⊂ QC 이름 'NT371B5M_i7-7_내장 AA급2 / 단일색상 …'
 #   짧은 글자가 우연히 겹치는 것을 막으려고 최소 길이를 둔다.
 PREFIX_MIN = 8
 
@@ -116,7 +116,7 @@ def _load_nas(base):
 
 
 def _score(row, n):
-    """HMS 주문 row 와 QC 주문 n 이 같은 건일 근거를 점수와 말로 돌려준다."""
+    """OWS 주문 row 와 QC 주문 n 이 같은 건일 근거를 점수와 말로 돌려준다."""
     pts, why = 0, []
     for col, key, label in (("product_name", "productName", "상품명"),
                             ("product_code", "productCode", "제품코드")):
@@ -146,11 +146,11 @@ def _score(row, n):
 
 
 def _existing_qc_rows(conn):
-    """QC 주문번호 → 이미 HMS에 들어와 있는 주문 행.
+    """QC 주문번호 → 이미 OWS에 들어와 있는 주문 행.
 
     ★QC 이관(설정 ▸ 데이터 이관)으로 들어온 주문은 import_key가
       '주문수집:고도몰:수집-A117193B5F' 처럼 QC 주문번호를 끝에 달고 있다.
-      같은 주문이 몰 API로도 한 번 더 들어와 있으면 **HMS에 같은 주문이 두 줄**이 된다.
+      같은 주문이 몰 API로도 한 번 더 들어와 있으면 **OWS에 같은 주문이 두 줄**이 된다.
     """
     out = {}
     for r in conn.execute(
@@ -163,7 +163,7 @@ def _existing_qc_rows(conn):
 
 
 def _plan_shipped(conn, base):
-    """QC에서 출고됐는데 HMS 보드에 남아 있는 주문을 찾는다."""
+    """QC에서 출고됐는데 OWS 보드에 남아 있는 주문을 찾는다."""
     shipped, read, total = _load_nas(base)
     rows = conn.execute(
         "SELECT id, import_key, channel, order_no, recipient, amount, product_code, "
@@ -185,7 +185,7 @@ def _plan_shipped(conn, base):
         }
 
     def _dup_note(qno, oid):
-        """★그 QC 주문이 이미 HMS에 주문 행으로 들어와 있으면 (상대 행, 안내문)을 준다.
+        """★그 QC 주문이 이미 OWS에 주문 행으로 들어와 있으면 (상대 행, 안내문)을 준다.
 
         같은 주문이 두 줄(QC 이관분 + 몰 API 수집분)인 것이다. 한쪽은 대개 이미 출고완료다.
         여기서 두 번째 줄까지 출고완료로 찍으면 매출·출고 건수가 그대로 두 배가 된다
@@ -232,8 +232,8 @@ def _plan_shipped(conn, base):
             item["note"] = "근거가 같은 후보가 둘 이상입니다"
             unsure.append(item)
 
-    # 2단계 — ★QC 주문 하나는 HMS 주문 하나에만 붙인다(1:1).
-    #   이게 없으면 QC에 1건인데 HMS에 2건인 고객에서 **안 나간 물건까지 출고완료**가 된다
+    # 2단계 — ★QC 주문 하나는 OWS 주문 하나에만 붙인다(1:1).
+    #   이게 없으면 QC에 1건인데 OWS에 2건인 고객에서 **안 나간 물건까지 출고완료**가 된다
     #   (2026-08-05 실측: 이명규·안호열 2명 4건이 그렇게 처리됐다).
     #   같은 QC 주문을 놓고 다투면 점수가 높은 쪽만 가져가고, 나머지는 '애매'로 남긴다.
     #   점수까지 같으면 어느 쪽인지 알 수 없으므로 **둘 다** 애매로 뺀다.
@@ -287,11 +287,11 @@ def _also_shipped(conn, base):
     """자동 반영 기준엔 못 미치지만 **QC에 출고 기록이 있는** 보드 주문.
 
     ★왜 필요한가(대표 2026-08-05: "출고 완료인 제품인데 왜 제작대기에 있는지 알 수 있나?")
-      HMS와 QC는 금액을 다르게 적는다 —
-        · HMS = **주문 단위 합계**(여러 상품·여러 대를 한 줄로)
+      OWS와 QC는 금액을 다르게 적는다 —
+        · OWS = **주문 단위 합계**(여러 상품·여러 대를 한 줄로)
         · QC  = **상품/대수 단위 개별 금액**
-      예: 조용원 HMS 660,000원(2대) ↔ QC 340,000원(1대 단가, 관리번호 2개)
-          김병엽 HMS 259,000원(키보드+노트북) ↔ QC 10,000원(키보드만)
+      예: 조용원 OWS 660,000원(2대) ↔ QC 340,000원(1대 단가, 관리번호 2개)
+          김병엽 OWS 259,000원(키보드+노트북) ↔ QC 10,000원(키보드만)
       그래서 금액이 크게 달라 자동 반영에서 빠진다. 그건 안전상 맞지만,
       **작업자에게는 알려 줘야** 이미 나간 물건을 또 만들지 않는다.
     """
@@ -326,15 +326,23 @@ def _also_shipped(conn, base):
 
 @bp.get("/qc-shipped/flags")
 def qc_shipped_flags():
-    """셋팅 보드 행에 붙일 표시 — 'QC에서는 이미 출고됨'."""
+    """셋팅 보드 행에 붙일 표시 — 'QC에서는 이미 출고됨'.
+
+    ★2026-08-07 대표 지시로 연동을 끈 뒤로는 늘 빈 값이다. 셋팅/QC를 OWS에서 직접
+      쓰기 시작했으므로 남의 폴더를 들여다볼 이유가 없다. 라우트를 지우지 않은 것은
+      화면이 이걸 부르다 404를 만나 깨지지 않게 하려는 것뿐이다.
+    """
     require("setup.view")
+    if not qc_live():
+        return jsonify({"flags": {}, "count": 0, "live": False})
     with tx() as conn:
         cfg = _cfg(conn)
         try:
             items = _also_shipped(conn, cfg["path"])
         except Exception:                                        # noqa: BLE001
             items = []            # 폴더가 끊겼을 뿐 — 작업은 계속돼야 한다
-    return jsonify({"flags": {str(x["id"]): x for x in items}, "count": len(items)})
+    return jsonify({"flags": {str(x["id"]): x for x in items}, "count": len(items),
+                    "live": True})
 
 
 @bp.get("/qc-shipped/preview")

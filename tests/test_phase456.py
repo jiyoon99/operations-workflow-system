@@ -20,7 +20,7 @@ ADMIN_PW = "admin-pass-1"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-p456-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-p456-"))
         self.db_path = self.tmp / "test.db"
         self.app = create_app(db_path=self.db_path)
         self.app.testing = True
@@ -231,6 +231,165 @@ class TestReports(Base):
         self.assertEqual(c.get("/api/reports/summary").status_code, 403)
 
 
+class TestLotteonMapping(Base):
+    """롯데온 실응답 매핑(2026-08-31 실주문으로 키 확정 — 주문번호/일시/상품코드만 오고
+    수취인·연락처·주소·상품명·판매자코드가 비던 사고). 실키: dvpCustNm/dvpMphnNo/dvpZipNo/
+    dvpStnmZipAddr+DtlAddr/spdNm/sitmNm/epdNo/odCmptDttm/slAmt. 이 행 모양이 바뀌면
+    수집이 다시 반쪽이 된다 — 실측 응답 그대로(값만 가짜) 핀한다."""
+
+    ROW = {
+        "odNo": "2026083118432195", "odSeq": "1", "procSeq": "1",
+        "odPrgsStepCd": "11", "odTypCd": "10", "odQty": 1.0,
+        "odCmptDttm": "20260831143001",
+        "odrNm": "주문자", "mphnNo": "01000000000",
+        "dvpCustNm": "김수취", "dvpMphnNo": "01012345678", "dvpTelNo": "",
+        "dvpZipNo": "06000", "dvpStnmZipAddr": "서울특별시 강남구 테헤란로 1",
+        "dvpStnmDtlAddr": "101동 202호",
+        "dvMsg": "문 앞에 놓아주세요",
+        "spdNm": "레노버 씽크패드 X13 Gen3 초경량 노트북", "sitmNm": "단일옵션",
+        "spdNo": "LO2746331973", "sitmNo": "LO2746331973_2746331974",
+        "epdNo": "X13 Gen3_i5-12_내장 AA",
+        "slPrc": 690000.0, "slAmt": 690000.0, "actualAmt": 652920.0,
+        "fvrAmtSum": 37080.0, "prEntpShrAmtSum": 0.0, "prSfcoShrAmtSum": 29664.0,
+        "pdAdtnOptJsn": [],
+        "ifCplYN": "N",
+    }
+
+    def _adapter(self):
+        from app.malls.lotteon import LotteonAdapter
+        return LotteonAdapter({"api_key": "LK"})
+
+    def test_실응답_행이_전부_매핑된다(self):
+        out = self._adapter()._build_orders([dict(self.ROW)])
+        self.assertEqual(len(out), 1)
+        o = out[0]
+        self.assertEqual(o["orderNumber"], "2026083118432195")
+        self.assertEqual(o["orderedAt"], "2026-08-31 14:30:01", "주문일시(odCmptDttm)가 안 잡힌다")
+        self.assertEqual(o["recipient"], "김수취", "수취인(dvpCustNm)이 안 잡힌다")
+        self.assertEqual(o["phone"], "01012345678", "연락처(dvpMphnNo)가 안 잡힌다")
+        self.assertEqual(o["postalCode"], "06000")
+        self.assertEqual(o["address"], "서울특별시 강남구 테헤란로 1 101동 202호",
+                         "주소(dvpStnmZipAddr+DtlAddr)가 안 잡힌다")
+        self.assertEqual(o["productName"], "레노버 씽크패드 X13 Gen3 초경량 노트북",
+                         "상품명(spdNm)이 안 잡힌다")
+        # ★등급 꼬리(" AA")째 그대로 저장한다(2026-09-01 적대 리뷰) — 롯데온은 상품명·옵션
+        # 어디에도 등급이 없어 이 꼬리가 유일한 등급 운반체다(떼면 영구 소실). 고도몰
+        # 스펙·재고 대조는 sku_of/lookup_any 폴백이 꼬리를 떼어 맞춘다.
+        self.assertEqual(o["productCode"], "X13 Gen3_i5-12_내장 AA",
+                         "판매자 상품코드(epdNo)가 등급 꼬리째 보존돼야 한다")
+        # 롯데온 내부번호는 제품코드가 아니라 몰 상품 식별자 축으로(대표 9/1)
+        self.assertEqual(o["mallProductId"], "LO2746331973")
+        self.assertEqual(o["mallItemId"], "LO2746331973_2746331974")
+        self.assertEqual(o["optionName"], "단일옵션")
+        self.assertEqual(o["deliveryMessage"], "문 앞에 놓아주세요")
+        # 매출 = 판매금액(slAmt) − 업체 분담 할인(0) — 고객 실결제(652,920)로 과소잡지 않는다
+        self.assertEqual(o["amount"], 690000)
+        self.assertEqual(o["quantity"], 1)
+
+    def test_업체_분담_할인은_매출에서_뺀다(self):
+        row = dict(self.ROW)
+        row["prEntpShrAmtSum"] = 20000.0
+        o = self._adapter()._build_orders([row])[0]
+        self.assertEqual(o["amount"], 670000, "우리(업체) 분담 쿠폰만 매출에서 빠져야 한다")
+
+    def test_롯데온_내부번호는_제품코드_칸에_안_들어간다(self):
+        """대표 9/1 "롯데온 고유코드는 필요하지 않아" — epdNo(판매자 코드 계열)가 없으면
+        제품코드는 비워 둔다(LO번호가 박히면 고도몰 매칭만 막고, 빈 칸 보강도 못 받는다).
+        내부번호는 mallProductId 로 보존된다."""
+        row = dict(self.ROW)
+        row["epdNo"] = ""
+        o = self._adapter()._build_orders([row])[0]
+        self.assertEqual(o["productCode"], "", "몰 내부번호가 제품코드 칸에 들어가면 안 된다")
+        self.assertEqual(o["mallProductId"], "LO2746331973", "내부번호 보존 축이 비었다")
+
+    def test_추가옵션_JSON이_옵션으로_붙는다(self):
+        row = dict(self.ROW)
+        row["pdAdtnOptJsn"] = '[{"optNm": "RAM 16GB 추가", "optPrc": 40000}]'
+        o = self._adapter()._build_orders([row])[0]
+        self.assertIn("RAM 16GB 추가", o["optionName"], "추가옵션(pdAdtnOptJsn)이 옵션에 안 남는다")
+
+    def test_반쪽_저장된_기존_주문은_재수집이_채운다(self):
+        """키 누락 사고로 상품명/전화/금액이 비어 저장된 주문(라이브 #2502)은
+        고친 어댑터로 재수집하면 빈 칸이 보강된다 — 있는 값은 덮지 않는다."""
+        from app.importers.dedupe import new_unique_orders
+        existing = [{"importKey": "롯데온:2026083118432195", "orderNumber": "2026083118432195",
+                     "channel": "롯데온", "recipient": "", "phone": "", "postalCode": "",
+                     "address": "", "deliveryMessage": "", "productName": "",
+                     "productCode": "LO2746331973", "orderedAt": "", "amount": 0,
+                     "quantity": 1, "optionName": "", "archivedAt": "", "cancelledAt": "",
+                     "shippingDone": False}]
+        fetched = self._adapter()._build_orders([dict(self.ROW)])
+        added, _updates = new_unique_orders(existing, fetched, now="2026-08-31T19:00:00")
+        self.assertEqual(added, [], "같은 주문번호가 새 줄로 또 들어가면 안 된다")
+        ex = existing[0]
+        self.assertEqual(ex["productName"], "레노버 씽크패드 X13 Gen3 초경량 노트북",
+                         "재수집이 빈 상품명을 안 채운다")
+        self.assertEqual(ex["phone"], "01012345678")
+        self.assertEqual(ex["orderedAt"], "2026-08-31 14:30:01")
+        self.assertEqual(ex["amount"], 690000, "0원 금액이 재수집으로 안 채워진다")
+        # ★박힌 몰 내부번호(LO번호)는 자사 코드 축(epdNo)으로 자동 교체된다(대표 9/1
+        #   "롯데온 고유코드는 필요하지 않아" — 칸 비우는 수작업 없이 재수집이 바로잡음)
+        self.assertEqual(ex["productCode"], "X13 Gen3_i5-12_내장 AA",
+                         "몰 내부번호가 자사 코드로 승격 안 된다")
+        # 수취인은 바로 덮지 않고 '배송지 변경 확인'으로 뜬다(운영자 승인 후 반영)
+        self.assertIn("pendingShippingUpdate", ex)
+
+    def test_코드_모양인_기존_제품코드는_덮지_않는다(self):
+        """승격 규칙의 안전핀 — 사람이 넣은(또는 이미 올바른) 자사 코드는 재수집 값과
+        달라도 절대 안 덮는다. 승격은 '몰 내부번호 → 자사 코드' 한 방향뿐이다."""
+        from app.importers.dedupe import new_unique_orders
+        existing = [{"importKey": "롯데온:2026083118432195", "orderNumber": "2026083118432195",
+                     "channel": "롯데온", "recipient": "김수취", "phone": "01012345678",
+                     "postalCode": "06000", "address": "서울특별시 강남구 테헤란로 1 101동 202호",
+                     "deliveryMessage": "문 앞에 놓아주세요", "productName": "이미 있는 이름",
+                     "productCode": "840 G3_i7-6_내장", "orderedAt": "2026-08-31 14:30:01",
+                     "amount": 690000, "quantity": 1, "optionName": "단일옵션",
+                     "archivedAt": "", "cancelledAt": "", "shippingDone": False}]
+        fetched = self._adapter()._build_orders([dict(self.ROW)])
+        new_unique_orders(existing, fetched, now="2026-09-01T12:00:00")
+        self.assertEqual(existing[0]["productCode"], "840 G3_i7-6_내장",
+                         "코드 모양인 기존 값이 재수집 값으로 덮였다")
+
+    def test_보강_값이_DB까지_써진다(self):
+        """merge 가 채운 상품명/주문일시/금액이 writeback UPDATE 에 실려 실제로 저장돼야
+        한다(2026-09-01 발견: UPDATE 에 컬럼이 빠져 메모리에서만 채워지고 버려졌다 —
+        재시작·재수집을 해도 화면이 그대로던 원인)."""
+        import json as _json
+
+        from app.db import tx
+        from app.importers.dedupe import new_unique_orders
+        from app.orders.mapping import insert_import_dict, row_to_import_dict, writeback_changed
+        half = {"importKey": "롯데온:2026083118432195", "orderNumber": "2026083118432195",
+                "channel": "롯데온", "sourceFile": "API:lotteon", "orderedAt": "",
+                "productName": "", "optionName": "", "productCode": "LO2746331973",
+                "quantity": 1, "amount": 0, "recipient": "", "phone": "",
+                "postalCode": "", "address": "", "deliveryMessage": "", "memo": ""}
+        fetched = self._adapter()._build_orders([dict(self.ROW)])
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                oid = insert_import_dict(conn, half, "시험")
+                rows = conn.execute("SELECT * FROM orders").fetchall()
+                existing = [row_to_import_dict(r) for r in rows]
+                snapshot = {d["_rowId"]: _json.dumps(d, ensure_ascii=False,
+                                                     sort_keys=True, default=str)
+                            for d in existing}
+                added, _u = new_unique_orders(existing, fetched, now="2026-09-01T10:00:00")
+                self.assertEqual(added, [], "같은 주문이 새 줄로 들어가면 안 된다")
+                changed = writeback_changed(conn, snapshot, existing)
+                self.assertGreaterEqual(changed, 1, "보강 변경이 DB 반영 대상으로 안 잡혔다")
+                row = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        self.assertEqual(row["product_name"], "레노버 씽크패드 X13 Gen3 초경량 노트북",
+                         "상품명 보강이 DB 에 안 써졌다")
+        self.assertEqual(row["ordered_at"], "2026-08-31 14:30:01")
+        self.assertEqual(row["amount"], 690000)
+        self.assertEqual(row["phone"], "01012345678")
+        self.assertEqual(row["address"], "서울특별시 강남구 테헤란로 1 101동 202호")
+        self.assertTrue(row["pending_update"], "수취인은 '배송지 변경 확인'으로 떠야 한다")
+        # 몰 내부번호 → 자사 코드 승격이 writeback 을 타고 DB까지 써져야 한다(대표 9/1)
+        self.assertEqual(row["product_code"], "X13 Gen3_i5-12_내장 AA",
+                         "제품코드 승격이 DB 에 안 써졌다")
+
+
 class TestAllMallAdapters(Base):
     """몰 8곳 어댑터 — 키만 넣으면 바로 쓸 수 있어야 한다."""
 
@@ -395,7 +554,6 @@ class TestAuditFixes0729(Base):
     def test_recall_waybill_not_treated_as_shipment(self):
         """회수 송장이 생겨도 그 주문의 출고 송장 자리를 차지하면 안 된다."""
         o, _a = self.make_shipped_order()
-        self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": False})
         fwd = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"]
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": True})
         self.client.post(f"/api/orders/{o['id']}/recall", json={"reason": "반품"})
@@ -407,17 +565,19 @@ class TestAuditFixes0729(Base):
     def test_recall_does_not_block_reissue(self):
         """회수 송장 때문에 '이미 발행된 송장이 있습니다'로 막히면 교환 흐름이 죽는다."""
         o, _a = self.make_shipped_order()
-        self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": False})
         wid = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"]
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": True})
         self.client.post(f"/api/orders/{o['id']}/recall", json={})
         self.client.post(f"/api/waybills/{wid}/cancel")   # 출고 송장만 취소
-        self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": False})
         r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
 
     def test_as_recall_asset_is_not_sellable(self):
         """★A/S로 받은 고객 물건이 판매 재고로 섞이면 남의 노트북을 팔게 된다."""
+        # ★'중복 매칭 허용'(2026-08-31, 기본 켜짐)을 끄고 차단 모드의 안전핀을 검증한다
+        #   — A/S 자산은 원 주문 연결이 남아 있어 허용 모드에선 검색 후보(available)로 뜬다
+        self.assertEqual(self.client.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": False}}).status_code, 200)
         o, a = self.make_shipped_order()
         t = self.client.post("/api/as-tickets", json={
             "customer": "홍길동", "phone": "010-1111-2222", "address": "서울시 강남구 1",
@@ -486,17 +646,31 @@ class TestInvoicePush(Base):
             required_keys = ("token",)
             sent = []
             fail = False
+            attempts = 0
+            snos = []           # upload_invoice 가 받은 sno
+            fetched = {}        # order_no -> sno (fetch_sno 폴백이 돌려줄 값)
+            fetch_calls = []
+
+            def fetch_sno(self, order_no, ordered_at=""):
+                PushFake.fetch_calls.append((order_no, ordered_at))
+                return PushFake.fetched.get(order_no, "")
 
             def collect_orders(self, since, until):
                 return []
 
             def upload_invoice(self, order_no, invoice_no, courier_code="", sno=""):
+                PushFake.attempts += 1
                 if PushFake.fail:
                     raise MallError("몰이 거부했습니다")
                 PushFake.sent.append((order_no, invoice_no, courier_code))
+                PushFake.snos.append(sno)
                 return True
         PushFake.sent = []
         PushFake.fail = False
+        PushFake.attempts = 0
+        PushFake.snos = []
+        PushFake.fetched = {}
+        PushFake.fetch_calls = []
         self.Fake = PushFake
 
     def _shipped(self, **kw):
@@ -508,7 +682,7 @@ class TestInvoicePush(Base):
         a = self.client.post("/api/assets", json={
             "categoryId": self.cats[0]["id"], "model": "L480", "qty": 1}).get_json()[0]
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": [a["id"]]})
-        for act in ("production", "softwareInspection"):
+        for act in ("production", "softwareInspection", "shipping"):
             self.client.patch(f"/api/orders/{o['id']}", json={"action": act, "value": True})
         self.client.post(f"/api/orders/{o['id']}/waybill", json={})   # 송장번호 채번
         # ★CJ 미설정이라 테스트 송장(999…)이 붙는다. 999는 몰 전송에서 제외되므로
@@ -528,7 +702,7 @@ class TestInvoicePush(Base):
         a = self.client.post("/api/assets", json={
             "categoryId": self.cats[0]["id"], "model": "L480", "qty": 1}).get_json()[0]
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": [a["id"]]})
-        for act in ("production", "softwareInspection"):
+        for act in ("production", "softwareInspection", "shipping"):
             self.client.patch(f"/api/orders/{o['id']}", json={"action": act, "value": True})
         self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         return o
@@ -610,6 +784,265 @@ class TestInvoicePush(Base):
         c.post("/api/auth/login", json={"username": "nopush", "password": "nopush-pw-1234"})
         self.assertEqual(c.get("/api/orders/invoice-push/pending").status_code, 403)
         self.assertEqual(c.post("/api/orders/invoice-push", json={"ids": [1]}).status_code, 403)
+
+    # ---------------- 2026-09-08 대표 "송장 발급하면 고도몰에도 반영되게" — 출고 확인 세 경로 전부
+    def _ready(self, order_no="M-2001"):
+        """출고 확인 '직전'까지 — 송장은 있고(실발행처럼 번호를 바꿔 둔다) 아직 출고 확인은 안 한 주문."""
+        o = self.client.post("/api/orders", json={
+            "channel": "전송몰", "orderNo": order_no, "recipient": "홍길동",
+            "productName": "노트북", "phone": "010-1111-2222",
+            "address": "서울시 강남구 1", "postalCode": "06000", "amount": 500000}).get_json()
+        a = self.client.post("/api/assets", json={
+            "categoryId": self.cats[0]["id"], "model": "L480", "qty": 1}).get_json()[0]
+        self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": [a["id"]]})
+        for act in ("production", "softwareInspection"):
+            self.client.patch(f"/api/orders/{o['id']}", json={"action": act, "value": True})
+        wid = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"]
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE orders SET tracking_no='612345678902' WHERE id=?", (o["id"],))
+        conn.execute("UPDATE waybills SET invoice_no='612345678902', status='issued' WHERE wid=?", (wid,))
+        conn.commit()
+        conn.close()
+        return o, wid
+
+    def _enable(self):
+        self.client.put("/api/settings", json={"malls": {
+            "pushfake": {"token": "T", "enabled": True, "push_invoice": True}}})
+
+    def test_금일_출고_확인도_몰로_보낸다(self):
+        """[🚚 금일 출고 확인]은 여러 건을 한 번에 마감한다 — 행 체크와 같은 규칙으로 몰에 보내야 한다.
+        예전에는 이 경로만 빠져 있어, 일괄 마감한 날은 전부 손으로 입력해야 했다."""
+        self._enable()
+        o, _ = self._ready()
+        r = self.client.post("/api/orders/ship-today", json={"ids": [o["id"]]})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        d = r.get_json()
+        self.assertEqual(d["shipped"], 1)
+        self.assertEqual(d["mallPush"]["sent"], 1, d["mallPush"])
+        self.assertEqual([s[0] for s in self.Fake.sent], ["M-2001"])
+        got = self.client.get(f"/api/orders/{o['id']}").get_json()
+        self.assertTrue(got["mallSentAt"], "주문에 '몰 전송됨'이 안 남았다")
+        self.assertEqual(self.client.get("/api/orders/invoice-push/pending").get_json(), [])
+
+    def test_CJ_간선상차_자동_출고_확인도_몰로_보낸다(self):
+        """★09-04 이후 출고 확인의 대부분은 사람이 아니라 CJ 추적(간선상차 11)이 한다.
+        그 경로가 몰에 안 보내면 '자동으로 나갔는데 몰에는 안 올라간' 건이 매일 쌓인다.
+        몰 호출은 DB 잠금 밖에서 해야 하므로 after 목록으로 넘겨 트랜잭션 뒤에 보낸다."""
+        self._enable()
+        o, wid = self._ready("M-2002")
+        from app.db import tx
+        from app.orders import recall as rc
+        res = {"ok": True, "data": {"PROC_LIST": [{"CRG_ST_CD": "11", "CRG_ST_NM": "간선상차"}]}}
+        after = []
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                w = conn.execute("SELECT * FROM waybills WHERE wid=?", (wid,)).fetchone()
+                self.assertTrue(rc._sync_one(conn, w, res, after=after))
+        self.assertIn(("mall_push", o["id"]), after, "자동 출고 확인이 몰 전송을 예약하지 않았다")
+        self.assertEqual(self.Fake.sent, [], "DB 잠금 안에서 몰을 불렀다(원칙 #1 위반)")
+        with self.app.app_context():
+            rc._notify_after(after)
+        self.assertEqual([s[0] for s in self.Fake.sent], ["M-2002"])
+        got = self.client.get(f"/api/orders/{o['id']}").get_json()
+        self.assertTrue(got["shippingDone"])
+        self.assertTrue(got["mallSentAt"])
+
+    def test_자동_출고_확인이_안_된_단계면_몰에_안_보낸다(self):
+        """집화완료(02)는 아직 출고 확인이 아니다 — 몰에도 배송중이라고 알리면 안 된다."""
+        self._enable()
+        o, wid = self._ready("M-2003")
+        from app.db import tx
+        from app.orders import recall as rc
+        res = {"ok": True, "data": {"PROC_LIST": [{"CRG_ST_CD": "02", "CRG_ST_NM": "집화완료"}]}}
+        after = []
+        with self.app.app_context():
+            with tx(write=True) as conn:
+                w = conn.execute("SELECT * FROM waybills WHERE wid=?", (wid,)).fetchone()
+                rc._sync_one(conn, w, res, after=after)
+            rc._notify_after(after)
+        self.assertEqual(self.Fake.sent, [])
+        self.assertFalse(self.client.get(f"/api/orders/{o['id']}").get_json()["shippingDone"])
+
+    def test_전송_실패는_주문에_사유가_남고_화면_칩으로_보인다(self):
+        self._enable()
+        self.Fake.fail = True
+        o, _ = self._ready("M-2004")
+        r = self.client.post("/api/orders/ship-today", json={"ids": [o["id"]]}).get_json()
+        self.assertEqual(r["mallPush"]["failed"], 1)
+        self.assertIn("거부", r["mallPush"]["messages"][0])
+        got = self.client.get(f"/api/orders/{o['id']}").get_json()
+        self.assertEqual(got["mallSentAt"], "")
+        self.assertIn("거부", got["mallSendError"])
+        js = (Path(__file__).resolve().parent.parent / "static" / "js" / "setup.js").read_text("utf-8")
+        self.assertIn("🛒 몰 전송", js, "셋팅 보드에 '몰 전송됨' 칩이 없다")
+        self.assertIn("⚠ 몰 미전송", js, "셋팅 보드에 실패 칩이 없다")
+        self.assertIn("o.mallSendError", js)
+
+    # ---------------- 2026-09-08 대표 "송장 뽑았는데 고도몰에 왜 안 들어가 있지" — 발급 즉시 전송 + 자동 스윕
+    def _inspected(self, order_no):
+        """SW 검수까지 끝나 송장을 뽑을 수 있는 주문(아직 송장 없음)."""
+        o = self.client.post("/api/orders", json={
+            "channel": "전송몰", "orderNo": order_no, "recipient": "홍길동",
+            "productName": "노트북", "phone": "010-1111-2222",
+            "address": "서울시 강남구 1", "postalCode": "06000", "amount": 500000}).get_json()
+        a = self.client.post("/api/assets", json={
+            "categoryId": self.cats[0]["id"], "model": "L480", "qty": 1}).get_json()[0]
+        self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": [a["id"]]})
+        for act in ("production", "softwareInspection"):
+            self.client.patch(f"/api/orders/{o['id']}", json={"action": act, "value": True})
+        return o
+
+    def _issue_real_like(self, o, invoice="612345678930"):
+        """CJ 미설정 환경에서 '실발행처럼' 송장을 뽑는다 — 테스트 번호(999…) 대신 진짜 모양의 번호.
+        발행본 상태도 실발행(issued)으로 맞춘다(스윕은 실발행본만 본다)."""
+        from unittest import mock
+        from app.orders import waybill as wb
+        with mock.patch.object(wb, "_next_test_invoice", return_value=invoice):
+            r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
+        if r.status_code == 201:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("UPDATE waybills SET status='issued' WHERE wid=?", (r.get_json()["wid"],))
+            conn.commit()
+            conn.close()
+        return r
+
+    def test_송장_발급_즉시_몰로_보낸다(self):
+        """기본값 — 대표가 몰 관리자에서 손으로 송장을 넣던 시점이 '뽑은 직후'다."""
+        self._enable()
+        o = self._inspected("M-3001")
+        r = self._issue_real_like(o)
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        d = r.get_json()
+        self.assertTrue(d["mallPush"] and d["mallPush"]["ok"], d.get("mallPush"))
+        self.assertEqual([s[0] for s in self.Fake.sent], ["M-3001"])
+        got = self.client.get(f"/api/orders/{o['id']}").get_json()
+        self.assertTrue(got["mallSentAt"])
+        self.assertFalse(got["shippingDone"], "발급이 출고 확인까지 켜면 안 된다(09-03 규칙)")
+        self.assertEqual(self.client.get("/api/orders/invoice-push/pending").get_json(), [])
+        # 나중에 출고 확인을 해도 두 번 보내지 않는다
+        r2 = self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": True})
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(len(self.Fake.sent), 1)
+
+    def test_테스트_발행은_발급_때도_안_나간다(self):
+        self._enable()
+        o = self._inspected("M-3002")
+        r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})     # 999… 테스트 번호
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        self.assertIsNone(r.get_json()["mallPush"])
+        self.assertEqual(self.Fake.sent, [])
+        self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["mallSendError"], "")
+
+    def test_발급_즉시를_끄면_출고_확인_때_보낸다(self):
+        """몰별 스위치 [송장 발급 즉시 전송]을 끄면 예전 동작(출고 확인 시점) 그대로다."""
+        self.client.put("/api/settings", json={"malls": {
+            "pushfake": {"token": "T", "enabled": True, "push_invoice": True, "push_on_issue": False}}})
+        o = self._inspected("M-3003")
+        r = self._issue_real_like(o, "612345678931")
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        self.assertIsNone(r.get_json()["mallPush"])
+        self.assertEqual(self.Fake.sent, [])
+        # 자동 스윕도 이 몰은 건드리지 않는다 — 출고 확인 전에 배송중이 되면 안 된다
+        from app.malls import invoice_push as ip
+        ip.reset_sweep_tries()
+        self.assertEqual(ip.sweep_pending(self.app)["sent"], 0)
+        self.assertEqual(self.Fake.sent, [])
+        r2 = self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": True})
+        self.assertTrue(r2.get_json()["mallPush"]["ok"], r2.get_json().get("mallPush"))
+        self.assertEqual([s[0] for s in self.Fake.sent], ["M-3003"])
+
+    def test_자동_전송이_꺼진_몰은_발급_때_오류를_남기지_않는다(self):
+        """꺼진 몰에서 발급할 때마다 '꺼져 있습니다'가 대기 목록에 쌓이면 진짜 실패가 묻힌다."""
+        self.client.put("/api/settings", json={"malls": {
+            "pushfake": {"token": "T", "enabled": True}}})
+        o = self._inspected("M-3004")
+        r = self._issue_real_like(o, "612345678932")
+        self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
+        self.assertIsNone(r.get_json()["mallPush"])
+        self.assertEqual(self.Fake.sent, [])
+        self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["mallSendError"], "")
+
+    def test_스윕이_놓친_최근_발급분을_보내고_옛_건은_건드리지_않는다(self):
+        """재시작 직후·몰 장애 뒤를 위한 그물. 48시간 지난 건은 고도몰 상태가 뒤로 갈 수 있어 사람 몫."""
+        from datetime import timedelta
+        from app import config
+        from app.malls import invoice_push as ip
+        self._enable()
+        self.Fake.fail = True                                   # 발급 순간에는 몰이 죽어 있었다
+        o1 = self._inspected("M-3005")
+        r1 = self._issue_real_like(o1, "612345678933")
+        self.assertEqual(r1.status_code, 201, r1.get_data(as_text=True))
+        self.assertFalse(r1.get_json()["mallPush"]["ok"])
+        self.assertIn("거부", self.client.get(f"/api/orders/{o1['id']}").get_json()["mallSendError"])
+        o2 = self._inspected("M-3006")
+        self.assertEqual(self._issue_real_like(o2, "612345678934").status_code, 201)
+        self.Fake.fail = False
+        conn = sqlite3.connect(self.db_path)                    # o2 는 사흘 전 발급으로 만든다
+        conn.execute("UPDATE waybills SET created_at=? WHERE order_id=?",
+                     ((config.now() - timedelta(days=3)).isoformat(timespec="seconds"), o2["id"]))
+        conn.commit()
+        conn.close()
+        ip.reset_sweep_tries()
+        res = ip.sweep_pending(self.app)
+        self.assertEqual(res["sent"], 1, res)
+        self.assertEqual([s[0] for s in self.Fake.sent], ["M-3005"])
+        self.assertTrue(self.client.get(f"/api/orders/{o1['id']}").get_json()["mallSentAt"])
+        self.assertEqual(self.client.get(f"/api/orders/{o1['id']}").get_json()["mallSendError"], "")
+        self.assertEqual(self.client.get(f"/api/orders/{o2['id']}").get_json()["mallSentAt"], "")
+        # 옛 건은 여전히 사람이 보는 대기 목록에 남는다
+        pend = self.client.get("/api/orders/invoice-push/pending").get_json()
+        self.assertEqual([p["orderNumber"] for p in pend], ["M-3006"])
+
+    def test_스윕은_계속_거부되는_건을_영원히_두드리지_않는다(self):
+        """상한은 자동 스윕에만 — 사람이 대기 목록에서 다시 보내면 나간다."""
+        from app.malls import invoice_push as ip
+        self._enable()
+        self.Fake.fail = True
+        o = self._inspected("M-3007")
+        self.assertEqual(self._issue_real_like(o, "612345678935").status_code, 201)
+        ip.reset_sweep_tries()
+        first = self.Fake.attempts
+        for _ in range(ip.MAX_TRIES + 3):
+            ip.sweep_pending(self.app)
+        self.assertEqual(self.Fake.attempts - first, ip.MAX_TRIES)
+        self.Fake.fail = False
+        res = self.client.post("/api/orders/invoice-push", json={"ids": [o["id"]]}).get_json()
+        self.assertEqual(res["ok"], 1, res)
+        self.assertEqual([s[0] for s in self.Fake.sent], ["M-3007"])
+
+    def test_주문상품_번호는_수집_원본에서_꺼내_보내고_없으면_몰에_물어본다(self):
+        """고도몰 sno — 2026-09-08 첫 실전송 5건 거부(898)의 수정. 수집분은 raw 에서, 옛 수집분은 fetch_sno 로."""
+        self._enable()
+        o1, _ = self._ready("M-4001")
+        o2, _ = self._ready("M-4002")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE orders SET raw=? WHERE id=?", (json.dumps({"mallSno": "11|12"}), o1["id"]))
+        conn.execute("UPDATE orders SET raw=NULL, ordered_at='2026-09-08 09:00' WHERE id=?", (o2["id"],))
+        conn.commit()
+        conn.close()
+        self.Fake.fetched["M-4002"] = "77"
+        res = self.client.post("/api/orders/invoice-push", json={"ids": [o1["id"], o2["id"]]}).get_json()
+        self.assertEqual(res["ok"], 2, res)
+        self.assertEqual(self.Fake.snos, ["11|12", "77"])
+        self.assertEqual(self.Fake.fetch_calls, [("M-4002", "2026-09-08 09:00")],
+                         "raw 에 있는 건은 몰에 묻지 않고, 없는 건만 한 번 묻는다")
+
+    def test_배선_발급_즉시_스위치와_스윕_데몬(self):
+        from app.malls import COMMON_FIELDS
+        f = next(x for x in COMMON_FIELDS if x["key"] == "push_on_issue")
+        self.assertIs(f.get("default"), True, "스위치 기본값이 켜짐이어야 한다(옛 설정에도 적용)")
+        self.assertEqual(f["type"], "bool")
+        root = Path(__file__).resolve().parent.parent
+        self.assertIn("start_push_sweeper", (root / "app" / "__init__.py").read_text("utf-8"))
+        self.assertIn("f.default", (root / "static" / "js" / "app.js").read_text("utf-8"),
+                      "설정 화면이 스위치 기본값(켜짐)을 모른다")
+        self.assertIn("mallPush", (root / "static" / "js" / "setup.js").read_text("utf-8"),
+                      "셋팅 보드 발급 토스트가 몰 전송 결과를 안 보여 준다")
+        # 몰 설정 API 가 default 를 화면까지 실어 나른다
+        regs = self.client.get("/api/mall-registry").get_json()
+        field = next((x for m in regs for x in (m.get("fields") or []) if x.get("key") == "push_on_issue"), None)
+        self.assertIsNotNone(field, "/api/mall-registry 가 push_on_issue 칸을 안 준다")
+        self.assertIs(field.get("default"), True)
 
 
 class TestAutoCollect(Base):
@@ -929,7 +1362,6 @@ class TestCategoryScope(Base):
         """송장 목록은 주문번호를 몰라도 고객 이름·전화·주소가 나열되는 곳이다."""
         other = self.cats[1]["id"]
         o, _a = self.make_shipped_order(recipient="남의고객", categoryId=other)
-        self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": False})
         wid = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"]
         c = self._scoped_user(self.cats[0]["id"])
         self.assertEqual(c.get("/api/waybills").get_json(), [])
@@ -1255,9 +1687,9 @@ class TestAsSms(Base):
         self.assertIn("운영 데이터가 아니라", log[0]["reason"])
 
     def test_env_var_alone_cannot_make_it_live(self):
-        """★HMS_DB로 사본을 가리켜도 '운영'으로 둔갑하면 안 된다.
+        """★OWS_DB로 사본을 가리켜도 '운영'으로 둔갑하면 안 된다.
 
-        예전 판정은 열린 DB를 config.DB_PATH와 비교했는데, 그 값 자체가 HMS_DB에서 나와
+        예전 판정은 열린 DB를 config.DB_PATH와 비교했는데, 그 값 자체가 OWS_DB에서 나와
         검증 서버에서 항상 참이 됐다(설정=API 키도 사본에 함께 딸려온다).
         """
         self._arm()
@@ -1476,7 +1908,6 @@ class TestSmallAuditFixes(Base):
     def test_waybills_manage_can_cancel(self):
         """'송장 관리(취소·재발행)' 권한이 설명대로 동작해야 한다."""
         o, _a = self.make_shipped_order()
-        self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": False})
         wid = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"]
         r = self.client.post("/api/users", json={
             "username": "wbmgr", "displayName": "송장관리", "password": "wbmgr-pw-1234",
@@ -1520,7 +1951,7 @@ class TestSmallAuditFixes(Base):
             "categoryId": self.cats[0]["id"], "model": "찾을모델", "grade": "AA", "qty": 1})
         self.client.post("/api/assets", json={
             "categoryId": self.cats[0]["id"], "model": "다른모델", "grade": "B급", "qty": 1})
-        listed = self.client.get("/api/assets?q=찾을모델").get_json()
+        listed = self.client.get("/api/assets?q=찾을모델").get_json()["rows"]
         self.assertEqual(len(listed), 1)
         r = self.client.get("/api/assets/export?q=찾을모델")
         self.assertEqual(r.status_code, 200)
@@ -1650,6 +2081,9 @@ class TestNoDoubleAssignment(Base):
 
     def test_cannot_match_asset_already_on_live_order(self):
         """데이터가 꼬여도 두 주문에 같은 자산을 붙일 수 없다."""
+        # ★'중복 매칭 허용'(2026-08-31, 기본 켜짐)을 끄고 차단 모드의 안전핀을 검증한다
+        self.assertEqual(self.client.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": False}}).status_code, 200)
         o1 = self.client.post("/api/orders", json={"recipient": "A", "productName": "N"}).get_json()
         a = self.client.post("/api/assets", json={
             "categoryId": self.cats[0]["id"], "model": "L480", "qty": 1}).get_json()[0]
@@ -1676,7 +2110,7 @@ class TestLegacyPurchaseTable(unittest.TestCase):
     """구형 테이블(supplier_id NOT NULL)이 있어도 가입고 전표가 만들어져야 한다."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-legacy-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-legacy-"))
         self.db_path = self.tmp / "legacy.db"
         conn = sqlite3.connect(self.db_path)
         conn.executescript("""
@@ -1741,7 +2175,7 @@ class TestLegacyRebuildKeepsAssetsUsable(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-legacy-fk-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-legacy-fk-"))
         self.db_path = self.tmp / "legacyfk.db"
         schema = (Path(__file__).resolve().parent.parent / "app" / "schema.sql").read_text("utf-8")
         conn = sqlite3.connect(self.db_path)
@@ -1766,7 +2200,8 @@ class TestLegacyRebuildKeepsAssetsUsable(unittest.TestCase):
         auth_mod._login_failures.clear()
         self.client.post("/api/auth/setup", json={
             "username": "admin", "displayName": "대표", "password": ADMIN_PW})
-        self.cat = self.client.post("/api/categories", json={"name": "노트북"}).get_json()
+        # '노트북'은 이제 기본 시드(sort 0)라 POST 하면 409 — 시드된 것을 쓴다(2026-09-03, A5)
+        self.cat = next(c for c in self.client.get("/api/categories").get_json() if c["name"] == "노트북")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1822,15 +2257,15 @@ class TestBackupSafety(Base):
         from app import db as db_mod
         bdir = db_mod.backup_dir(self.db_path)
         self.client.post("/api/orders", json={"recipient": "A", "productName": "노트북"})
-        first = sorted(p.name for p in bdir.glob("hms-*.db"))
+        first = sorted(p.name for p in bdir.glob("ows-*.db"))
         self.assertEqual(len(first), 1)
         # 아침에 백업이 만들어진 상황을 재현 — 5시간 전으로 돌린다(기본 주기 4시간)
         old = config.now().timestamp() - 5 * 3600
-        for p in bdir.glob("hms-*.db"):
+        for p in bdir.glob("ows-*.db"):
             os.utime(p, (old, old))
         self.client.post("/api/orders", json={"recipient": "B", "productName": "노트북"})
         # 백업은 '쓰기 직전' 상태를 담는다. 주기가 지났으므로 새로 만들어져 있어야 한다.
-        newest = max(bdir.glob("hms-*.db"), key=lambda p: p.stat().st_mtime)
+        newest = max(bdir.glob("ows-*.db"), key=lambda p: p.stat().st_mtime)
         self.assertLess(config.now().timestamp() - newest.stat().st_mtime, 60,
                         "주기가 지났는데 새 백업이 만들어지지 않았다")
         conn = sqlite3.connect(f"file:{newest}?mode=ro", uri=True)
@@ -1844,7 +2279,7 @@ class TestBackupSafety(Base):
         from app import db as db_mod
         for i in range(5):
             self.client.post("/api/orders", json={"recipient": f"고객{i}", "productName": "노트북"})
-        self.assertEqual(len(list(db_mod.backup_dir(self.db_path).glob("hms-*.db"))), 1)
+        self.assertEqual(len(list(db_mod.backup_dir(self.db_path).glob("ows-*.db"))), 1)
 
     def test_backup_download(self):
         name = self.client.post("/api/backups/run").get_json()["name"]
@@ -1852,8 +2287,8 @@ class TestBackupSafety(Base):
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.data.startswith(b"SQLite format 3"))
         # 경로 조작 차단
-        self.assertEqual(self.client.get("/api/backups/..%2F..%2Fhms.db/download").status_code, 404)
-        self.assertEqual(self.client.get("/api/backups/nothms.db/download").status_code, 400)
+        self.assertEqual(self.client.get("/api/backups/..%2F..%2Fows.db/download").status_code, 404)
+        self.assertEqual(self.client.get("/api/backups/notows.db/download").status_code, 400)
 
     def test_mirror_copy(self):
         """2차 사본이 다른 폴더에 실제로 만들어져야 한다(디스크 하나 고장 대비)."""
@@ -1885,27 +2320,27 @@ class TestBackupSafety(Base):
                          "임시 DB인데 2차 백업이 만들어졌다")
 
     def test_mirror_skipped_even_when_db_path_env_points_at_copy(self):
-        """★검증 서버가 'HMS_DB=<라이브 사본>'으로 떠도 미러는 막혀야 한다.
+        """★검증 서버가 'OWS_DB=<라이브 사본>'으로 떠도 미러는 막혀야 한다.
 
-        앞의 테스트만으로는 부족했다. 실제 사고(2026-07-29 hms-20260729-103002.db)는
-        라이브를 복사해 HMS_DB로 지정한 경우였고, 그러면 config.DB_PATH 자체가 사본이 되어
+        앞의 테스트만으로는 부족했다. 실제 사고(2026-07-29 ows-20260729-103002.db)는
+        라이브를 복사해 OWS_DB로 지정한 경우였고, 그러면 config.DB_PATH 자체가 사본이 되어
         '열린 DB == config.DB_PATH'가 항상 참이 됐다. 그래서 판정 기준을
         환경변수를 타지 않는 config.LIVE_DB_PATH로 바꿨다 — 이 테스트가 그 회귀를 잡는다.
         """
         mirror = self.tmp / "mirror"
         orig_mirror, orig_db = config.BACKUP_MIRROR, config.DB_PATH
         config.BACKUP_MIRROR = str(mirror)
-        config.DB_PATH = self.db_path          # HMS_DB=<사본> 으로 뜬 상황을 흉내
+        config.DB_PATH = self.db_path          # OWS_DB=<사본> 으로 뜬 상황을 흉내
         self.addCleanup(setattr, config, "BACKUP_MIRROR", orig_mirror)
         self.addCleanup(setattr, config, "DB_PATH", orig_db)
         self.client.post("/api/backups/run")
         self.assertFalse(mirror.exists() and any(mirror.glob("*.db")),
-                         "HMS_DB로 사본을 지정했는데 2차 백업이 만들어졌다(환경변수 구멍)")
+                         "OWS_DB로 사본을 지정했는데 2차 백업이 만들어졌다(환경변수 구멍)")
 
     def test_mirror_failure_does_not_break_backup(self):
         """2차 위치가 죽어 있어도 1차 백업과 저장은 계속돼야 한다."""
         orig = config.BACKUP_MIRROR
-        config.BACKUP_MIRROR = "Z:/없는드라이브/hms"
+        config.BACKUP_MIRROR = "Z:/없는드라이브/ows"
         self.addCleanup(setattr, config, "BACKUP_MIRROR", orig)
         r = self.client.post("/api/backups/run")
         self.assertEqual(r.status_code, 200)
@@ -1920,7 +2355,7 @@ class TestBackupSafety(Base):
         c = self.app.test_client()
         c.post("/api/auth/login", json={"username": "nobackup", "password": "nobackup-pw-1234"})
         self.assertEqual(c.get("/api/backups").status_code, 403)
-        self.assertEqual(c.get("/api/backups/hms-x.db/download").status_code, 403)
+        self.assertEqual(c.get("/api/backups/ows-x.db/download").status_code, 403)
 
 
 class TestBundleA(Base):
@@ -2023,7 +2458,7 @@ class TestBundleB(Base):
         r = self.client.get("/api/orders/export?view=all&channel=쿠팡")
         self.assertEqual(r.status_code, 200)
         self.assertIn("spreadsheetml", r.headers["Content-Type"])
-        self.assertIn("hms-orders-", r.headers["Content-Disposition"])
+        self.assertIn("ows-orders-", r.headers["Content-Disposition"])
         self.assertGreater(len(r.data), 500)          # 빈 파일이 아니다
 
     def test_customer_history_by_phone(self):
@@ -2157,15 +2592,32 @@ class TestBundleC(Base):
         self.assertFalse(self.client.get(f"/api/orders/{b['id']}").get_json()["shippingDone"])
 
     def test_bulk_cancel_keeps_single_order_guards(self):
-        """일괄 취소도 단건과 같은 안전장치를 지켜야 한다(출고분이 재고로 둔갑 금지)."""
+        """일괄 취소도 단건과 같은 규칙을 따른다.
+
+        ★2026-09-03 대표 지시로 규칙이 바뀌었다 — 출고 확인된 주문도 취소되고, 취소하면
+          매칭 자산이 재고로 돌아온다("출고확인까지 갔는데 취소한 경우는 자산이 빠져야").
+          대신 **아직 집화 전인 송장**이 있으면 일괄에서는 건너뛴다(기사 헛걸음 방지 —
+          정말 취소해야 하면 그 건을 열어 단건으로 확인 후 취소한다).
+        """
         shipped, asset = self.make_shipped_order()
         plain = self._orders(1)[0]
         r = self.client.post("/api/orders/bulk", json={
             "action": "cancel", "reason": "일괄 정리", "ids": [shipped["id"], plain["id"]]}).get_json()
+        # 출고 확인만으로는 더 이상 막지 않는다 — 둘 다 취소되고 자산도 돌아온다
+        self.assertEqual(sorted(r["done"]), sorted([shipped["id"], plain["id"]]),
+                         f"출고 확인된 건이 취소되지 않았다: {r.get('failed')}")
+        self.assertEqual(self.client.get(f"/api/assets/{asset['id']}").get_json()["status"],
+                         "in_stock", "취소했는데 자산이 그 주문에 묶인 채로 남았다")
+
+    def test_bulk_cancel_skips_orders_with_open_waybill(self):
+        """아직 집화 전인 송장이 붙은 건은 일괄 취소에서 건너뛴다(기사 헛걸음 방지)."""
+        o, _a = self.make_shipped_order()
+        self.client.post(f"/api/orders/{o['id']}/waybill", json={})
+        plain = self._orders(1)[0]
+        r = self.client.post("/api/orders/bulk", json={
+            "action": "cancel", "reason": "일괄 정리", "ids": [o["id"], plain["id"]]}).get_json()
         self.assertEqual(r["done"], [plain["id"]])
-        self.assertIn("출고 확인", r["failed"][0]["reason"])
-        # 출고된 자산은 그대로 shipped
-        self.assertEqual(self.client.get(f"/api/assets/{asset['id']}").get_json()["status"], "shipped")
+        self.assertIn("집화 전", r["failed"][0]["reason"])
 
     def test_bulk_cancel_releases_assets(self):
         o = self._orders(1)[0]
@@ -2293,7 +2745,6 @@ class TestBundleC(Base):
         wids = []
         for _ in range(2):
             o, _a = self.make_shipped_order()
-            self.client.patch(f"/api/orders/{o['id']}", json={"action": "shipping", "value": False})
             wids.append(self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"])
         r = self.client.post("/api/waybills/print", json={"wids": wids})
         self.assertEqual(r.status_code, 200)          # 본문은 PDF 바이너리라 텍스트로 읽지 않는다
@@ -2331,12 +2782,16 @@ class TestBundleD(Base):
         o, _a = self.make_shipped_order(channel="전화", amount=100000)
         self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["feeAmount"], 3000)
 
-    def test_no_settings_means_no_deduction(self):
-        """설정 전에는 아무것도 임의로 깎지 않는다."""
+    def test_no_settings_uses_default_rates(self):
+        """설정 전에도 기본 요율은 붙는다(2026-08-12 대표 "일단 기본 값으로") —
+        단 택배비와 모르는 채널은 임의로 깎지 않는다."""
         o, _a = self.make_shipped_order(channel="쿠팡", amount=500000)
         d = self.client.get(f"/api/orders/{o['id']}").get_json()
-        self.assertEqual((d["feeAmount"], d["shippingCost"]), (0, 0))
-        self.assertEqual(d["netAmount"], 500000)
+        self.assertEqual((d["feeAmount"], d["feeRate"]), (25000, 5.0))   # 기본 5%
+        self.assertEqual(d["shippingCost"], 0)        # 택배비는 기본값이 없다
+        self.assertEqual(d["netAmount"], 475000)
+        o2, _a2 = self.make_shipped_order(channel="사내직거래", amount=100000)
+        self.assertEqual(self.client.get(f"/api/orders/{o2['id']}").get_json()["feeAmount"], 0)
 
     def test_manual_settlement_overrides(self):
         self._fees()
@@ -2377,12 +2832,12 @@ class TestBundleD(Base):
         self.assertEqual(s["margin"], 227000)            # 430,000 − 203,000
 
     def test_backfill_dry_run_changes_nothing(self):
-        o, _a = self.make_shipped_order(channel="쿠팡", amount=500000)
-        self._fees({"쿠팡": 10})                          # 출고 후에 요율을 넣은 상황
+        o, _a = self.make_shipped_order(channel="쿠팡", amount=500000)   # 출고 시 기본 5% = 25,000
+        self._fees({"쿠팡": 10})                          # 실요율을 나중에 넣은 상황
         r = self.client.post("/api/orders/settlement-backfill", json={"dryRun": True}).get_json()
         self.assertEqual(r["changed"], 1)
         self.assertEqual(r["feeTotal"], 50000)
-        self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["feeAmount"], 0)
+        self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["feeAmount"], 25000)
         r = self.client.post("/api/orders/settlement-backfill", json={}).get_json()
         self.assertEqual(r["changed"], 1)
         self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["feeAmount"], 50000)
@@ -2395,9 +2850,18 @@ class TestBundleD(Base):
         self.assertEqual(r["changed"], 0)
         self.assertEqual(self.client.get(f"/api/orders/{o['id']}").get_json()["feeAmount"], 7777)
 
-    def test_backfill_needs_settings(self):
-        self.assertEqual(self.client.post(
-            "/api/orders/settlement-backfill", json={}).status_code, 400)
+    def test_backfill_fills_past_orders_with_default_rates(self):
+        """저장된 요율이 없어도 소급이 기본 요율로 과거 0원 주문을 채운다
+        (옛 '설정 먼저 하라 400' 계약은 기본값 도입으로 폐기)."""
+        o, _a = self.make_shipped_order(channel="쿠팡", amount=500000)
+        import sqlite3 as _sq
+        with _sq.connect(self.db_path) as raw:            # 기본값 도입 전 출고분 재현
+            raw.execute("UPDATE orders SET fee_amount=0, fee_rate=0 WHERE id=?", (o["id"],))
+        r = self.client.post("/api/orders/settlement-backfill", json={})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["changed"], 1)
+        d = self.client.get(f"/api/orders/{o['id']}").get_json()
+        self.assertEqual((d["feeAmount"], d["feeRate"]), (25000, 5.0))
 
     def test_ledger_rows_and_totals(self):
         self._fees({"쿠팡": 10}, ship=3000)
@@ -2420,7 +2884,7 @@ class TestBundleD(Base):
         r = self.client.get("/api/reports/ledger/export")
         self.assertEqual(r.status_code, 200)
         self.assertIn("spreadsheetml", r.headers["Content-Type"])
-        self.assertIn("hms-ledger-", r.headers["Content-Disposition"])
+        self.assertIn("ows-ledger-", r.headers["Content-Disposition"])
 
     def test_profitability_by_model(self):
         self._fees({"쿠팡": 10})
@@ -2808,6 +3272,101 @@ class TestGodomallAdapter(unittest.TestCase):
         with self.assertRaises(MallError):
             CoupangAdapter({}).search_goods("아무거나")
 
+    # ---------------- 택배사 코드(RMS 이식 2026-09-08 — "RMS쪽에는 이미 고도몰 연동되어있는데 확인 후 적용")
+    COURIERS_XML = """<data><header><code>000</code></header><return>
+      <data><invoiceCompanySno>4</invoiceCompanySno><invoiceCompanyName>우체국택배</invoiceCompanyName></data>
+      <data><invoiceCompanySno>17</invoiceCompanySno><invoiceCompanyName>CJ대한통운</invoiceCompanyName></data>
+      <data><invoiceCompanySno>5</invoiceCompanySno><invoiceCompanyName>한진택배</invoiceCompanyName></data>
+    </return></data>"""
+
+    def test_택배사_목록을_읽고_CJ_번호를_찾는다(self):
+        a = self._adapter([self.COURIERS_XML])
+        got = a.list_couriers()
+        self.assertEqual([c["sno"] for c in got], ["4", "17", "5"])
+        self.assertEqual(a.cj_courier_sno(), "17")
+        self.assertIn("code_type", self.calls[0][1])
+        self.assertEqual(self.calls[0][1]["code_type"], "deliveryCompany")
+        self.assertTrue(self.calls[0][0].endswith("/godomall5/common/Code_Search.php"))
+        # cj_courier_sno 는 자기 조회 결과를 캐시한다 — 위 list_couriers(1) + 첫 조회(2) 뒤로는 안 늘어난다
+        self.assertEqual(len(self.calls), 2)
+        a.cj_courier_sno()
+        self.assertEqual(len(self.calls), 2, "캐시가 안 되어 전송 때마다 몰을 또 부른다")
+
+    def test_송장_전송은_택배사_번호를_반드시_같이_보낸다(self):
+        """★예전에는 택배사 없이 송장번호만 올렸다 — 그러면 고객 화면에 배송조회가 안 붙는다(RMS 대조)."""
+        ok_xml = "<data><header><code>000</code><msg>ok</msg></header></data>"
+        a = self._adapter([self.COURIERS_XML, ok_xml])
+        a.upload_invoice("A1", "612345678901", sno="11|12")
+        url, params = self.calls[-1]
+        self.assertTrue(url.endswith("/godomall5/order/Order_Status.php"))
+        self.assertEqual(params["orderStatus"], "d1")
+        self.assertEqual(params["invoiceNo"], "612345678901")
+        self.assertEqual(params["invoiceCompanySno"], "17", "택배사 번호를 자동으로 찾아 넣어야 한다")
+        self.assertEqual(params["sno"], "11|12", "주문상품 번호(sno)를 같이 보내야 한다 — 없으면 898 거부")
+
+    def test_설정에_적힌_택배사_번호가_있으면_몰에_묻지_않는다(self):
+        ok_xml = "<data><header><code>000</code><msg>ok</msg></header></data>"
+        a = self._adapter([ok_xml])
+        a.upload_invoice("A1", "612345678901", courier_code="17", sno="1")
+        self.assertEqual(len(self.calls), 1, "설정값이 있는데 택배사 목록을 또 물었다")
+        self.assertEqual(self.calls[0][1]["invoiceCompanySno"], "17")
+
+    def test_CJ가_등록돼_있지_않으면_보내지_않고_이유를_말한다(self):
+        """엉뚱한 택배사로 올리는 것보다 안 올리는 게 낫다 — 등록된 이름을 알려 사람이 고치게."""
+        from app.malls.base import MallError
+        xml = """<data><header><code>000</code></header><return>
+          <data><invoiceCompanySno>4</invoiceCompanySno><invoiceCompanyName>우체국택배</invoiceCompanyName></data>
+        </return></data>"""
+        a = self._adapter([xml])
+        with self.assertRaises(MallError) as e:
+            a.upload_invoice("A1", "612345678901", sno="1")
+        self.assertIn("CJ대한통운", str(e.exception))
+        self.assertIn("우체국택배", str(e.exception))
+        self.assertEqual(len(self.calls), 1, "택배사가 없는데 상태변경까지 나갔다")
+
+    # ---------------- 2026-09-08 첫 실전송: 고도몰 898 "sno 값은 필수 값입니다" (5건 거부)
+    def test_수집이_주문상품_번호_sno_를_보관한다(self):
+        """살아 있는 상품줄의 sno 를 '|'로 이어 raw 에 남긴다(RMS 와 같은 모양). 취소된 줄은 뺀다."""
+        xml = """<data><header><code>000</code><lastOrder>true</lastOrder></header><return>
+          <order_data><orderNo>S1</orderNo><orderStatus>p1</orderStatus>
+            <orderInfoData><receiverName>홍</receiverName></orderInfoData>
+            <orderGoodsData><sno>11</sno><goodsNm>노트북</goodsNm><orderStatus>p1</orderStatus>
+              <goodsCnt>1</goodsCnt><goodsPrice>500000</goodsPrice></orderGoodsData>
+            <orderGoodsData><sno>12</sno><goodsNm>가방</goodsNm><orderStatus>p1</orderStatus>
+              <goodsCnt>1</goodsCnt><goodsPrice>30000</goodsPrice></orderGoodsData>
+            <orderGoodsData><sno>13</sno><goodsNm>취소된것</goodsNm><orderStatus>c1</orderStatus>
+              <goodsCnt>1</goodsCnt><goodsPrice>10000</goodsPrice></orderGoodsData>
+          </order_data></return></data>"""
+        a = self._adapter([xml])
+        o = a.collect_orders(datetime(2026, 9, 8), datetime(2026, 9, 9))[0]
+        self.assertEqual(o["mallSno"], "11|12")
+
+    def test_fetch_sno_는_주문일_앞뒤를_뒤져_그_주문의_sno_를_찾는다(self):
+        """옛 수집분(raw 에 sno 없음)은 전송 직전에 몰에 다시 묻는다 — 날짜 조회로만(RMS 검증 방식)."""
+        xml = """<data><header><code>000</code><lastOrder>true</lastOrder></header><return>
+          <order_data><orderNo>A9</orderNo><orderStatus>p1</orderStatus>
+            <orderGoodsData><sno>5</sno><goodsNm>다른주문</goodsNm><goodsCnt>1</goodsCnt><goodsPrice>1</goodsPrice></orderGoodsData>
+          </order_data>
+          <order_data><orderNo>B1</orderNo><orderStatus>p1</orderStatus>
+            <orderGoodsData><sno>7</sno><goodsNm>노트북</goodsNm><goodsCnt>1</goodsCnt><goodsPrice>1</goodsPrice></orderGoodsData>
+            <orderGoodsData><sno>8</sno><goodsNm>취소</goodsNm><orderStatus>c1</orderStatus><goodsCnt>1</goodsCnt><goodsPrice>1</goodsPrice></orderGoodsData>
+          </order_data></return></data>"""
+        a = self._adapter([xml])
+        self.assertEqual(a.fetch_sno("B1", "2026-09-08 10:00"), "7")
+        url, params = self.calls[0]
+        self.assertTrue(url.endswith("/godomall5/order/Order_Search.php"))
+        self.assertEqual((params["startDate"], params["endDate"]), ("2026-09-07", "2026-09-09"))
+        self.assertEqual(params["dateType"], "order")
+        self.assertEqual(a.fetch_sno("없는주문", "2026-09-08"), "")
+
+    def test_송장_전송은_sno_없이는_몰을_부르지_않는다(self):
+        """898 은 확정적이다 — 없이 두드려 봐야 거부만 쌓인다. 사유를 남기고 멈춘다."""
+        from app.malls.base import MallError
+        a = self._adapter(["<data><header><code>000</code></header></data>"])
+        with self.assertRaises(MallError) as e:
+            a.upload_invoice("A1", "612345678901", courier_code="17")
+        self.assertIn("sno", str(e.exception))
+        self.assertEqual(self.calls, [], "sno 없이 상태변경이 나갔다")
 
 class TestGoodsSearchRoute(Base):
     def test_requires_setup_and_permission(self):
@@ -3082,10 +3641,10 @@ class TestReviewFixes456(Base):
         st = self.client.get("/api/mall-status").get_json()
         self.assertTrue(next(m for m in st if m["code"] == "godomall")["ready"])
         # 다른 최상위 설정도 보존
-        self.client.put("/api/settings", json={"cj": {"cust_id": "30516776"}})
+        self.client.put("/api/settings", json={"cj": {"cust_id": "00000000"}})
         self.client.put("/api/settings", json={"malls": {"toss": {"client_id": "C", "enabled": True}}})
         s = self.client.get("/api/settings").get_json()
-        self.assertEqual(s["cj"]["cust_id"], "30516776")
+        self.assertEqual(s["cj"]["cust_id"], "00000000")
         self.assertEqual(len(s["malls"]), 3)
 
     def test_recall_cancel_restores_asset(self):
@@ -3118,7 +3677,9 @@ class TestReviewFixes456(Base):
         r = self.client.post(f"/api/waybills/{as_wid}/received", json={"status": "repair"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json()["assets"], [a["assetNo"]])
-        self.assertEqual(self.client.get(f"/api/as-tickets/{t['id']}").get_json()["status"], "repairing")
+        # ★2026-09-07 개편: 입고는 '입고 완료'(arrived)에 선다 — 수리 시작은 사람이 누른다.
+        #   (예전엔 곧바로 '수리 중'이 되어 도착만 했는지 손을 댔는지 구분이 안 됐다)
+        self.assertEqual(self.client.get(f"/api/as-tickets/{t['id']}").get_json()["status"], "arrived")
 
     def test_margin_counts_cost_per_order(self):
         """같은 자산이 두 번 팔리면 원가도 두 번 계상돼야 한다(집계 단위 일치)."""

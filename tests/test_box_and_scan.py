@@ -62,7 +62,7 @@ class TestBoxQtyOnLabel(unittest.TestCase):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-box-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-box-"))
         self.app = create_app(db_path=self.tmp / "test.db")
         self.app.testing = True
         self.client = self.app.test_client()
@@ -90,6 +90,9 @@ class TestAssetScanReason(Base):
 
     def test_이미_출고된_자산도_찾아_주되_이유를_알려_준다(self):
         """예전에는 아무것도 안 나와서 '없는 번호'로 보였다 — 그래서 계속 다시 찍게 됐다."""
+        # ★'중복 매칭 허용'(2026-08-31, 기본 켜짐)을 끄고 차단 모드의 안전핀을 검증한다
+        self.assertEqual(self.client.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": False}}).status_code, 200)
         a = self._asset()
         o = self.client.post("/api/orders", json={
             "recipient": "홍길동", "productName": "노트북", "phone": "010-1111-2222",

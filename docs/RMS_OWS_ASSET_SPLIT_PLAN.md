@@ -1,15 +1,15 @@
-# 렌탈(RMS) ↔ 판매(HMS) 자산 분리 · 양방향 이관 설계안
+# 렌탈(RMS) ↔ 판매(OWS) 자산 분리 · 양방향 이관 설계안
 
-작성 2026-08-04 / 실측 기준: `E:\rental-system\rental_system.db`, `E:\halfbook-system\data\hms.db`,
-`E:\halfbook-system\tms-export\재고항목현황260804.xlsx` (모두 읽기 전용 조회)
+작성 2026-08-04 / 실측 기준: `E:\rental-system\rental_system.db`, `E:\operations-system\data\ows.db`,
+`E:\operations-system\tms-export\재고항목현황260804.xlsx` (모두 읽기 전용 조회)
 
 ---
 
 ## 1. RMS 자산 데이터 실측
 
-### 1-1. 저장 구조 — HMS와 완전히 다르다
+### 1-1. 저장 구조 — OWS와 완전히 다르다
 
-| | RMS | HMS |
+| | RMS | OWS |
 |---|---|---|
 | 테이블 | `assets(key TEXT PK, data TEXT, updated_at)` | `assets(id INTEGER PK, asset_no UNIQUE, …45개 컬럼)` |
 | 형태 | **KV 1행 = JSON 자산 1건** | 정규화 컬럼 |
@@ -19,7 +19,7 @@
 
 RMS는 `load_assets()` → `db_load_kv('assets')`로 **전체를 통째로 읽고 통째로 저장**한다
 (`app.py:807`, `app.py:828`). 컬럼 추가가 아니라 **JSON 키 추가**로 필드를 늘린다.
-반대로 HMS는 `ALTER TABLE ADD COLUMN`이 필요하다. 이관 설계에서 이 비대칭이 핵심이다.
+반대로 OWS는 `ALTER TABLE ADD COLUMN`이 필요하다. 이관 설계에서 이 비대칭이 핵심이다.
 
 ### 1-2. 관리번호 체계 — 두 종류가 섞여 있다
 
@@ -45,14 +45,14 @@ RMS는 `load_assets()` → `db_load_kv('assets')`로 **전체를 통째로 읽�
 
 ---
 
-## 2. RMS ↔ HMS ↔ TMS 3자 대조 결과
+## 2. RMS ↔ OWS ↔ TMS 3자 대조 결과
 
 ### 2-1. 교집합
 
 ```
-RMS 고유 관리번호 1,336  ∩  HMS asset_no 15,066  =  1,255 일치
+RMS 고유 관리번호 1,336  ∩  OWS asset_no 15,066  =  1,255 일치
   RMS에만 있음   81   (대부분 위 1-2의 자체 채번 58건 + 폐기/삭제분)
-  HMS에만 있음  13,811 (순수 판매 자산)
+  OWS에만 있음  13,811 (순수 판매 자산)
 ```
 
 ### 2-2. 대표님이 말씀하신 592대 — 정확히 재현됨
@@ -67,9 +67,9 @@ TMS 재고항목현황 2,691건 기준:
 | 반입 | 191 |
 | 판매취소 | 4 |
 
-렌탈+반납 **1,421건 → 전부 HMS에 존재**. 그 HMS 상태는:
+렌탈+반납 **1,421건 → 전부 OWS에 존재**. 그 OWS 상태는:
 
-| HMS status | 건수 |
+| OWS status | 건수 |
 |---|---|
 | shipped | 829 |
 | **in_stock** | **582** |
@@ -88,11 +88,11 @@ TMS 재고항목현황 2,691건 기준:
 ```
 
 - `반납 → in_stock` 이 545대를 통째로 판매 재고로 밀어 넣었다 (실제 in_stock 527 + 기타).
-- `렌탈 → shipped` 는 "우리 손에 없다"는 의도였지만, 결과적으로 **829대가 HMS에서 '판매 출고완료'로 보인다.**
+- `렌탈 → shipped` 는 "우리 손에 없다"는 의도였지만, 결과적으로 **829대가 OWS에서 '판매 출고완료'로 보인다.**
 - 근본 문제: **이관 시점에 사업부 구분 자체가 없었다.** 상태값만으로 소유를 표현하려 해서 실패.
 
 교집합 1,255건 전부가 `purchase_batches.memo = '[TMS 이관]'` 배치 소속이다.
-즉 HMS가 자기 매입으로 등록한 게 아니라 **7/30 벌크 유입분**이다.
+즉 OWS가 자기 매입으로 등록한 게 아니라 **7/30 벌크 유입분**이다.
 
 ### 2-4. 829대 shipped의 정체 — 판별됨
 
@@ -105,7 +105,7 @@ shipped 교집합 791건의 `asset_events`:
 | **판매** | **18** |
 | 이관등록 | 3 |
 
-→ **판매 증거(판매전표 또는 HMS 주문 연결)가 있는 건 21건뿐.** 나머지 ~770대는
+→ **판매 증거(판매전표 또는 OWS 주문 연결)가 있는 건 21건뿐.** 나머지 ~770대는
 "렌탈 출고를 판매로 오인"한 게 맞다. RMS를 봐야 판별된다는 가설이 데이터로 확인됐다.
 
 ### 2-5. 판매가능 592대의 상태
@@ -125,9 +125,9 @@ shipped 교집합 791건의 `asset_events`:
 |---|---|---|---|
 | R1 | RMS `status ∈ (rented, holding)` | **rental** | 고객이 쓰고 있거나 나갈 예정 = 렌탈이 확실 |
 | R2 | TMS 재고상태 ∈ (렌탈, 반납) | **rental** | 매입팀 원장이 렌탈로 찍음 |
-| R3 | R1·R2 해당인데 HMS에 판매전표/주문/몰노출 있음 | **충돌 → 수동** | 양쪽이 다 소유 주장 |
-| R4 | 위에 안 걸리고 HMS에 존재 | **sale** | 기본값 |
-| R5 | RMS에만 있고 HMS에 없음 | **rental** | RMS 원장 그대로 유지 |
+| R3 | R1·R2 해당인데 OWS에 판매전표/주문/몰노출 있음 | **충돌 → 수동** | 양쪽이 다 소유 주장 |
+| R4 | 위에 안 걸리고 OWS에 존재 | **sale** | 기본값 |
+| R5 | RMS에만 있고 OWS에 없음 | **rental** | RMS 원장 그대로 유지 |
 | R6 | RMS 보유 · 비대여 · TMS도 렌탈 아님 | **회색 → 대표 확인** | 22건, 전부 `available` |
 
 **R1을 R2보다 위에 둔 이유**: TMS는 매입팀이 손으로 갱신해서 뒤처진다.
@@ -141,7 +141,7 @@ R2  TMS 렌탈/반납                 1,421
 R1 ∪ R2 후보                      1,603
   − R3 판매증거 충돌 (수동판정)      13
   = rental 확정                    1,590
-      HMS에도 있음                 1,513
+      OWS에도 있음                 1,513
       RMS에만 있음(R5)                77
 R6  회색지대                          22   (전부 RMS available / TMS는 매입 17·없음 5)
 ```
@@ -150,7 +150,7 @@ R6  회색지대                          22   (전부 RMS available / TMS는 �
 
 | | 현재 | 백필 후 |
 |---|---|---|
-| HMS 판매가능(in_stock+ready) | 1,929 | **1,241** |
+| OWS 판매가능(in_stock+ready) | 1,929 | **1,241** |
 | 빠지는 대수 | | **688** |
 
 > 592가 아니라 **688**이다. 차이 96대는 TMS는 아직 '매입'으로 두고 있지만
@@ -165,7 +165,7 @@ R6  회색지대                          22   (전부 RMS available / TMS는 �
 250314-0021  250509-0044  250925-0001
 ```
 
-예: `241216-0016` — TMS 렌탈 / RMS 보유 / HMS엔 판매전표 `S250102-001` 박주환 390,000원 자사몰.
+예: `241216-0016` — TMS 렌탈 / RMS 보유 / OWS엔 판매전표 `S250102-001` 박주환 390,000원 자사몰.
 **실제로 팔린 건지, 렌탈 자산이 판매전표에 잘못 붙은 건지 대표님 확인이 필요합니다.**
 
 ### 3-4. 정리 선행 과제
@@ -177,7 +177,7 @@ R6  회색지대                          22   (전부 RMS available / TMS는 �
 
 ## 4. 사업부 귀속 필드 설계
 
-### 4-1. HMS (원장 보유측)
+### 4-1. OWS (원장 보유측)
 
 ```sql
 ALTER TABLE assets ADD COLUMN division       TEXT NOT NULL DEFAULT 'sale';  -- 'sale' | 'rental'
@@ -200,7 +200,7 @@ CREATE INDEX idx_assets_division ON assets(division, status);
 
 ### 4-3. 기존 `sold` 상태와의 관계 — 재활용 제안
 
-RMS→HMS 이관 시 **`division='sale'` + `status='sold'` 를 함께 설정**할 것을 권합니다.
+RMS→OWS 이관 시 **`division='sale'` + `status='sold'` 를 함께 설정**할 것을 권합니다.
 
 RMS 코드에 `sold` 자산 제외 로직이 이미 6곳 깔려 있습니다
 (`app.py:1408` 대여후보 제외, `app.py:2658` 충돌검사, `app.py:2700` 경고, `app.py:13333` 통계 등).
@@ -215,7 +215,7 @@ RMS 코드에 `sold` 자산 제외 로직이 이미 6곳 깔려 있습니다
 
 → 둘을 구분해 두면 나중에 "렌탈이 직접 판 것"과 "판매팀에 넘긴 것"을 재무에서 갈라 볼 수 있습니다.
 
-### 4-4. 이관 원장 테이블 (HMS에 신설)
+### 4-4. 이관 원장 테이블 (OWS에 신설)
 
 ```sql
 CREATE TABLE asset_transfers (
@@ -229,7 +229,7 @@ CREATE TABLE asset_transfers (
   reason        TEXT NOT NULL DEFAULT '',
   requested_by  TEXT NOT NULL DEFAULT '',  requested_at TEXT NOT NULL DEFAULT '',
   committed_by  TEXT NOT NULL DEFAULT '',  committed_at TEXT NOT NULL DEFAULT '',
-  hms_acked_at  TEXT NOT NULL DEFAULT '',  rms_acked_at TEXT NOT NULL DEFAULT '',
+  ows_acked_at  TEXT NOT NULL DEFAULT '',  rms_acked_at TEXT NOT NULL DEFAULT '',
   snapshot      TEXT NOT NULL DEFAULT ''     -- 이관 직전 양쪽 상태 JSON (롤백용)
 );
 CREATE TABLE asset_transfer_items (
@@ -241,8 +241,8 @@ CREATE TABLE asset_transfer_items (
 );
 ```
 
-원장을 HMS에 두는 이유: 매입 시스템이 HMS에 붙어 있고, 매입이 두 시스템의 **중간 성격**이므로
-자산 소유 이력의 단일 진실 원천을 HMS에 두는 게 구조와 맞습니다.
+원장을 OWS에 두는 이유: 매입 시스템이 OWS에 붙어 있고, 매입이 두 시스템의 **중간 성격**이므로
+자산 소유 이력의 단일 진실 원천을 OWS에 두는 게 구조와 맞습니다.
 
 ---
 
@@ -251,14 +251,14 @@ CREATE TABLE asset_transfer_items (
 ### 5-1. 2단계 커밋 (제안 → 커밋 → 양측 ack)
 
 ```
-① 제안   RMS/HMS 어느 쪽에서든 자산번호 목록 붙여넣기
-         → POST /api/transfers  (HMS)
+① 제안   RMS/OWS 어느 쪽에서든 자산번호 목록 붙여넣기
+         → POST /api/transfers  (OWS)
          → 가드 검사 후 state=pending, commit_id 발급 + 차단목록 즉시 반환
          ★ 이 단계에서는 아무것도 안 바뀐다 (미리보기)
 
 ② 커밋   대표 확인 후
-         → POST /api/transfers/<commit_id>/commit  (HMS)
-         → HMS 측 적용 + snapshot 저장, state=committed
+         → POST /api/transfers/<commit_id>/commit  (OWS)
+         → OWS 측 적용 + snapshot 저장, state=committed
 
 ③ ack    RMS가 미처리 커밋을 받아 자기 쪽 적용
          → GET  /api/transfers/pending-for-rms
@@ -277,9 +277,9 @@ CREATE TABLE asset_transfer_items (
 - RMS에 미등록 관리번호 → `unmatched`로 반환(조용히 통과 금지)
 
 **sale → rental 차단 조건**
-- HMS `stock_listed = 1` (몰 노출 중) → **차단**. 먼저 몰에서 내려야 한다.
-- HMS `order_assets` 연결됨 / `status='shipped'` + 판매전표 존재 → **차단**
-- HMS `status ∈ (repair, as, defective, painting)` → 경고 후 선택 통과
+- OWS `stock_listed = 1` (몰 노출 중) → **차단**. 먼저 몰에서 내려야 한다.
+- OWS `order_assets` 연결됨 / `status='shipped'` + 판매전표 존재 → **차단**
+- OWS `status ∈ (repair, as, defective, painting)` → 경고 후 선택 통과
 
 **공통**
 - 이미 목표 division이면 no-op (`result='ok'`, 무변경)
@@ -289,7 +289,7 @@ CREATE TABLE asset_transfer_items (
 
 | | rental → sale | sale → rental |
 |---|---|---|
-| HMS | `division='sale'`, `status`는 검수 필요하니 `in_stock`, `stock_listed=0` | `division='rental'`, 판매가능 집계에서 제외 |
+| OWS | `division='sale'`, `status`는 검수 필요하니 `in_stock`, `stock_listed=0` | `division='rental'`, 판매가능 집계에서 제외 |
 | RMS | `division='sale'` + `status='sold'` → 자산관리/대여후보에서 사라짐 | `division='rental'`, `status='available'` 로 복원 (없으면 신규 생성) |
 | 이력 | 양쪽 `history` / `asset_events` 에 `이관(commit_id)` 기록 | 동일 |
 
@@ -298,7 +298,7 @@ CREATE TABLE asset_transfer_items (
 매입 전표에서 자산 등록 시 **`division` 을 그 자리에서 지정**한다.
 
 - 전표 단위 기본값 (`purchase_batches.division`) + 자산별 개별 지정 가능
-- `division='rental'` 로 등록되면 → 그 즉시 HMS 판매재고 집계에서 빠지고
+- `division='rental'` 로 등록되면 → 그 즉시 OWS 판매재고 집계에서 빠지고
   RMS `pending-for-rms` 큐에 올라가 RMS가 자동 수령
 - 기존 매입 흐름은 그대로. **컬럼 하나 + 등록 화면 라디오 하나**만 늘어난다.
 
@@ -307,19 +307,19 @@ CREATE TABLE asset_transfer_items (
 같은 PC(5000 ↔ 5100)이므로 **HTTP + 공유 시크릿** 방식.
 
 - 시크릿: 환경변수 `ASSET_TRANSFER_TOKEN` (양쪽 동일값), `X-Transfer-Token` 헤더
-- RMS→HMS 호출은 `127.0.0.1:5100` 고정 (고정경로 방식 — A/S 문자 차단 때와 같은 패턴)
-- **HMS가 죽어 있어도 RMS는 정상 동작**해야 함 → 호출 실패 시 로컬 큐에 적재 후 재시도,
+- RMS→OWS 호출은 `127.0.0.1:5100` 고정 (고정경로 방식 — A/S 문자 차단 때와 같은 패턴)
+- **OWS가 죽어 있어도 RMS는 정상 동작**해야 함 → 호출 실패 시 로컬 큐에 적재 후 재시도,
   화면엔 "이관 대기 N건"으로만 표시 (동기 의존 금지)
 
 ---
 
 ## 6. 화면 설계 — 탭 안 늘립니다
 
-> "TMS가 쓸데없이 화면을 여러 개로 나눠놔서 못 쓰겠다. TMS 화면 1개당 HMS 탭 1개씩 만들지 마라."
+> "TMS가 쓸데없이 화면을 여러 개로 나눠놔서 못 쓰겠다. TMS 화면 1개당 OWS 탭 1개씩 만들지 마라."
 
 **신설 탭 0개.** 전부 기존 화면에 흡수합니다.
 
-### HMS (매입 화면 탭은 현행 3개 그대로: 매입 작업 / 재고 현황 / 자산 목록)
+### OWS (매입 화면 탭은 현행 3개 그대로: 매입 작업 / 재고 현황 / 자산 목록)
 
 | 위치 | 추가 | 방식 |
 |---|---|---|
@@ -350,9 +350,9 @@ CREATE TABLE asset_transfer_items (
 
 | 단계 | 내용 | 라이브 영향 |
 |---|---|---|
-| 0 | **백업** — HMS/RMS DB 각각, 건수로 확인 | 없음 |
-| 1 | 사본 검증 환경: `HMS_DB` 로 사본 지정, **별도 포트**, 사본 전용 임시비번 로그인으로 사본임을 증명 | 없음 |
-| 2 | 스키마 추가 (HMS 4컬럼 + 2테이블 / RMS JSON 키) — 사본에서 | 없음 |
+| 0 | **백업** — OWS/RMS DB 각각, 건수로 확인 | 없음 |
+| 1 | 사본 검증 환경: `OWS_DB` 로 사본 지정, **별도 포트**, 사본 전용 임시비번 로그인으로 사본임을 증명 | 없음 |
+| 2 | 스키마 추가 (OWS 4컬럼 + 2테이블 / RMS JSON 키) — 사본에서 | 없음 |
 | 3 | **백필 dry-run** — 판정 규칙 적용 결과표 출력 (1,590 rental / 688 판매재고 제외) | 없음 |
 | 4 | **대표 확인**: 충돌 13건 + 회색지대 22건 | — |
 | 5 | 이관 커밋 API + 가드 (사본에서 양방향 왕복 테스트) | 없음 |
@@ -362,7 +362,7 @@ CREATE TABLE asset_transfer_items (
 
 ### 검증 항목 (사본에서 전부 통과 후 라이브)
 
-- 백필 후 HMS 판매가능 1,929 → 1,241, `stock_listed=1` 인 rental 자산 **0건**
+- 백필 후 OWS 판매가능 1,929 → 1,241, `stock_listed=1` 인 rental 자산 **0건**
 - 몰 재고 동기화(`stock_sync.py:35`)가 rental 자산을 **안 올림**
 - RMS 자산관리·대여후보에 `division='sale'` **0건 노출**
 - 왕복 테스트: rental → sale → rental 후 원상복구(스냅샷 일치)
@@ -378,7 +378,7 @@ CREATE TABLE asset_transfer_items (
 근거: 판매전표 하나에 여러 사람이 서로 다른 자산번호로 붙어 있다.
 
 ```
-250102-0001~0005  RMS 대여중(전부 서지아)  →  HMS 판매전표 S250102-001 하나에
+250102-0001~0005  RMS 대여중(전부 서지아)  →  OWS 판매전표 S250102-001 하나에
                   윤동수·정민규·정수진·이재홍·이재만 5명이 각각 붙음
 250121-0047  판매가 0원, 수령자 "이태연(교환)"
 250314-0021  판매가 0원
@@ -389,7 +389,7 @@ CREATE TABLE asset_transfer_items (
 처리:
 - 13건 전부 `division='rental'` (R1 우선)
 - `division_note` 에 무시한 판매전표를 **원문 그대로 보존**
-  (예: `TMS 관리번호 오배정 — HMS 판매전표 S250102-001(윤동수 160,000) 무시. 2026-08-04 대표 확인`)
+  (예: `TMS 관리번호 오배정 — OWS 판매전표 S250102-001(윤동수 160,000) 무시. 2026-08-04 대표 확인`)
 - `division_locked = 1` — **이후 자동 판정이 건드리지 않는다.** TMS 재이관해도 안 뒤집힘
 - 판매전표 레코드 자체는 삭제하지 않음 (매출 대조 시 추적 가능해야 함)
 
@@ -408,7 +408,7 @@ CREATE TABLE asset_transfer_items (
 
 이관 대상 제외 2건 (자산이 아님, "정리 필요" 표시만):
 - `테스트` — 모델명 "테스트장비입출고용", 시험용 더미
-- `2026-0031` — RMS 자체채번, TMS·HMS 양쪽 다 없음
+- `2026-0031` — RMS 자체채번, TMS·OWS 양쪽 다 없음
 
 ### ✅ 결정 3 — 중복 관리번호: 데이터 그대로 둔다
 
@@ -463,15 +463,15 @@ CREATE TABLE asset_transfer_items (
 
 ### ✅ 결정 6 — 829대는 "상태를 되돌리는" 게 아니라 "라벨만 붙인다"
 
-★"되돌리기"라는 표현이 오해를 불렀다. **HMS `status`는 건드리지 않는다.**
+★"되돌리기"라는 표현이 오해를 불렀다. **OWS `status`는 건드리지 않는다.**
 
-실측 (TMS 렌탈/반납 ∩ HMS shipped = **829대**):
+실측 (TMS 렌탈/반납 ∩ OWS shipped = **829대**):
 
 | 항목 | 값 |
 |---|---|
 | TMS 내역 | 렌탈 811 / 반납 18 |
 | 판매전표 붙음 | **4대** (`250116-0016`, `250121-0047`, `250225-0027`, `250925-0001`) — **전부 결정 1의 예외 13건 안에 이미 포함** |
-| HMS 주문 연결 | **0** |
+| OWS 주문 연결 | **0** |
 | 판매증거 전혀 없음 | **825대** |
 | 몰 노출(`stock_listed=1`) | **0** |
 | RMS에 존재 | 777대 (그중 `rented` **708** = 지금 고객이 쓰는 중) |
@@ -486,7 +486,7 @@ CREATE TABLE asset_transfer_items (
 
 **처리: `division='rental'`만 찍고 `status='shipped'`는 그대로 둔다.**
 
-`shipped`의 뜻은 "HMS 손에 없다"이고, 렌탈로 나가 있는 것도 HMS 손에 없으니 **상태값 자체는 맞다.**
+`shipped`의 뜻은 "OWS 손에 없다"이고, 렌탈로 나가 있는 것도 OWS 손에 없으니 **상태값 자체는 맞다.**
 여기서 `in_stock`으로 "되돌리면" 오히려 "창고에 있다"가 되어
 판매가능 재고가 1,970 → 2,799로 **늘어난다. 그게 진짜 사고다.**
 
@@ -504,30 +504,30 @@ CREATE TABLE asset_transfer_items (
 
 ---
 
-## 9. 구현 현황 (2026-08-04 · HMS 측 완료, 사본에서만)
+## 9. 구현 현황 (2026-08-04 · OWS 측 완료, 사본에서만)
 
 ### 작업 위치 — ★라이브와 분리했다
 
-`E:\halfbook-system`은 **라이브 서버가 돌고 있는 바로 그 소스 트리**다. git도 없고
-작업스케줄러에 `HalfbookSystemAutoStart`(워치독)가 걸려 있어, 여기서 고치면
+`E:\operations-system`은 **라이브 서버가 돌고 있는 바로 그 소스 트리**다. git도 없고
+작업스케줄러에 `OperationsSystemAutoStart`(워치독)가 걸려 있어, 여기서 고치면
 **라이브가 재시작되는 순간 작업 중인 코드가 그대로 운영에 올라간다.** 그래서 분리했다.
 
 | | 경로 / 포트 |
 |---|---|
-| 라이브 (건드리지 않음) | `E:\halfbook-system` · `data\hms.db` · **5100** |
-| 개발 트리 | `E:\halfbook-system-dev` |
-| 사본 DB | `E:\halfbook-system-dev\data\hms-verify.db` |
-| 검증 서버 | **127.0.0.1:5307** (`HMS_BACKUP_MIRROR=''`, `HMS_SMS_BLOCK=1`) |
+| 라이브 (건드리지 않음) | `E:\operations-system` · `data\ows.db` · **5100** |
+| 개발 트리 | `E:\operations-system-dev` |
+| 사본 DB | `E:\operations-system-dev\data\ows-verify.db` |
+| 검증 서버 | **127.0.0.1:5307** (`OWS_BACKUP_MIRROR=''`, `OWS_SMS_BLOCK=1`) |
 | 사본 전용 계정 | `copycheck` — 라이브 users에는 0건(확인 완료) |
 
-★사본 DB 파일명을 `hms.db`로 두면 dev 트리의 `LIVE_DB_PATH`와 같아져
-`mirror_backup`의 '라이브인가' 판정을 통과해 `D:\hms-backups`를 오염시킨다.
-그래서 `hms-verify.db`로 두고 미러도 껐다(이중 안전장치).
+★사본 DB 파일명을 `ows.db`로 두면 dev 트리의 `LIVE_DB_PATH`와 같아져
+`mirror_backup`의 '라이브인가' 판정을 통과해 `D:\ows-backups`를 오염시킨다.
+그래서 `ows-verify.db`로 두고 미러도 껐다(이중 안전장치).
 
-백업: `hms-20260804-203820-before-division.db` / `rms-20260804-203820-before-division.db`
+백업: `ows-20260804-203820-before-division.db` / `rms-20260804-203820-before-division.db`
 — 둘 다 테이블별 건수 대조로 검증.
 
-### HMS 구현 내용
+### OWS 구현 내용
 
 **스키마** — `assets`에 `division`(기본 `sale`) `division_since` `division_by`
 `division_ref` `division_note` `division_locked`, 인덱스 `(division, status)`.
@@ -587,11 +587,11 @@ rental 확정 1,566건
 
 ### 남은 것
 
-- **HMS 화면 육안 클릭 확인** — 세션 쿠키가 HttpOnly라 로그인 화면을 거쳐야 한다.
+- **OWS 화면 육안 클릭 확인** — 세션 쿠키가 HttpOnly라 로그인 화면을 거쳐야 한다.
   비밀번호 입력은 대표가 직접(아래 10장).
 - **RMS 측 구현** — RMS도 라이브(5000)와 같은 트리이므로 dev 트리 + 사본 DB 분리부터.
   JSON `division` 키, 판매 귀속분 숨김(`sold` 재활용), `sell-by-number` 확장,
-  반납 채번 게이트(54대), HMS 큐 수신·ack.
+  반납 채번 게이트(54대), OWS 큐 수신·ack.
 
 ## 10. 대표가 직접 해야 하는 것
 

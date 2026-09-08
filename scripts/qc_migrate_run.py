@@ -35,7 +35,7 @@ def main():
         admin = conn.execute(
             "SELECT * FROM users WHERE is_admin=1 AND enabled=1 ORDER BY id LIMIT 1").fetchone()
         if admin is None:
-            print("관리자 계정이 없습니다. 먼저 HMS에서 계정을 만드세요.")
+            print("관리자 계정이 없습니다. 먼저 OWS에서 계정을 만드세요.")
             return 1
         g.user = admin
         g.perms = set()

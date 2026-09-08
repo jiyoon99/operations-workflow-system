@@ -3,16 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HMS — 하프북 관리 시스템</title>
+<title>Operations Workflow System</title>
 <link rel="stylesheet" href="/static/css/app.css">
+<link rel="stylesheet" href="/static/css/workload.css">
 </head>
 <body>
 
 <!-- 로그인 / 최초 설정 -->
 <div id="auth-screen" class="auth-screen hidden">
   <div class="auth-card">
-    <div class="auth-brand">HMS</div>
-    <div class="auth-sub">하프북 관리 시스템</div>
+    <div class="auth-brand">OWS</div>
+    <div class="auth-sub">사내 업무 관리 시스템</div>
 
     <form id="login-form" class="auth-form hidden" autocomplete="off">
       <label>아이디<input type="text" id="login-username" required autocomplete="username"></label>
@@ -37,13 +38,18 @@
   <!-- 좁은 화면(≤1024px)에서만 보이는 상단 바. PC에서는 CSS가 숨긴다. -->
   <header class="topbar">
     <button id="menu-toggle" class="menu-toggle" aria-label="메뉴 열기" aria-expanded="false">☰</button>
-    <span class="tb-brand">HMS</span>
+    <span class="tb-brand">OWS</span>
     <span class="tb-title"></span>
     <span class="tb-spacer"></span>
   </header>
   <div class="nav-backdrop" aria-hidden="true"></div>
   <aside class="sidebar">
-    <div class="brand">HMS<span>하프북 관리 시스템</span></div>
+    <div class="brand">OWS<span>사내 업무 관리 시스템</span></div>
+    <!-- 업데이트 내역(2026-08-14 대표) — 작업자가 '뭐가 바뀌었는지'를 여기서 본다.
+         안 본 날짜가 있으면 빨간 점이 붙는다. -->
+    <button id="whatsnew-btn" class="whatsnew-btn" title="최근 바뀐 내용을 봅니다">
+      📋 업데이트 내역<span id="whatsnew-dot" class="whatsnew-dot hidden"></span>
+    </button>
     <nav id="nav">
       <a href="#" data-view="dashboard" class="active">대시보드</a>
       <a href="#" data-view="purchase">매입</a>
@@ -51,13 +57,15 @@
       <a href="#" data-view="setup">셋팅</a>
       <a href="#" data-view="shipping">배송 / 송장</a>
       <a href="#" data-view="as">A/S</a>
-      <a href="#" data-view="reports">리포트</a>
       <a href="#" data-view="settings">설정</a>
     </nav>
     <div class="sidebar-foot">
       <div class="user-chip">
         <div class="user-name" id="chip-name">-</div>
         <div class="user-role" id="chip-role">-</div>
+      </div>
+      <div id="server-health" class="server-health checking" title="OWS 서버와 데이터베이스 상태를 확인 중입니다.">
+        <span class="server-health-dot"></span><span id="server-health-text">OWS 확인 중</span>
       </div>
       <div class="foot-actions">
         <button id="theme-toggle" class="btn btn-ghost btn-sm" title="다크 모드">◐</button>
@@ -76,6 +84,8 @@
 <script src="/static/js/shipping.js"></script>
 <script src="/static/js/as.js"></script>
 <script src="/static/js/reports.js"></script>
+<script src="/static/js/workload.js"></script>
+<script src="/static/js/qr.js"></script>
 <script src="/static/js/app.js"></script>
 <script src="/static/js/responsive.js"></script>
 </body>

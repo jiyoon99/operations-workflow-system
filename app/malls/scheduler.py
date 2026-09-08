@@ -151,6 +151,6 @@ def start_collector(app):
             except Exception:                                    # noqa: BLE001
                 app.logger.exception("자동수집 루프 오류")
 
-    t = threading.Thread(target=loop, name="hms-mall-collector", daemon=True)
+    t = threading.Thread(target=loop, name="ows-mall-collector", daemon=True)
     t.start()
     return t

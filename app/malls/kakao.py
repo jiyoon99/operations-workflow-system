@@ -50,7 +50,7 @@ TIMEOUT = 25          # 지시 기준(20초 이상)보다 여유를 둔다
 PAGE_SIZE = 100       # 요청당 최대 100건
 MAX_PAGES = 60        # 커서 페이징 무한루프 방지(하루치 6,000건이면 충분)
 MAX_RETRY = 2         # 429/5xx 백오프 재시도 횟수
-DEFAULT_COURIER = "CJGLS"  # CJ대한통운 — HMS 출고는 전부 CJ라 기본값으로 둔다
+DEFAULT_COURIER = "CJGLS"  # CJ대한통운 — OWS 출고는 전부 CJ라 기본값으로 둔다
 
 # ---- 수집 대상 주문상태 -------------------------------------------------------
 # 카카오 OrderStatus: ShippingWaiting / ShippingProgress / ShippingComplete /
@@ -189,7 +189,7 @@ def _dt_text(value) -> str:
 
 
 def _kst(dt: datetime) -> datetime:
-    """tz 없는 datetime이 들어와도 KST로 본다(HMS는 config.now()=KST 기준)."""
+    """tz 없는 datetime이 들어와도 KST로 본다(OWS는 config.now()=KST 기준)."""
     if dt.tzinfo is None:
         return dt.replace(tzinfo=config.KST)
     return dt.astimezone(config.KST)
@@ -261,7 +261,7 @@ class KakaoAdapter(MallAdapter):
             "Target-Authorization": f"KakaoAK {seller}",
             "channel-ids": self._channel_ids(),
             "Accept": "application/json",
-            "User-Agent": "HMS/1.0",
+            "User-Agent": "OWS/1.0",
         }
 
     def _session(self):

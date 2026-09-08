@@ -186,7 +186,7 @@ class TossAdapter(MallAdapter):
             r = self._sess().post(
                 TOKEN_URL, data=data, timeout=TIMEOUT,
                 headers={"Content-Type": "application/x-www-form-urlencoded",
-                         "Accept": "application/json", "User-Agent": "HMS/1.0"})
+                         "Accept": "application/json", "User-Agent": "OWS/1.0"})
         except requests.Timeout as e:
             raise MallError("토스쇼핑 토큰 발급이 시간 내에 끝나지 않았습니다(네트워크 확인).") from e
         except requests.RequestException as e:
@@ -269,7 +269,7 @@ class TossAdapter(MallAdapter):
             headers = {
                 "Authorization": f"Bearer {self._token()}",
                 "Accept": "application/json",
-                "User-Agent": "HMS/1.0",
+                "User-Agent": "OWS/1.0",
             }
             try:
                 r = self._sess().request(method, url, params=params, json=json_body,

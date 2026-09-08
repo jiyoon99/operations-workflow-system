@@ -1,4 +1,4 @@
-"""엑셀 주문 임포터 패키지 (하프북 주문 워크플로 이식본, 순수 stdlib).
+"""엑셀 주문 임포터 패키지 (업무관리 주문 워크플로 이식본, 순수 stdlib).
 
 - excel: 자체 XLSX 파서 / XLSX 생성 (.xls는 LibreOffice 변환 의존)
 - mall_excel: 채널 자동감지 임포터 (import_workbook)

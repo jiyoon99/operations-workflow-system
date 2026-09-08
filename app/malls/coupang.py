@@ -53,7 +53,7 @@ PAGE_LIMIT = 200           # nextToken이 안 끝나는 이상 상황 방어(최
 TIMEOUT = 25               # 초 — 대량 구간은 응답이 느리다
 DEFAULT_COURIER = "CJGLS"  # 기본 택배사(CJ대한통운)
 
-# ★같은 계정에 렌탈(RMS)·판매(HMS) 상품이 함께 있다. 렌탈 주문이 HMS로 들어오면
+# ★같은 계정에 렌탈(RMS)·판매(OWS) 상품이 함께 있다. 렌탈 주문이 OWS로 들어오면
 #   판매 출고 사고가 난다(2026-08-05 대표 지적, 실측 쿠팡 1건·스마트스토어 1건 유입).
 #   스마트스토어에 이미 있는 분류를 그대로 옮긴다 — 두 몰이 다르게 굴면 한쪽에만 구멍이 생긴다.
 RENTAL_KEYWORDS = ("렌탈", "렌트", "대여", "임대", "사용기간")
@@ -134,7 +134,7 @@ class CoupangAdapter(MallAdapter):
             "X-Requested-By": _s(self.s.get("wing_id")),   # 판매자 ID — 필수 헤더
             "Content-Type": "application/json;charset=UTF-8",
             "Accept": "application/json",
-            "User-Agent": "HMS/1.0",
+            "User-Agent": "OWS/1.0",
         }
 
     def _expiry_hint(self):
@@ -332,7 +332,7 @@ class CoupangAdapter(MallAdapter):
                 opt = ""   # 옵션 없는 단품은 상품명과 같은 값이 오기도 한다
             price = _money(it.get("orderPrice")) or _money(it.get("salesPrice")) * qty
             # ★제품코드는 '등록상품명(판매자 관리용)'에도 들어온다(2026-08-04 대표 확인).
-            #   쿠팡 WING의 그 칸은 발주서에 쓰이는 판매자용 이름이고, 하프북은 거기에
+            #   쿠팡 WING의 그 칸은 발주서에 쓰이는 판매자용 이름이고, 업무관리은 거기에
             #   고도몰과 같은 제품코드(NT371B5M_i7-7_내장)를 넣어 두고 있다.
             #   판매자상품코드(externalVendorSkuCode)가 비어 오면 여기서 코드를 뽑는다 —
             #   안 그러면 쿠팡 내부 번호(95787471151)가 코드 자리에 들어가 고도몰과 안 맞는다.
@@ -347,6 +347,12 @@ class CoupangAdapter(MallAdapter):
                 # 렌탈/판매 분류에 쓸 쿠팡 상품번호(등록상품ID) — 코드와 달리 몰이 정한 값이라
                 # 상품명이 바뀌어도 그대로다.
                 "pid": _s(it.get("sellerProductId")) or _s(it.get("productId")),
+                # ★상품 페이지 링크용(2026-08-14 대표) — URL은 '노출상품ID'(productId)를 쓴다.
+                #   등록상품ID(sellerProductId)를 넣으면 열리지 않는다: 대표 실물 확인
+                #   등록 16063461329 안에 노출 9616118750 + 옵션ID 6개.
+                #   vendorItemId까지 있으면 '그 옵션'이 선택된 채로 열린다(제목=옵션표라 중요).
+                "urlPid": _s(it.get("productId")),
+                "itemId": _s(it.get("vendorItemId")),
             })
 
     def _to_order(self, b):
@@ -378,6 +384,9 @@ class CoupangAdapter(MallAdapter):
             productName=main["name"],
             optionName=" / ".join(x for x in parts if x),
             productCode=main["code"],
+            # 상품명 링크가 '그 상품(그 옵션)'으로 가게 — 노출상품ID + 옵션ID
+            mallProductId=main.get("urlPid") or "",
+            mallItemId=main.get("itemId") or "",
             quantity=max(1, sum(line["qty"] for line in lines)),
             amount=sum(line["amount"] for line in lines),
             recipient=b["recipient"],

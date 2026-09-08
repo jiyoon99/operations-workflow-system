@@ -17,7 +17,15 @@
   바꾸는 부수효과가 있으므로 키 발급 후에도 실주문 1건으로만 단계 검증할 것.
 - 응답 키 이름이 문서 버전마다 달라서(odNo/orderNo, rcvrNm/receiverName …) 단일 키를 믿지 않고
   _first()로 후보를 순서대로 훑는다. 응답 껍데기 이름도 마찬가지라 _find_rows()로 찾아낸다.
+- ★2026-08-31 실주문 응답으로 실제 키 확정(주문번호·주문일시·상품코드만 오고 수취인/상품명이
+  비던 사고 수정). 실키는 후보 맨 앞에 둔다:
+    수취인=dvpCustNm(주문자=odrNm) / 휴대폰=dvpMphnNo(주문자=mphnNo) / 우편번호=dvpZipNo
+    주소=dvpStnmZipAddr+dvpStnmDtlAddr(도로명) / 상품명=spdNm / 단품명=sitmNm
+    판매자 상품코드(자사 제품코드 축)=epdNo / 롯데온 상품번호=spdNo / 주문완료일시=odCmptDttm
+    금액: 판매금액=slAmt·단가=slPrc·고객실결제=actualAmt·혜택합=fvrAmtSum
+          분담: 업체=prEntpShrAmtSum / 롯데=prSfcoShrAmtSum / 추가옵션=pdAdtnOptJsn(JSON 배열)
 """
+import json
 from datetime import timedelta
 
 import requests
@@ -157,6 +165,34 @@ def _flatten(row):
     return [{**parent, **child} for child in children]
 
 
+def _extra_options(line):
+    """추가옵션(pdAdtnOptJsn) — JSON 배열(문자열로 오기도 한다)을 옵션 조각으로 편다.
+
+    실측 건은 빈 배열이라 안쪽 모양을 다 모른다 — dict 안의 문자열/숫자 값만 조심스럽게
+    이어 붙인다(고도몰 옵션 배열 미파싱으로 챙길 옵션이 빠졌던 사고의 재발 방지)."""
+    raw = line.get("pdAdtnOptJsn") if isinstance(line, dict) else None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text in ("[]", "{}"):
+            return []
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return [text[:120]]
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if isinstance(item, dict):
+            piece = " ".join(str(v).strip() for v in item.values()
+                             if isinstance(v, (str, int, float)) and str(v).strip())
+            if piece:
+                out.append(piece[:120])
+        elif isinstance(item, (str, int, float)) and str(item).strip():
+            out.append(str(item).strip()[:120])
+    return out
+
+
 @register
 class LotteonAdapter(MallAdapter):
     code = "lotteon"
@@ -184,7 +220,7 @@ class LotteonAdapter(MallAdapter):
             "Accept-Language": "ko",
             "X-Timezone": "GMT+09:00",
             "Content-Type": "application/json",
-            "User-Agent": "HMS/1.0",
+            "User-Agent": "OWS/1.0",
         }
 
     def _post(self, path, body, timeout=30):
@@ -365,7 +401,8 @@ class LotteonAdapter(MallAdapter):
 
     def _merge(self, od_no, lines):
         main = lines[0]
-        product_name = _first(main, "prdNm", "prdNmKor", "productName", "goodsNm", "itemNm")
+        # ★실측(2026-08-31): 상품명=spdNm, 단품(옵션)명=sitmNm. 옛 후보(prdNm…)는 폴백 유지.
+        product_name = _first(main, "spdNm", "prdNm", "prdNmKor", "productName", "goodsNm", "itemNm")
         option_parts = []
         main_option = _first(main, "optNm", "optnNm", "prdOptNm", "optionName", "itemOptNm", "sitmNm")
         if main_option and main_option != product_name:
@@ -377,27 +414,34 @@ class LotteonAdapter(MallAdapter):
             qty = _int(_first(line, "odQty", "orderQty", "qty", "dlvQty", "ordQty")) or 1
             quantity += qty
             amount += self._line_amount(line, qty)
+            # 추가옵션(pdAdtnOptJsn) — RAM 추가 같은 선택이 실려 오면 옵션에 함께 남긴다
+            for extra in _extra_options(line):
+                if extra not in option_parts:
+                    option_parts.append(extra)
             if line is main:
                 continue
-            name = _first(line, "prdNm", "prdNmKor", "productName", "goodsNm", "itemNm")
+            name = _first(line, "spdNm", "prdNm", "prdNmKor", "productName", "goodsNm", "itemNm")
             opt = _first(line, "optNm", "optnNm", "prdOptNm", "optionName", "itemOptNm", "sitmNm")
             label = " ".join(x for x in [name, f"({opt})" if opt and opt != name else ""] if x)
-            if label:
+            if label and label != product_name and label not in option_parts:
                 option_parts.append(label)
 
         # 수취인 정보는 주문 공통이지만 행마다 비어 올 수 있어 값이 있는 첫 행에서 집는다.
-        recipient = self._pick(lines, "rcvrNm", "rcvrName", "receiverName", "dlvNm", "rcvNm")
-        phone = self._pick(lines, "rcvrPrtblNo", "rcvrMpNo", "rcvrCellNo", "receiverPhone",
-                           "rcvrTelNo", "rcvrHpNo")
-        postal = self._pick(lines, "rcvrZipNo", "rcvrZipCd", "rcvrZipcode", "zipNo", "rcvrPostNo")
-        base_addr = self._pick(lines, "rcvrBaseAddr", "rcvrRoadBaseAddr", "rcvrAddr",
-                               "baseAddr", "receiverAddress")
-        detail_addr = self._pick(lines, "rcvrDtlAddr", "rcvrRoadDtlAddr", "dtlAddr",
-                                 "receiverAddressDetail")
-        message = self._pick(lines, "dlvMsg", "dlvMemo", "deliveryMessage", "shipMsg",
+        # ★실측: 배송지(dvp*) 계열이 진짜 수취인이고, odrNm/mphnNo 는 주문자(마지막 폴백).
+        recipient = self._pick(lines, "dvpCustNm", "rcvrNm", "rcvrName", "receiverName",
+                               "dlvNm", "rcvNm", "odrNm")
+        phone = self._pick(lines, "dvpMphnNo", "rcvrPrtblNo", "rcvrMpNo", "rcvrCellNo",
+                           "receiverPhone", "rcvrTelNo", "rcvrHpNo", "dvpTelNo", "mphnNo")
+        postal = self._pick(lines, "dvpZipNo", "rcvrZipNo", "rcvrZipCd", "rcvrZipcode",
+                            "zipNo", "rcvrPostNo")
+        base_addr = self._pick(lines, "dvpStnmZipAddr", "rcvrBaseAddr", "rcvrRoadBaseAddr",
+                               "rcvrAddr", "baseAddr", "receiverAddress")
+        detail_addr = self._pick(lines, "dvpStnmDtlAddr", "rcvrDtlAddr", "rcvrRoadDtlAddr",
+                                 "dtlAddr", "receiverAddressDetail")
+        message = self._pick(lines, "dvMsg", "dlvMsg", "dlvMemo", "deliveryMessage", "shipMsg",
                              "rcvrMsg", "dlvReqCn")
-        ordered_at = self._pick(lines, "odDtm", "orderDtm", "odYmd", "odDt", "orderDate",
-                                "pymCmptDtm", "regDtm", "sndInstDtm")
+        ordered_at = self._pick(lines, "odCmptDttm", "odDtm", "orderDtm", "odYmd", "odDt",
+                                "orderDate", "pymCmptDtm", "regDtm", "owhoDttm", "sndInstDtm")
 
         return self.order(
             importKey=f"롯데온:{od_no}",
@@ -405,9 +449,19 @@ class LotteonAdapter(MallAdapter):
             orderedAt=_fmt_dt(ordered_at),
             productName=product_name,
             optionName=" / ".join(option_parts),
-            # 자사 코드 매칭에 쓰기 좋은 판매자상품코드를 먼저 본다(없으면 롯데온 단품/상품번호).
-            productCode=self._pick(lines, "vndPrdCd", "sellerPrdCd", "prtnPrdCd", "spdNo",
-                                   "sitmNo", "prdNo"),
+            # 판매자상품코드(자사 제품코드 축)만 제품코드 칸에 넣는다. ★실측:
+            # epdNo="X13 Gen3_i5-12_내장 AA" — 우리 제품코드 축 그대로.
+            # ★롯데온 내부번호(spdNo "LO…"·sitmNo·prdNo)는 여기 안 넣는다(2026-09-01 대표
+            #   "롯데온 고유코드는 필요하지 않아") — 제품코드 칸은 고도몰 스펙·자산 재고
+            #   매칭의 열쇠라 몰 내부번호가 박히면 매칭만 막는다. 내부번호는 아래
+            #   mallProductId/mallItemId(몰 상품 식별자 축)로 보존한다.
+            # ★등급 꼬리(" AA")는 여기서 떼지 않는다(적대 리뷰) — 롯데온은 상품명(spdNm=소매
+            #   제목)·옵션 어디에도 등급이 없어 이 꼬리가 등급의 유일한 운반체다(떼면 영구
+            #   소실). 고도몰 스펙·재고 대조는 product_info 의 sku_of/폴백이 꼬리를 떼어
+            #   맞추고, 송장 요구등급(_order_grade)은 이 꼬리를 그대로 읽는다.
+            productCode=self._pick(lines, "epdNo", "vndPrdCd", "sellerPrdCd", "prtnPrdCd"),
+            mallProductId=self._pick(lines, "spdNo", "prdNo"),
+            mallItemId=self._pick(lines, "sitmNo"),
             quantity=max(1, quantity),
             amount=amount,
             recipient=recipient,
@@ -419,17 +473,24 @@ class LotteonAdapter(MallAdapter):
         )
 
     def _line_amount(self, line, qty):
-        """단품 금액. 실결제금액 계열이 있으면 그걸 쓰고, 없을 때만 판매가×수량으로 계산한다.
+        """단품 금액 — ★실측(2026-08-31 실주문)으로 확정.
 
-        salePrc가 단가인지 합계인지 문서상 애매해서, 합계로 명시된 필드를 우선한다.
-        (키 발급 후 실주문 1건으로 금액이 맞는지 반드시 대조할 것)
+        실키: slAmt=판매금액(합계) / slPrc=판매단가 / actualAmt=고객 실결제 /
+              fvrAmtSum=혜택 합 = 업체 분담(prEntpShrAmtSum) + 롯데 분담(prSfcoShrAmtSum)+α.
+        매출 = 판매금액 − '우리(업체) 분담 할인'만. 롯데 분담 쿠폰은 정산에서 보전되므로
+        빼지 않는다(고도몰 간편결제 자사포인트 사고와 같은 기준). actualAmt(고객 실결제)는
+        롯데 분담분까지 빠져 있어 매출로 쓰면 과소로 잡힌다.
         """
         paid = _int(_first(line, "rlPayAmt", "realPayAmt", "pymAmt", "payAmt",
                            "totPayAmt", "sumAmt", "odAmt"))
         if paid:
             return paid
-        unit = _int(_first(line, "salePrc", "salePrice", "prdPrc", "unitPrc", "sellPrc"))
-        return unit * max(1, qty)
+        entp_share = _int(_first(line, "prEntpShrAmtSum", "entpShrAmt"))
+        total = _int(_first(line, "slAmt"))
+        if total:
+            return max(0, total - entp_share)
+        unit = _int(_first(line, "slPrc", "salePrc", "salePrice", "prdPrc", "unitPrc", "sellPrc"))
+        return max(0, unit * max(1, qty) - entp_share)
 
     @staticmethod
     def _pick(lines, *names):

@@ -578,6 +578,26 @@ def put_settings():
             #   되살아나 '비우면 0%'라는 안내와 어긋난다(2026-07-29 확인).
             if key == "settlement" and isinstance(value, dict) and "rates" in value:
                 merged["rates"] = value["rates"]
+            # ★운송장 문구 — 모르는 키워드는 종이에 빈칸으로 나간다. 저장 단계에서 막는다
+            #   (2026-08-24 대표 지시로 문구를 편집 가능하게 열었다).
+            # ★집화 휴무일 목록도 '보낸 그대로'가 정답이다(2026-09-07) — 병합하면 화면에서
+            #   지운 공휴일이 되살아나 그 날 예약이 계속 막힌다(수수료율 표와 같은 함정).
+            if key == "cj" and isinstance(value, dict) and isinstance(value.get("pickup"), dict) \
+                    and "holidays" in value["pickup"]:
+                merged.setdefault("pickup", {})["holidays"] = value["pickup"]["holidays"]
+            if key == "cj" and isinstance(value, dict) and "label_tmpl" in value:
+                from ..orders.waybill import check_label_tmpl
+                tm = value.get("label_tmpl") or {}
+                for which in ("item", "remark"):
+                    bad = check_label_tmpl(tm.get(which) or "", which)
+                    if bad:
+                        where = "상품명 칸" if which == "item" else "배송메세지 칸"
+                        abort(400, description=(
+                            f"{where}에 쓸 수 없는 키워드가 있습니다: "
+                            + ", ".join(f"[{b}]" for b in bad[:5])
+                            + ". 화면의 키워드 목록에서 골라 주세요."))
+                merged["label_tmpl"] = {k: (tm.get(k) or "").strip()
+                                       for k in ("item", "remark")}
             conn.execute(
                 "INSERT INTO settings(key, value, updated_at, updated_by) VALUES(?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
@@ -619,7 +639,7 @@ def backups():
     if mirror is not None:
         try:
             mirror.mkdir(parents=True, exist_ok=True)
-            probe = mirror / ".hms-write-test"
+            probe = mirror / ".ows-write-test"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
             mirror_ok = True
@@ -631,7 +651,7 @@ def backups():
         "retentionDays": config.BACKUP_RETENTION_DAYS,
         "mirror": str(mirror) if mirror else "",
         "mirrorWritable": mirror_ok,
-        "mirrorCount": len(list(mirror.glob("hms-*.db"))) if (mirror and mirror.exists()) else 0,
+        "mirrorCount": len(list(mirror.glob("ows-*.db"))) if (mirror and mirror.exists()) else 0,
     })
 
 
@@ -653,7 +673,7 @@ def download_backup(name):
     """백업 내려받기 — 대표가 PC 밖(USB·클라우드)에 보관할 수 있어야 한다."""
     require("settings.manage")
     # 목록이 보여주는 파일은 전부 받을 수 있어야 한다(종료 스냅샷 shutdown-latest.db 포함)
-    if not re.fullmatch(r"(hms-[A-Za-z0-9_-]+|shutdown-latest)\.db", name or ""):
+    if not re.fullmatch(r"(ows-[A-Za-z0-9_-]+|shutdown-latest)\.db", name or ""):
         abort(400, description="백업 파일 이름이 올바르지 않습니다.")
     path = backup_dir(current_app.config["DB_PATH"]) / name
     if not path.exists():

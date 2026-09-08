@@ -63,7 +63,8 @@ function attachAutocomplete(input, field) {
     list.innerHTML = options.map((o, i) => `
       <div class="ac-item${i === active ? " active" : ""}" data-i="${i}">
         <span>${acHighlight(o.value, q)}</span>
-        ${o.source === "used" ? '<span class="ac-tag">사용 중</span>' : ""}
+        ${o.source === "used" ? '<span class="ac-tag">사용 중</span>'
+          : o.source === "master" ? `<span class="ac-tag">${o.hint ? escapeHtml(o.hint) + " · " : ""}마스터</span>` : ""}
       </div>`).join("");
     wrap.appendChild(list);
     list.querySelectorAll(".ac-item").forEach((el) => {

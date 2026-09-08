@@ -1,16 +1,16 @@
 """QC 프로그램 폴더 실시간 감시 — 셋팅/QC 단계를 자동으로 따라오게 한다.
 
-대표 지시(2026-08-05): `\\\\192.168.0.185\\order-data` 를 보고
+대표 지시(2026-08-05): `\\\\127.0.0.1\\order-data` 를 보고
 제작대기 / 제작완료 / 검수완료 체크가 실시간으로 반영되게 할 것.
 
 ★왜 파일을 보나
   QC 프로그램(구 order-workflow)이 그 폴더의 orders.json 에 작업 결과를 쓴다.
-  HMS가 그 파일을 주기적으로 읽어 '더 진행된 단계'만 따라간다 —
+  OWS가 그 파일을 주기적으로 읽어 '더 진행된 단계'만 따라간다 —
   대표가 매번 손으로 올리던 것을 없앤 것뿐, 넣는 방식은 [데이터 이관]과 같다.
 
 ★안전 규칙 (설정 화면 이관과 동일)
   - **전진만** 반영한다(미완료 → 완료). 되돌리지 않는다.
-    HMS에서도 같은 주문을 만지므로, 파일이 옛것이면 되돌리기가 일을 지운다.
+    OWS에서도 같은 주문을 만지므로, 파일이 옛것이면 되돌리기가 일을 지운다.
   - 파일이 안 바뀌었으면(수정시각+크기 동일) 읽지도 않는다 — 네트워크 부담 0.
   - 폴더가 없거나 끊겨도 서버는 계속 돈다. 다음 주기에 다시 시도한다.
   - 계정(users.json)은 건드리지 않는다. 주문 단계만 본다.
@@ -31,9 +31,18 @@ from .qc_import import _plan, _s
 #   쓰는 자리(sync_once)에서 늦게 불러온다.
 
 # 기본 감시 대상. 설정에서 바꿀 수 있다(설정 → 데이터 이관).
-DEFAULT_PATH = r"\\192.168.0.185\order-data"
+DEFAULT_PATH = r"\\127.0.0.1\order-data"
 TICK_SECONDS = 20          # 실시간감을 주되 네트워크를 두드리지 않는 간격
 SETTING_KEY = "qc_watch"
+
+# ★2026-08-07 대표 지시로 QC 실시간 연동을 껐다.
+#   "셋팅 및 QC는 OWS를 바로 관련 사람들이 사용할 예정이니까. 앞으로 OWS에서 데이터가 쌓일거야."
+#
+#   ★DB에 저장된 설정이 '켬'이어도 이 상수가 이긴다. 일부러 그렇게 했다 —
+#     '꺼 달라'는 지시가 예전 설정값보다 위다. 저장값만 바꿔 두면 다음에 누가
+#     설정 화면을 잘못 눌러 되살아난다.
+#   되살리려면 환경변수 OWS_QC_WATCH=1.
+QC_LIVE = os.getenv("OWS_QC_WATCH") == "1"
 
 _last_seen = {"sig": None, "at": "", "applied": 0, "error": ""}
 
@@ -44,8 +53,13 @@ def _cfg(conn):
         d = json.loads(row["value"]) if row else {}
     except Exception:                                            # noqa: BLE001
         d = {}
-    return {"enabled": bool(d.get("enabled", True)),
+    return {"enabled": QC_LIVE and bool(d.get("enabled", True)),
             "path": _s(d.get("path")) or DEFAULT_PATH}
+
+
+def qc_live():
+    """QC 프로그램을 실시간으로 따라가는 중인가. 껐으면 아무 데도 붙지 않는다."""
+    return QC_LIVE
 
 
 def _orders_file(base):
@@ -162,7 +176,7 @@ def start_qc_watch(app):
                 app.logger.warning("QC 폴더 감시 실패: %s", e)
             time.sleep(TICK_SECONDS)
 
-    t = threading.Thread(target=loop, name="hms-qc-watch", daemon=True)
+    t = threading.Thread(target=loop, name="ows-qc-watch", daemon=True)
     t.start()
     return t
 
@@ -176,6 +190,8 @@ def qc_watch_status():
     path = _orders_file(cfg["path"])
     return jsonify({
         "enabled": cfg["enabled"], "folder": cfg["path"],
+        # ★2026-08-07 대표 지시로 아예 꺼 둔 상태인지 — 화면이 '고장'과 구분해 보여 준다
+        "live": QC_LIVE,
         "file": path, "found": bool(path),
         "intervalSeconds": TICK_SECONDS,
         "lastAt": _last_seen.get("at", ""),

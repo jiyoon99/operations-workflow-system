@@ -7,16 +7,18 @@
 - 관리번호 입력은 자산번호 FK 매칭으로 승격 (자산 상태 검증 + 자산 이력 기록)
 """
 import json
+import re
 
 from flask import Blueprint, abort, g, jsonify, request
 
 from .. import audit, config
 from ..auth.perms import ORDER_READ_PERMS, require, require_any
-from ..db import get_db, tx
+from ..db import DIVISION_RENTAL, get_db, tx
 from ..prep import options_for_order as prep_options_for_order
 from ..prep import options_for_orders as prep_options_for_orders
 from ..prep import unchecked_for_order as prep_unchecked_for_order
-from ..purchase import ASSET_STATUSES, AVAILABLE_STATUSES, asset_event
+from ..purchase import (ASSET_STATUSES, AVAILABLE_STATUSES, _unlist,
+                        apply_checked_option_parts, asset_event, revert_option_parts)
 from ..settings import _int_or_400, _money_or_400
 
 bp = Blueprint("orders", __name__, url_prefix="/api")
@@ -117,8 +119,13 @@ def order_payload(conn, row, prep_map=None):
     ms = mall_status_of(row, delivered)
     pii = can_see_pii()
     assets = conn.execute(
-        "SELECT a.id, a.asset_no, a.model, a.maker, a.grade, a.status, oa.matched_by, oa.matched_at "
+        "SELECT a.id, a.asset_no, a.model, a.maker, a.grade, a.status, oa.matched_by, oa.matched_at, "
+        "       oa.prepared, oa.prepared_by, p.id AS prebuild_id, "
+        "       p.spec_change_required, p.spec_change_reason, p.built_ram_type, "
+        "       p.built_ram_primary, p.built_ram2_type, p.built_ram2, p.built_ram, "
+        "       p.built_ssd_type, p.built_ssd, p.built_hdd "
         "FROM order_assets oa JOIN assets a ON a.id = oa.asset_id "
+        "LEFT JOIN asset_prebuilds p ON p.asset_id=a.id AND p.used_order_id=oa.order_id "
         "WHERE oa.order_id=? ORDER BY a.asset_no", (row["id"],)
     ).fetchall()
     # ★종류를 함께 내려준다 — 회수 송장을 출고 송장으로 착각하면 인쇄·재발급·취소가 모두 막힌다
@@ -134,6 +141,9 @@ def order_payload(conn, row, prep_map=None):
         "productName": row["product_name"],
         "optionName": row["option_name"],
         "productCode": row["product_code"],
+        # 몰의 상품/옵션 식별자 — 상품명 링크를 '그 상품(그 옵션)'으로 보낸다
+        "mallProductId": row["mall_product_id"] if "mall_product_id" in row.keys() else "",
+        "mallItemId": row["mall_item_id"] if "mall_item_id" in row.keys() else "",
         # 택배가 아니면 송장이 필요 없다 — 셋팅·배송 화면이 이 값을 보고 판단한다
         "receiveMethod": row["receive_method"],
         "quantity": row["quantity"],
@@ -156,11 +166,18 @@ def order_payload(conn, row, prep_map=None):
         "categoryId": row["category_id"],
         "isReview": bool(row["is_review"]),
         "reviewNote": row["review_note"],
+        # 옵션라벨 인쇄 여부(2026-08-31) — 주문관리 일괄 인쇄가 '안 뽑은 것만' 거르는 기준
+        "optLabelAt": row["opt_label_at"],
+        "optLabelBy": row["opt_label_by"],
         "courier": row["courier"],
         "trackingNumber": row["tracking_no"],
         # 쇼핑몰 관점 상태(입금대기/준비중/배송중/배송완료/취소)
         "mallStatus": ms,
         "mallStatusLabel": MALL_STATUS_LABELS.get(ms, ms),
+        # 송장번호를 쇼핑몰에 보냈는지(2026-09-08 대표 "고도몰 가서 내가 직접 입력해야 하니까") —
+        # 셋팅 보드가 '몰 전송됨/미전송' 칩으로 보여 준다. 실패 사유는 배송/송장 화면 목록에도 뜬다.
+        "mallSentAt": row["mall_sent_at"] or "",
+        "mallSendError": row["mall_send_error"] or "",
         "payStatus": row["pay_status"],
         "deliveredAt": row["delivered_at"],
         "preparing": bool(row["preparing"]),
@@ -190,7 +207,21 @@ def order_payload(conn, row, prep_map=None):
             {"assetId": a["id"], "assetNo": a["asset_no"], "model": a["model"], "maker": a["maker"],
              "grade": a["grade"], "status": a["status"],
              "statusLabel": ASSET_STATUSES.get(a["status"], a["status"]),
-             "matchedBy": a["matched_by"], "matchedAt": a["matched_at"]}
+             "matchedBy": a["matched_by"], "matchedAt": a["matched_at"],
+             "isPrebuilt": bool(a["prebuild_id"]),
+             "prebuildRam1Type": a["built_ram_type"] or "",
+             "prebuildRam1": a["built_ram_primary"] or "",
+             "prebuildRam2Type": a["built_ram2_type"] or "",
+             "prebuildRam2": a["built_ram2"] or "",
+             "prebuildRamTotal": a["built_ram"] or "",
+             "prebuildSsdType": a["built_ssd_type"] or "",
+             "prebuildSsd": a["built_ssd"] or "",
+             "prebuildHdd": a["built_hdd"] or "",
+             "prebuildReworkRequired": bool(a["spec_change_required"] or 0),
+             "prebuildReworkReason": (a["spec_change_reason"] or ""),
+             # 대별 준비 체크(2026-08-24) — 옛 행에는 칸이 없을 수 있어 안전하게 읽는다
+             "prepared": bool(a["prepared"] if "prepared" in a.keys() else 0),
+             "preparedBy": (a["prepared_by"] if "prepared_by" in a.keys() else "") or ""}
             for a in assets
         ],
         "waybills": [
@@ -218,10 +249,16 @@ def _get_order_or_404(conn, oid):
     return row
 
 
-def _conflict(conn, oid, msg):
-    """409 + 최신 주문 동봉 — 프론트 자동 복구 계약(원본 설계 계승)."""
+def _conflict(conn, oid, msg, code=""):
+    """409 + 최신 주문 동봉 — 프론트 자동 복구 계약(원본 설계 계승).
+
+    code 는 화면이 '무엇을 물어봐야 하는지' 가릴 때 쓴다(예: waybill_open → 그래도 취소할지).
+    """
     row = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-    resp = jsonify({"error": msg, "order": order_payload(conn, row) if row else None})
+    body = {"error": msg, "order": order_payload(conn, row) if row else None}
+    if code:
+        body["code"] = code
+    resp = jsonify(body)
     resp.status_code = 409
     return resp
 
@@ -243,11 +280,32 @@ def _order_scope_clause():
     return f" AND (o.category_id IS NULL OR o.category_id IN ({ph}))", ids
 
 
+# 몰별 기본 판매수수료율(%) — 대표 지시(2026-08-11): "채널별 수수료는 일단 기본 값으로".
+# 노트북·디지털 카테고리의 공개 통상 요율 기준 '추정 기본값'이다. 몰과 계약·카테고리에 따라
+# 다르므로 ★설정 ▸ 정산에서 저장한 값이 항상 이긴다(채널별로 덮어쓰기, 0도 존중).
+# 전화·방문·b2b 같은 직거래 채널은 목록에 없으므로 _default(0)를 타 수수료가 붙지 않는다.
+DEFAULT_FEE_RATES = {
+    "고도몰": 3.4,          # 자사몰 — PG 결제수수료 수준
+    "쿠팡": 5.0,            # 노트북 카테고리 통상
+    "스마트스토어": 5.6,    # 결제수수료 + 네이버쇼핑 연동수수료
+    "카카오": 4.5,          # 톡스토어 통상
+    "토스": 2.0,
+    "11번가": 5.0,
+    "롯데온": 5.5,
+    "G마켓": 5.5,
+    "옥션": 5.5,
+    "테무": 0,              # 정산 구조가 달라 요율로 못 잡는다 — 손으로
+    "_default": 0,          # 모르는 채널·직거래에 함부로 수수료를 붙이지 않는다
+}
+
+
 def settlement_settings(conn):
     """정산 설정 — 몰별 판매수수료율(%)과 기본 출고 택배비.
 
     {"rates": {"쿠팡": 10.8, "고도몰": 3.4, "_default": 0}, "shippingCost": 3000}
-    비어 있으면 0 — 설정하기 전까지는 아무것도 임의로 깎지 않는다.
+    저장값이 없는 채널은 기본 요율(DEFAULT_FEE_RATES)을 쓴다. 저장값은 0이라도 존중 —
+    "이 채널은 수수료 없음"을 대표가 정한 것일 수 있어서다.
+    택배비는 기본값을 두지 않는다(계약 단가를 모르는 채 지어내면 원가가 오염된다).
     """
     row = conn.execute("SELECT value FROM settings WHERE key='settlement'").fetchone()
     data = {}
@@ -262,7 +320,8 @@ def settlement_settings(conn):
         ship = int(float(str(data.get("shippingCost") or 0).replace(",", "").strip() or 0))
     except (TypeError, ValueError):
         ship = 0
-    return {"rates": data.get("rates") or {}, "shippingCost": max(0, ship)}
+    return {"rates": {**DEFAULT_FEE_RATES, **(data.get("rates") or {})},
+            "shippingCost": max(0, ship)}
 
 
 def fee_for(cfg, channel, amount):
@@ -278,15 +337,31 @@ def fee_for(cfg, channel, amount):
     return (round(int(amount or 0) * rate / 100), rate) if rate else (0, 0.0)
 
 
+def extras_sums(conn, oid):
+    """이 주문의 추가 결제 합(금액, 수수료). 자동 수수료 계산이 반드시 이걸 빼고 계산한다.
+
+    ★안 빼면 입금(무수수료) 추가분에도 몰 요율이 붙고, 몰 결제 추가분은 두 번 붙는다.
+    """
+    r = get_db().execute(
+        "SELECT COALESCE(SUM(amount),0) AS a, COALESCE(SUM(fee),0) AS f "
+        "FROM order_extras WHERE order_id=?", (oid,)).fetchone() if conn is None else conn.execute(
+        "SELECT COALESCE(SUM(amount),0) AS a, COALESCE(SUM(fee),0) AS f "
+        "FROM order_extras WHERE order_id=?", (oid,)).fetchone()
+    return r["a"] or 0, r["f"] or 0
+
+
 def apply_settlement_defaults(conn, oid, row):
     """출고 확인 시 수수료·택배비를 자동으로 채운다(사람이 확정한 값은 건드리지 않는다)."""
     cfg = settlement_settings(conn)
     sets, params = [], []
     if not row["fee_manual"]:
-        fee, rate = fee_for(cfg, row["channel"], row["amount"])
-        if fee or rate:
+        # ★추가 결제(order_extras)는 각자 방법대로 수수료가 이미 정해져 있다 —
+        #   기본 요율은 '몰에서 원래 결제된 몫'에만 건다(2026-08-24).
+        ex_amt, ex_fee = extras_sums(conn, oid)
+        fee, rate = fee_for(cfg, row["channel"], (row["amount"] or 0) - ex_amt)
+        if fee or rate or ex_fee:
             sets += ["fee_amount=?", "fee_rate=?"]
-            params += [fee, rate]
+            params += [fee + ex_fee, rate]
     if not row["shipping_cost"] and cfg["shippingCost"]:
         sets.append("shipping_cost=?")
         params.append(cfg["shippingCost"])
@@ -303,7 +378,8 @@ def recalc_fee_for_amount(conn, oid, row):
     if row["fee_manual"] or not row["fee_rate"]:
         return None
     new_row = conn.execute("SELECT channel, amount FROM orders WHERE id=?", (oid,)).fetchone()
-    fee = round((new_row["amount"] or 0) * row["fee_rate"] / 100)
+    ex_amt, ex_fee = extras_sums(conn, oid)
+    fee = round(((new_row["amount"] or 0) - ex_amt) * row["fee_rate"] / 100) + ex_fee
     if fee != row["fee_amount"]:
         conn.execute("UPDATE orders SET fee_amount=? WHERE id=?", (fee, oid))
         return fee
@@ -440,6 +516,10 @@ def _orders_filter_sql(skip=()):
         sql += " AND o.cancelled_at != ''"
     elif view == "archived":
         sql += " AND o.archived_at != ''"
+    # 주문관리의 '진행중' 보기: 결제 대기·출고 준비까지만 포함한다.
+    # 송장이 발급됐거나 출고 확인된 배송중 주문은 배송중 카드에서 별도로 본다.
+    if request.args.get("progressOnly") == "1":
+        sql += f" AND ({_MALL_STATUS_SQL}) NOT IN ('shipping','delivered','cancelled')"
     since = (request.args.get("since") or "").strip()
     if since:
         sql += " AND o.updated_at > ?"
@@ -570,14 +650,17 @@ def export_orders():
     return Response(
         write_xlsx(headers, data),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=hms-orders-{config.today_str()}.xlsx"})
+        headers={"Content-Disposition": f"attachment; filename=ows-orders-{config.today_str()}.xlsx"})
 
 
 @bp.post("/orders/settlement-backfill")
 def settlement_backfill():
     """이미 출고된 주문에 수수료·택배비를 소급 적용한다.
 
-    요율을 처음 넣었을 때 과거분까지 맞추기 위한 것. 손으로 넣은 값은 건드리지 않는다.
+    요율을 넣거나 고쳤을 때 과거분까지 맞추기 위한 것. 자동 산정분(fee_manual=0)은
+    현재 요율로 다시 계산한다 — 기본 요율(DEFAULT_FEE_RATES)로 붙은 수수료가
+    나중에 실요율을 입력해도 옛값으로 굳어 있으면 순이익이 조용히 틀어진다.
+    손으로 확정한 값(0원 직거래 포함)은 건드리지 않는다.
     dryRun이면 얼마가 바뀌는지만 알려준다(대표가 숫자를 보고 결정하도록).
     """
     require("orders.edit")
@@ -588,7 +671,7 @@ def settlement_backfill():
 
     # 사람이 확정한 수수료(0원 직거래 포함)는 건드리지 않는다
     sql = ("SELECT * FROM orders WHERE shipping_done=1 AND cancelled_at='' "
-           "AND fee_manual=0 AND fee_amount=0 AND fee_rate=0")
+           "AND fee_manual=0")
     params = []
     if frm:
         sql += " AND substr(shipping_at,1,10) >= ?"
@@ -606,9 +689,13 @@ def settlement_backfill():
         by_channel = {}
         touched = []
         for r in rows:
-            fee, rate = fee_for(cfg, r["channel"], r["amount"])
+            ex_amt, ex_fee = extras_sums(conn, r["id"])
+            fee, rate = fee_for(cfg, r["channel"], (r["amount"] or 0) - ex_amt)
+            fee += ex_fee
             ship = cfg["shippingCost"] if not r["shipping_cost"] else 0
-            if not fee and not ship:
+            # ★요율만 다른 경우(금액 0원 주문 등)는 건드리지 않는다 — changed에
+            #   452건짜리 허수가 잡혀 dryRun 숫자를 못 믿게 된다.
+            if fee == (r["fee_amount"] or 0) and not ship:
                 continue
             changed += 1
             fee_sum += fee
@@ -659,6 +746,9 @@ def bulk_orders():
         require("orders.cancel")
     elif action in ("payStatus", "delivered", "archive", "unarchive", "review"):
         require("orders.edit")
+    elif action == "optlabel":
+        # 옵션라벨 인쇄 기록 — 주문을 만지는 사람이면 남길 수 있어야 한다
+        require_any("orders.work", "orders.edit")
     else:
         abort(400, description="알 수 없는 일괄 작업입니다.")
 
@@ -694,17 +784,17 @@ def bulk_orders():
                 if row["archived_at"]:
                     failed.append({"id": oid, "label": label, "reason": "보관된 주문은 취소할 수 없습니다."})
                     continue
-                if row["shipping_done"]:
-                    failed.append({"id": oid, "label": label,
-                                   "reason": "출고 확인된 주문입니다. 출고 확인을 해제한 후 취소하세요."})
-                    continue
+                # ★출고 확인된 주문도 취소된다(단건과 같은 규칙, 2026-09-03 대표) —
+                #   아래에서 매칭 자산을 되돌려 자산번호가 자동으로 빠진다.
                 wb = conn.execute(
-                    "SELECT wid FROM waybills WHERE order_id=? AND type='forward' "
-                    "AND status IN ('issued','test') LIMIT 1",
-                    (oid,)).fetchone()
-                if wb:
+                    "SELECT wid, invoice_no, cj_stage_cd FROM waybills WHERE order_id=? "
+                    "AND type='forward' AND status IN ('issued','test') LIMIT 1", (oid,)).fetchone()
+                if wb and not (wb["cj_stage_cd"] or "").strip():
+                    # 아직 집화 전 송장은 일괄에서 건너뛴다 — 기사 헛걸음을 막는다.
+                    # 정말 취소해야 하면 그 건을 열어 단건으로(확인 후) 취소한다.
                     failed.append({"id": oid, "label": label,
-                                   "reason": f"발행된 송장({wb['wid']})을 먼저 취소하세요."})
+                                   "reason": f"아직 집화 전인 송장({wb['invoice_no'] or wb['wid']})이 "
+                                             "있습니다. 송장을 먼저 취소하세요."})
                     continue
                 conn.execute(
                     "UPDATE orders SET cancelled_at=?, cancelled_by=?, cancel_reason=?, preparing=0 "
@@ -717,7 +807,14 @@ def bulk_orders():
                         conn.execute("UPDATE assets SET status=?, updated_at=? WHERE id=?",
                                      (back, now, a["id"]))
                         asset_event(conn, a["id"], "매칭해제", {"orderId": oid, "사유": "주문취소"})
+                # 선제작 자산은 다시 '출고 준비완료·사용 가능'으로 돌린다.
+                # used_at을 비워야 선제작 사용 실적에서도 즉시 빠진다.
+                conn.execute(
+                    "UPDATE asset_prebuilds SET used_order_id=NULL, used_by='', used_at='', "
+                    "credit_voided=0, credit_void_reason='', spec_change_required=0, "
+                    "spec_change_reason='', updated_at=? WHERE used_order_id=?", (now, oid))
                 conn.execute("DELETE FROM order_assets WHERE order_id=?", (oid,))
+                revert_option_parts(conn, oid, actor=actor)   # 옵션 자동 기입분도 회수
                 _log_order("order_cancelled", row, {"reason": reason, "일괄": True})
             elif action == "payStatus":
                 v = "unpaid" if str(value) == "unpaid" else "paid"
@@ -743,6 +840,11 @@ def bulk_orders():
                 conn.execute("UPDATE orders SET is_review=?, review_note=? WHERE id=?",
                              (1 if value else 0,
                               (reason or "제품X 빈박스출고") if value else "", oid))
+            elif action == "optlabel":
+                # 옵션라벨 인쇄 기록(2026-08-31 대표) — 일괄 인쇄가 '안 뽑은 것만' 거르는 기준.
+                # value=False 는 기록 지우기(잘못 찍은 것 정정용 — 화면 버튼은 아직 없다)
+                conn.execute("UPDATE orders SET opt_label_at=?, opt_label_by=? WHERE id=?",
+                             (now if value else "", actor if value else "", oid))
             _touch(conn, oid)
             ok.append(oid)
         audit.log("orders_bulk", target=f"{action} {len(ok)}건",
@@ -989,10 +1091,19 @@ def _stage_check(conn, row, stage, value, actor, is_admin):
             conn.execute(
                 "UPDATE orders SET production_done=1, production_by=?, production_at=?, preparing=0 WHERE id=?",
                 (actor, now, oid))
+            # 사양이 다른 선제작품을 실제로 다시 만들었다. 이 시점에만 기존 선제작·선SW
+            # 실적을 무효화한다(자산번호만 찍고 다른 제품으로 바꾸는 경우에는 차감하지 않는다).
+            conn.execute(
+                "UPDATE asset_prebuilds SET credit_voided=1, credit_void_reason=?, updated_at=? "
+                "WHERE used_order_id=? AND spec_change_required=1",
+                (f"사양변경 제작완료: {actor}", now, oid))
         else:
             if row["inspection_done"]:
                 return "SW 검수가 완료된 주문입니다. 검수를 먼저 해제하세요."
             conn.execute("UPDATE orders SET production_done=0 WHERE id=?", (oid,))
+            conn.execute(
+                "UPDATE asset_prebuilds SET credit_voided=0, credit_void_reason='', updated_at=? "
+                "WHERE used_order_id=? AND spec_change_required=1", (now, oid))
         return None
 
     if stage == "softwareInspection":
@@ -1021,14 +1132,14 @@ def _stage_check(conn, row, stage, value, actor, is_admin):
             if not (row["production_done"] and row["inspection_done"]):
                 return "제작 완료와 SW 검수가 끝나야 출고 확인할 수 있습니다."
             # ★가재고 출고 금지(2026-08-04 대표) — 입고는 됐지만 완전한 수리 전인 물건이다.
-            #   매칭(자산번호 등록)까지는 허용하되, 매입에서 양품/실재고로 바꾸기 전에는
+            #   매칭(자산번호 등록)까지는 허용하되, 매입에서 가용/실재고로 바꾸기 전에는
             #   여기서 막는다. 안 막으면 수리 안 끝난 노트북이 고객에게 나간다.
             prov = [a["asset_no"] for a in conn.execute(
                 "SELECT a.asset_no FROM order_assets oa JOIN assets a ON a.id=oa.asset_id "
                 "WHERE oa.order_id=? AND a.tier='가재고'", (oid,)).fetchall()]
             if prov:
                 return (f"가재고 자산({', '.join(prov)})이 매칭돼 있어 출고할 수 없습니다. "
-                        "매입 화면에서 해당 자산을 양품 또는 실재고로 바꾼 뒤 출고 확인하세요.")
+                        "매입 화면에서 해당 자산을 가용 또는 실재고로 바꾼 뒤 출고 확인하세요.")
             # ★출고일·출고자는 '처음 출고한 때'를 지킨다.
             #   자산 매칭을 고치려고 단계를 껐다 켜는 일이 잦은데, 그때마다 오늘 날짜로
             #   덮으면 지난달 출고분이 이번 달 매출로 넘어가고 담당자 실적도 바뀐다.
@@ -1049,7 +1160,7 @@ def _stage_check(conn, row, stage, value, actor, is_admin):
                     # ★'누구에게 나갔는지'를 자산 이력 자체에 남긴다.
                     #   주문번호만 적어 두면 나중에 주문이 고쳐지거나 지워졌을 때
                     #   추적이 끊긴다. TMS 이관분에는 수령자가 남아 있는데
-                    #   정작 HMS가 새로 출고한 건에 없으면 앞뒤가 안 맞는다(2026-07-31).
+                    #   정작 OWS가 새로 출고한 건에 없으면 앞뒤가 안 맞는다(2026-07-31).
                     asset_event(conn, a["id"], "출고", {
                         "orderId": oid,
                         "주문번호": row["order_no"] or "",
@@ -1057,6 +1168,8 @@ def _stage_check(conn, row, stage, value, actor, is_admin):
                         "채널": row["channel"] or "",
                         "출고일": (keep_at or now)[:10],
                     })
+                # 나간 물건이 몰 재고에 세어지면 안 된다(유령 방지 — 매입 쪽과 같은 원칙)
+                _unlist(conn, a["id"], "출고")
         else:
             conn.execute("UPDATE orders SET shipping_done=0 WHERE id=?", (oid,))
             for a in conn.execute(
@@ -1077,6 +1190,7 @@ def patch_order(oid):
     actor = g.user["display_name"]
     is_admin = bool(g.user["is_admin"])
     push_after = False           # 출고 확인 뒤 몰에 송장번호를 보낼지(트랜잭션 밖에서 처리)
+    extra_warnings = []          # 자산 매칭 경고 — 막지 않고 화면 하단에 알린다
 
     with tx(write=True) as conn:
         row = _get_order_or_404(conn, oid)
@@ -1096,6 +1210,17 @@ def patch_order(oid):
                 fresh = conn.execute("SELECT tracking_no, mall_sent_at FROM orders WHERE id=?",
                                      (oid,)).fetchone()
                 push_after = bool((fresh["tracking_no"] or "").strip() and not fresh["mall_sent_at"])
+
+        elif action == "setupMemo":
+            # 셋팅 작업자가 주문관리 화면으로 이동하지 않고 작업 특이사항을 남긴다.
+            require_any("orders.work", "orders.edit")
+            memo = (body.get("memo") or "").strip()
+            if len(memo) > 500:
+                abort(400, description="비고는 500자 이하로 입력하세요.")
+            if memo != row["memo"]:
+                conn.execute("UPDATE orders SET memo=? WHERE id=?", (memo, oid))
+                _touch(conn, oid)
+                _log_order("order_updated", row, {"셋팅 비고": memo or "(삭제)"})
 
         elif action == "details":
             require("orders.edit")
@@ -1146,6 +1271,66 @@ def patch_order(oid):
             if settle_changes:
                 _log_order("order_settlement", row, settle_changes)
 
+        elif action == "prebuildRework":
+            require("orders.work")
+            if row["shipping_done"]:
+                return _conflict(conn, oid, "출고 확인된 주문은 사양변경으로 전환할 수 없습니다.")
+            try:
+                asset_id = int(body.get("assetId") or 0)
+            except (TypeError, ValueError):
+                asset_id = 0
+            pre = conn.execute(
+                "SELECT p.*,a.asset_no FROM asset_prebuilds p "
+                "JOIN assets a ON a.id=p.asset_id WHERE p.asset_id=? AND p.used_order_id=?",
+                (asset_id, oid)).fetchone()
+            if pre is None:
+                abort(404, description="이 주문에 사용된 선제작 자산을 찾을 수 없습니다.")
+            ram1 = (body.get("ram1") or "").strip().upper()
+            ram2 = (body.get("ram2") or "").strip().upper()
+            ram1_type = (body.get("ram1Type") or "").strip().upper()
+            ram2_type = (body.get("ram2Type") or "없음").strip().upper()
+            ssd = (body.get("ssd") or "").strip().upper()
+            ssd_type_map = {"M.2 NVME": "M.2 NVMe", "M.2 SATA": "M.2 SATA",
+                            "M.2 SSD": "M.2 SSD"}
+            ssd_type = ssd_type_map.get((body.get("ssdType") or "").strip().upper(), "")
+            hdd = (body.get("hdd") or "").strip().upper()
+            ram_types = {"온보드", "D3", "D4", "D5"}
+            ram_sizes = {"4GB", "8GB", "16GB", "24GB", "32GB", "64GB", "128GB"}
+            if (ram1_type not in ram_types or ram1 not in ram_sizes
+                    or ram2_type not in (ram_types | {"없음"})
+                    or (ram2_type != "없음" and ram2 not in ram_sizes)
+                    or ssd_type not in set(ssd_type_map.values())
+                    or ssd not in {"128GB", "256GB", "512GB", "1TB", "2TB", "4TB"}
+                    or hdd not in {"없음", "320GB", "500GB", "1TB", "2TB", "4TB"}):
+                abort(400, description="RAM 구성, SSD 종류·용량, HDD를 확인하세요.")
+            if ram2_type == "없음":
+                ram2 = ""
+            ram_total = int(ram1.removesuffix("GB")) + (
+                int(ram2.removesuffix("GB")) if ram2 else 0)
+            total_ram = f"{ram_total}GB"
+            before = " / ".join(x for x in (pre["built_ram"], pre["built_ssd"],
+                                               f"HDD {pre['built_hdd']}" if pre["built_hdd"] else "") if x)
+            after_ram = f"{ram1_type} {ram1}" + (f" + {ram2_type} {ram2}" if ram2 else "")
+            after = " / ".join((f"{after_ram} (총 {total_ram})", f"{ssd_type} {ssd}", f"HDD {hdd}"))
+            reason = f"{before or '-'} → {after}"[:500]
+            conn.execute(
+                "UPDATE asset_prebuilds SET built_ram_type=?, built_ram_primary=?, "
+                "built_ram2_type=?, built_ram2=?, built_ram=?, built_ssd_type=?, built_ssd=?, "
+                "built_hdd=?, spec_change_required=1, spec_change_reason=?, credit_voided=0, "
+                "credit_void_reason='', updated_at=? WHERE id=?",
+                (ram1_type, ram1, ram2_type, ram2, total_ram, ssd_type, ssd, hdd,
+                 reason, config.now_iso(), pre["id"]))
+            # 같은 사양이라 자동 완료됐던 주문도 실제 변경 작업자가 다시 완료하도록 되돌린다.
+            conn.execute(
+                "UPDATE orders SET production_done=0, production_by='', production_at='', "
+                "inspection_done=0, inspection_by='', inspection_at='', preparing=0 WHERE id=?",
+                (oid,))
+            _touch(conn, oid)
+            asset_event(conn, asset_id, "선제작사양변경선택", {
+                "orderId": oid, "작업자": actor, "사유": reason})
+            _log_order("prebuild_rework_selected", row, {
+                "assetNo": pre["asset_no"], "worker": actor, "reason": reason})
+
         elif action == "assets":
             require("orders.work")
             asset_ids = body.get("assetIds")
@@ -1155,9 +1340,12 @@ def patch_order(oid):
                 if unknown:
                     return _conflict(conn, oid,
                                      f"등록되지 않은 관리번호입니다: {', '.join(unknown[:5])}")
-            err = _set_order_assets(conn, row, asset_ids, actor)
+            err = _set_order_assets(conn, row, asset_ids, actor,
+                                    force=body.get("force") is True)
             if err:
                 return _conflict(conn, oid, err)
+            # 붙는 것 자체는 막지 않고, 주문 제품과 다르면 화면 하단에 알린다(대표 2026-09-03)
+            extra_warnings = asset_match_warnings(conn, row, asset_ids)
             _touch(conn, oid)
 
         elif action == "settlement":
@@ -1175,16 +1363,21 @@ def patch_order(oid):
                 abort(400, description="취소 사유를 1~500자로 입력하세요.")
             if row["archived_at"]:
                 abort(400, description="보관된 주문은 취소할 수 없습니다.")
-            # 이미 나간 물건이 '판매가능' 재고로 둔갑하는 것을 방지:
-            # 출고 확인·발행 송장을 먼저 정리해야 취소할 수 있다.
-            if row["shipping_done"]:
-                abort(400, description="출고 확인된 주문입니다. 출고 확인을 해제한 후 취소하세요.")
+            # ★출고 확인된 주문도 취소할 수 있다(2026-09-03 대표 "출고확인까지 갔는데
+            #   취소한 경우는 자산이 빠져야 한다"). 아래에서 매칭 자산을 되돌리므로
+            #   자산번호가 그 주문에서 자동으로 빠진다.
+            #   (택배로 나갔다가 반품받는 경우도 같은 경로 — 사람이 수기로 취소한다)
+            # ★다만 '아직 안 움직인 송장'이 있으면 한 번 물어본다 — 그대로 두면 CJ 기사가
+            #   헛걸음하고, 그 번호로 물건이 진짜 나갈 수도 있다. 이미 집화된 뒤라면
+            #   CJ에서 취소가 안 되므로 막지 않고 기록만 남긴 채 진행한다.
             wb = conn.execute(
-                "SELECT wid FROM waybills WHERE order_id=? AND type='forward' "
-                    "AND status IN ('issued','test') LIMIT 1",
-                (oid,)).fetchone()
-            if wb:
-                abort(400, description=f"발행된 송장({wb['wid']})이 있습니다. 송장을 먼저 취소하세요.")
+                "SELECT wid, invoice_no, cj_stage_cd FROM waybills WHERE order_id=? "
+                "AND type='forward' AND status IN ('issued','test') LIMIT 1", (oid,)).fetchone()
+            if wb and not (wb["cj_stage_cd"] or "").strip() and body.get("force") is not True:
+                return _conflict(conn, oid,
+                                 f"아직 집화 전인 송장({wb['invoice_no'] or wb['wid']})이 있습니다."
+                                 " 배송/송장 화면에서 송장을 먼저 취소하는 것이 안전합니다.",
+                                 code="waybill_open")
             now = config.now_iso()
             conn.execute(
                 "UPDATE orders SET cancelled_at=?, cancelled_by=?, cancel_reason=?, preparing=0 WHERE id=?",
@@ -1197,7 +1390,12 @@ def patch_order(oid):
                     back = a["prev_status"] if a["prev_status"] in AVAILABLE_STATUSES else "ready"
                     conn.execute("UPDATE assets SET status=?, updated_at=? WHERE id=?", (back, now, a["id"]))
                     asset_event(conn, a["id"], "매칭해제", {"orderId": oid, "사유": "주문취소"})
+            conn.execute(
+                "UPDATE asset_prebuilds SET used_order_id=NULL, used_by='', used_at='', "
+                "credit_voided=0, credit_void_reason='', spec_change_required=0, "
+                "spec_change_reason='', updated_at=? WHERE used_order_id=?", (now, oid))
             conn.execute("DELETE FROM order_assets WHERE order_id=?", (oid,))
+            revert_option_parts(conn, oid, actor=actor)   # 옵션 자동 기입분도 회수
             _touch(conn, oid)
             _log_order("order_cancelled", row, {"reason": reason})
 
@@ -1257,6 +1455,8 @@ def patch_order(oid):
 
     # ★몰 호출은 트랜잭션 밖에서. 실패해도 출고는 그대로 두고 사유만 남긴다
     #   (재전송은 배송/송장 화면의 '몰 전송 대기' 목록에서 한다).
+    if extra_warnings:
+        payload["assetWarnings"] = extra_warnings
     if push_after:
         from flask import current_app
         from ..malls.invoice_push import push_for_order
@@ -1269,7 +1469,104 @@ def patch_order(oid):
     return jsonify(payload)
 
 
-def _set_order_assets(conn, row, asset_ids, actor):
+# ★TMS 자동반영이 스스로 바꿀 수 있는 상태(migration.AUTO_STATUS_TO와 같다).
+#   여기 있는 상태만 '번호 충돌'로 보고 강제 매칭을 허용한다 — 나머지(수리·A/S·
+#   매입취소·반품 등)는 사람이 OWS에서 정한 상태라 강제로 넘길 이유가 없다.
+FORCEABLE_STATUSES = ("shipped", "scrapped")
+
+# 설정 ▸ 운영 설정에서 켜는 예외. 반품 후 재판매처럼 같은 실물 자산을 과거 주문
+# 연결을 남긴 채 새 주문에 다시 붙여야 할 때만 사용한다. 요청에 따라 기존 설치는 켜짐으로 시작하고,
+# 설정 화면에서 체크를 풀어 저장하면 즉시 차단된다.
+ALLOW_DUPLICATE_ASSET_SETTING = "order_asset_duplicate"
+ALLOW_RENTAL_ASSET_WORK_SETTING = "prebuild_rental_asset"
+
+
+def _allow_duplicate_asset_matching(conn):
+    row = conn.execute("SELECT value FROM settings WHERE key=?",
+                       (ALLOW_DUPLICATE_ASSET_SETTING,)).fetchone()
+    if not row:
+        return True
+    try:
+        value = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return False
+    return bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
+
+
+def _allow_rental_asset_work(conn):
+    """설정에서 명시적으로 허용한 경우 렌탈 자산의 제작·셋팅 작업을 연다."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?",
+                       (ALLOW_RENTAL_ASSET_WORK_SETTING,)).fetchone()
+    if not row:
+        return False
+    try:
+        value = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return False
+    return bool(value.get("enabled")) if isinstance(value, dict) else bool(value)
+
+
+def _spec_capacity(text, ram=False):
+    """자산/주문 사양 문자열에서 용량(GB)을 읽는다. RAM 모듈 병기는 합산한다."""
+    raw = (text or "").upper()
+    if not raw:
+        return 0
+    if not ram:
+        tb = re.search(r"(\d+(?:\.\d+)?)\s*TB", raw)
+        if tb:
+            return int(float(tb.group(1)) * 1024)
+    nums = [int(x) for x in re.findall(r"(?<!\d)(\d{1,4})\s*(?:GB|G)(?![A-Z])", raw)]
+    if ram:
+        return sum(x for x in nums if 1 <= x <= 128)
+    return next((x for x in nums if x >= 100), 0)
+
+
+def _prebuild_spec_mismatch(order, asset, pre):
+    # 옵션에 최종 사양이 적힌 몰이 많아 옵션을 우선하고, 없을 때 상품명까지 본다.
+    option = order["option_name"] or ""
+    whole = " ".join((order["product_name"] or "", option))
+    want_ram = _spec_capacity(option, ram=True) or _spec_capacity(whole, ram=True)
+    want_ssd = _spec_capacity(option, ram=False) or _spec_capacity(whole, ram=False)
+    built_ram = pre["built_ram"] or asset["ram"] or ""
+    built_ssd = pre["built_ssd"] or asset["ssd"] or ""
+    have_ram, have_ssd = _spec_capacity(built_ram, ram=True), _spec_capacity(built_ssd, ram=False)
+    diffs = []
+    if want_ram and have_ram and want_ram != have_ram:
+        diffs.append(f"RAM {built_ram or '-'} → {want_ram}GB")
+    if want_ssd and have_ssd and want_ssd != have_ssd:
+        diffs.append(f"SSD {built_ssd or '-'} → {want_ssd}GB")
+    return " · ".join(diffs)
+
+
+def asset_match_warnings(conn, row, asset_ids):
+    """주문이 요구한 제품과 붙인 자산의 제품이 다르면 경고 문구를 만든다(막지는 않는다).
+
+    ★대표 2026-09-03: "주문 건과 맞지 않는 자산번호를 넣으면 하단에 문구가 뜨게".
+      막지 않는 이유 — 등급·구성이 조금씩 다른 물건을 실무에서 대체 출고하는 경우가
+      실제로 있다. 그래서 '틀렸다'가 아니라 '확인하라'로 알린다.
+    ★대조 기준은 제품코드다. 주문 코드는 몰마다 등급 꼬리(…AA)가 붙어 오므로 sku_of 로
+      떼고 비교한다(셋팅 화면 재고 대조와 같은 규칙). 어느 한쪽이 비면 비교하지 않는다.
+    """
+    from .product_info import sku_of
+    want = sku_of(row["product_code"] or "", row["product_name"] or "")
+    if not want:
+        return []
+    out = []
+    for aid in asset_ids:
+        a = conn.execute("SELECT asset_no, product_code, model FROM assets WHERE id=?",
+                         (aid,)).fetchone()
+        if a is None:
+            continue
+        got = sku_of((a["product_code"] or "").strip(), "")
+        if not got or got == want:
+            continue
+        out.append(f"자산 {a['asset_no']}은(는) 실제 주문 건과 맞지 않는 제품입니다"
+                   f" — 주문은 {want}, 이 자산은 {got}"
+                   f"{f'({a["model"]})' if a['model'] else ''}입니다. 확인 후 진행하세요.")
+    return out
+
+
+def _set_order_assets(conn, row, asset_ids, actor, force=False):
     """주문 ↔ 자산 매칭 목록 갱신. 오류 메시지 반환 시 409 처리.
 
     ★검증을 전부 선행한 뒤에 쓰기를 시작한다 — 중간에 실패해 409를 돌려주면서
@@ -1300,8 +1597,11 @@ def _set_order_assets(conn, row, asset_ids, actor):
         "SELECT asset_id FROM order_assets WHERE order_id=?", (row["id"],)).fetchall()}
     now = config.now_iso()
 
+    allow_duplicate = _allow_duplicate_asset_matching(conn)
+    allow_rental = _allow_rental_asset_work(conn)
+
     # 1) 검증 단계 — 쓰기 없음
-    to_add = []
+    to_add, forced = [], []
     for aid in sorted(wanted - current):
         a = conn.execute("SELECT * FROM assets WHERE id=?", (aid,)).fetchone()
         if a is None:
@@ -1309,12 +1609,33 @@ def _set_order_assets(conn, row, asset_ids, actor):
         if not a["received"]:
             return (f"자산 {a['asset_no']}은(는) 아직 입고확인이 안 됐습니다"
                     " — 매입 화면에서 입고확인 후 매칭하세요.")
+        # ★렌탈 사업부 자산은 기본적으로 판매 주문에 붙일 수 없다(2026-08-12 대표 규칙).
+        #   다만 설정 ▸ 운영에서 제작 예외를 명시적으로 켠 경우에는 셋팅에도 쓸 수 있다.
+        if a["division"] == DIVISION_RENTAL and not allow_rental:
+            return (f"자산 {a['asset_no']}은(는) 렌탈 사업부 자산이라 판매 주문에 매칭할 수 없습니다."
+                    " 설정 ▸ 운영에서 [렌탈 자산 제작·셋팅 허용]을 켜거나, "
+                    "판매로 넘기려면 RMS 자산관리에서 [↔ 사업부 이관]으로 넘기세요.")
         if a["status"] not in AVAILABLE_STATUSES:
             other = conn.execute(
                 "SELECT o.id, o.recipient FROM order_assets oa JOIN orders o ON o.id=oa.order_id "
                 "WHERE oa.asset_id=? AND o.cancelled_at='' LIMIT 1", (aid,)).fetchone()
             where = f" (주문 #{other['id']} {other['recipient']})" if other else ""
-            return f"자산 {a['asset_no']}은(는) {ASSET_STATUSES.get(a['status'])} 상태라 매칭할 수 없습니다{where}."
+            # ★번호 충돌(2026-08-18 대표 지시) — TMS에서 번호를 잘못 적어 '판매'로 찍힌 탓에
+            #   실물이 멀쩡한데 스캔이 막히는 일이 있다. 그 경우만 강제로 붙일 수 있게 한다.
+            #   ·다른 살아 있는 주문이 잡고 있으면 아래 dup 가드가 그대로 막는다(두 번 판매 금지)
+            #   ·A/S 중인 물건도 아래 가드가 막는다
+            #   ·매입취소·반품 같은 전표 상태는 애초에 FORCEABLE 이 아니다
+            duplicate_override = allow_duplicate and other is not None
+            if not (duplicate_override or
+                    (force and a["status"] in FORCEABLE_STATUSES and not other)):
+                extra = ""
+                if a["status"] in FORCEABLE_STATUSES and other:
+                    extra = " 이 자산은 OWS 주문이 잡고 있어 강제로 붙일 수 없습니다."
+                elif a["status"] in FORCEABLE_STATUSES:
+                    extra = " TMS 오기입이라면 [⚠ 실물 있음]으로 붙일 수 있습니다."
+                return (f"자산 {a['asset_no']}은(는) {ASSET_STATUSES.get(a['status'])} 상태라"
+                        f" 매칭할 수 없습니다{where}.{extra}")
+            forced.append(a["id"])
         # ★진행 중인 A/S에 걸린 물건은 고객 소유다 — 상태가 판매 가능이어도 내보내면 안 된다
         ticket = conn.execute(
             "SELECT ticket_no, customer FROM as_tickets WHERE asset_id=? "
@@ -1328,7 +1649,7 @@ def _set_order_assets(conn, row, asset_ids, actor):
             "SELECT o.id, o.recipient FROM order_assets oa JOIN orders o ON o.id=oa.order_id "
             "WHERE oa.asset_id=? AND o.id != ? AND o.cancelled_at='' AND o.archived_at='' LIMIT 1",
             (aid, row["id"])).fetchone()
-        if dup:
+        if dup and not allow_duplicate:
             return (f"자산 {a['asset_no']}은(는) 이미 다른 주문에 배정돼 있습니다"
                     f"(주문 #{dup['id']} {dup['recipient']}). 그 주문에서 먼저 해제하세요.")
         to_add.append(a)
@@ -1339,15 +1660,75 @@ def _set_order_assets(conn, row, asset_ids, actor):
             "INSERT INTO order_assets(order_id, asset_id, prev_status, matched_by, matched_at) "
             "VALUES(?,?,?,?,?)", (row["id"], a["id"], a["status"], actor, now))
         conn.execute("UPDATE assets SET status='reserved', updated_at=? WHERE id=?", (now, a["id"]))
+        # 출고 준비까지 끝난 선제작 자산이면 이 주문이 사용 처리하고, 선제작 때 기록한
+        # 제작/SW 담당자를 주문 단계에 그대로 넘긴다. 기존 실적 집계가 곧바로 같은 이름을 쓴다.
+        pre = conn.execute(
+            "SELECT * FROM asset_prebuilds WHERE asset_id=? AND ready_done=1 "
+            "AND used_order_id IS NULL AND cancelled_at=''", (a["id"],)).fetchone()
+        if pre:
+            mismatch = _prebuild_spec_mismatch(row, a, pre)
+            conn.execute(
+                "UPDATE asset_prebuilds SET used_order_id=?, used_by=?, used_at=?, "
+                "credit_voided=0, credit_void_reason='', spec_change_required=?, "
+                "spec_change_reason=?, updated_at=? WHERE id=?",
+                (row["id"], actor, now, 1 if mismatch else 0, mismatch, now, pre["id"]))
+            if not mismatch:
+                conn.execute(
+                    "UPDATE orders SET production_done=1, production_by=?, production_at=?, "
+                    "inspection_done=1, inspection_by=?, inspection_at=?, preparing=0 WHERE id=?",
+                    (pre["production_by"], now, pre["inspection_by"], now, row["id"]))
+            asset_event(conn, a["id"], "선제작사용", {
+                "orderId": row["id"], "제작": pre["production_by"], "SW검수": pre["inspection_by"],
+                "실적인정": ("사양변경 제작완료 시 기존 선제작·선SW 실적 차감"
+                           if mismatch else "선제작 담당자에게 제작완료·SW검수 실적 추가"),
+                "사양변경": mismatch})
+        if a["id"] in forced:
+            # ★잠그지 않으면 다음 TMS 수집(2시간)이 이 자산을 다시 '출고'로 되돌린다.
+            #   주문에 붙어 있는 자산이 출고 상태로 바뀌면 그 주문은 손도 못 대게 된다.
+            note = f"셋팅 강제매칭: TMS가 {ASSET_STATUSES.get(a['status'], a['status'])}로 표시"
+            conn.execute(
+                "UPDATE assets SET tms_lock=1, tms_lock_note=? WHERE id=?", (note[:200], a["id"]))
+            asset_event(conn, a["id"], "번호충돌",
+                        {"당시상태": a["status"], "주문": row["order_no"] or f"#{row['id']}",
+                         "작업자": actor, "처리": "실물 있음으로 강제 매칭 · TMS 자동반영 잠금"})
+            audit.log("asset_number_conflict", target=a["asset_no"],
+                      detail={"orderId": row["id"], "wasStatus": a["status"]})
         asset_event(conn, a["id"], "주문매칭", {
             "orderId": row["id"], "주문번호": row["order_no"] or "",
             "수취인": row["recipient"] or "", "채널": row["channel"] or ""})
+    # ★옵션 부품 원가 자동 기입(2026-08-10) — 챙길옵션이 먼저 체크되고 자산이 나중에
+    #   붙는 순서를 받친다(체크가 나중이면 prep.toggle_check 가 처리). 멱등이라 안전.
+    if to_add:
+        apply_checked_option_parts(conn, row, [a["id"] for a in to_add], actor)
+        # 매칭 전 수동 차감분도 이 순간 자산 원가로 이관된다(2026-08-26 대표)
+        from ..purchase import apply_pending_part_uses
+        apply_pending_part_uses(conn, row, [a["id"] for a in to_add], actor)
 
     for aid in sorted(current - wanted):
         link = conn.execute(
             "SELECT oa.prev_status, a.status FROM order_assets oa JOIN assets a ON a.id=oa.asset_id "
             "WHERE oa.order_id=? AND oa.asset_id=?", (row["id"], aid)).fetchone()
         conn.execute("DELETE FROM order_assets WHERE order_id=? AND asset_id=?", (row["id"], aid))
+        pre = conn.execute(
+            "SELECT * FROM asset_prebuilds WHERE asset_id=? AND used_order_id=?", (aid, row["id"])).fetchone()
+        if pre:
+            conn.execute(
+                "UPDATE asset_prebuilds SET used_order_id=NULL, used_by='', used_at='', "
+                "credit_voided=0, credit_void_reason='', spec_change_required=0, "
+                "spec_change_reason='', updated_at=? WHERE id=?",
+                (now, pre["id"]))
+            # 선제작 자동 반영값이 그대로일 때만 원복한다. 이후 사람이 다시 체크했다면 보존한다.
+            fresh_order = conn.execute("SELECT * FROM orders WHERE id=?", (row["id"],)).fetchone()
+            if (fresh_order["production_by"] == pre["production_by"] and
+                    fresh_order["inspection_by"] == pre["inspection_by"] and
+                    not conn.execute("SELECT 1 FROM asset_prebuilds WHERE used_order_id=? LIMIT 1",
+                                     (row["id"],)).fetchone()):
+                conn.execute(
+                    "UPDATE orders SET production_done=0, production_by='', production_at='', "
+                    "inspection_done=0, inspection_by='', inspection_at='' WHERE id=?", (row["id"],))
+            asset_event(conn, aid, "선제작사용취소", {"orderId": row["id"]})
+        # 자동 기입했던 부품 원가도 함께 되돌린다 — 부품은 출고되는 자산을 따라간다
+        revert_option_parts(conn, row["id"], asset_id=aid, actor=actor)
         if link and link["status"] in ("reserved", "shipped"):
             # 매칭 전 상태로 복원 — 정비중/입고 자산이 '판매가능'으로 승격되지 않게
             back = link["prev_status"] if link["prev_status"] in AVAILABLE_STATUSES else "ready"
@@ -1363,6 +1744,348 @@ def _set_order_assets(conn, row, asset_ids, actor):
 
 # ---------------------------------------------------------------- 자산 검색(매칭용)
 
+# ---------------------------------------------------------------- 추가 결제(부품 업그레이드)
+#   (2026-08-24 대표) 셋팅 중 고객이 업그레이드 비용을 더 내는 경우 — 기존 주문에 합친다.
+#   금액은 orders.amount 에, 수수료는 fee_amount 에 바로 합쳐지므로 매출·마진·자산별
+#   집계가 전부 자동으로 맞는다. 내역은 order_extras 가 갖는다.
+
+
+EXTRA_METHODS = ("bank", "mall", "custom")
+
+
+def _extra_fee(conn, row, method, amount, rate_in):
+    """방법별 수수료 — bank(입금)=0 / mall=채널 요율 / custom=직접 요율."""
+    if method == "bank":
+        return 0, 0.0
+    if method == "mall":
+        cfg = settlement_settings(conn)
+        return fee_for(cfg, row["channel"], amount)
+    try:
+        rate = float(rate_in or 0)
+    except (TypeError, ValueError):
+        abort(400, description="요율은 숫자여야 합니다(예: 3.3).")
+    if not (0 <= rate <= 30):
+        abort(400, description="요율은 0~30% 사이여야 합니다.")
+    return round(amount * rate / 100), rate
+
+
+@bp.get("/orders/<int:oid>/extras")
+def list_extras(oid):
+    require_any("orders.work", "orders.ship", "orders.view")
+    conn = get_db()
+    _get_order_or_404(conn, oid)
+    rows = conn.execute(
+        "SELECT * FROM order_extras WHERE order_id=? ORDER BY id", (oid,)).fetchall()
+    return jsonify({"extras": [
+        {"id": r["id"], "amount": r["amount"], "fee": r["fee"], "method": r["method"],
+         "rate": r["rate"], "note": r["note"], "createdBy": r["created_by"],
+         "createdAt": r["created_at"]} for r in rows]})
+
+
+@bp.post("/orders/<int:oid>/extras")
+def add_extra(oid):
+    """추가 결제 등록. body: {amount, method: bank|mall|custom, rate?, note}
+
+    ★금액은 부가세 포함 총액(판매가와 같은 규약) — 기간 실적의 공급가·부가세 분해가
+      그대로 맞는다. 수수료만 방법에 따라 갈린다.
+    """
+    require_any("orders.work", "orders.ship")
+    body = request.get_json(silent=True) or {}
+    with tx(write=True) as conn:
+        row = _get_order_or_404(conn, oid)
+        if row["cancelled_at"]:
+            abort(400, description="취소된 주문입니다.")
+        if row["archived_at"]:
+            abort(400, description="보관된 주문입니다 — 보관 해제 후 등록하세요.")
+        # ★출고 확인 뒤에 금액을 더하면 이미 확정된 그 달 매출·실적이 소리 없이 바뀐다.
+        #   셋팅 중(출고 전)에 받는 것이 이 기능의 대상이다 — 출고 후라면 [↩ 되돌리기] 먼저.
+        if row["shipping_done"]:
+            abort(409, description="출고 확인된 주문입니다. 셋팅 보드의 [↩ 되돌리기]로 "
+                                   "출고를 되돌린 뒤 등록하세요.")
+        try:
+            amount = int(str(body.get("amount") or "").replace(",", ""))
+        except (TypeError, ValueError):
+            abort(400, description="금액을 숫자로 입력하세요.")
+        if not (0 < amount <= 10_000_000):
+            abort(400, description="금액은 1원 ~ 1,000만원 사이여야 합니다.")
+        method = (body.get("method") or "bank").strip()
+        if method not in EXTRA_METHODS:
+            abort(400, description="결제 방법은 bank(입금)/mall(몰 결제)/custom(요율 직접)만 됩니다.")
+        note = (body.get("note") or "").strip()[:120]
+        fee, rate = _extra_fee(conn, row, method, amount, body.get("rate"))
+        now = config.now_iso()
+        conn.execute(
+            "INSERT INTO order_extras(order_id, amount, fee, method, rate, note, "
+            "created_by, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (oid, amount, fee, method, rate, note, g.user["display_name"], now))
+        # 매출·수수료를 주문에 바로 합친다 — 모든 집계(요약·기간 실적·자산별 마진)가 이 두 칸을 본다
+        conn.execute("UPDATE orders SET amount = amount + ?, fee_amount = fee_amount + ?, "
+                     "updated_at=? WHERE id=?", (amount, fee, now, oid))
+        _log_order("order_extra_added", row, {
+            "금액": amount, "수수료": fee, "방법": method, "메모": note})
+        fresh = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        return jsonify({"ok": True, "fee": fee, "rate": rate,
+                        "order": order_payload(conn, fresh)}), 201
+
+
+@bp.post("/orders/<int:oid>/merge-extra")
+def merge_as_extra(oid):
+    """몰에서 따로 결제된 임시 주문을 기존 주문의 추가 결제로 합친다.
+
+    (2026-08-26 대표: "박준태님의 임시결제창 — 추가결제를 위한 결제창이니 기존 주문에 합치기")
+    - 금액·수수료가 대상 주문에 합쳐진다. ★수수료 요율은 '임시 주문의 채널'로 계산한다 —
+      결제가 그 몰에서 일어났기 때문(대상 주문 채널이 아니라).
+    - 임시 주문은 취소+사유 기록으로 내려간다. 자산 매칭·발행 송장·출고가 있으면 거부 —
+      그건 임시 결제창이 아니라 실물 주문이다.
+    - orders.cancel 을 따로 요구하지 않는 이유: 취소 권한의 취지는 '나간 물건이 판매가능
+      재고로 둔갑'하는 사고 방지인데, 여기는 자산 0·송장 0을 강제하므로 그 위험이 없다.
+    """
+    require_any("orders.work", "orders.ship")
+    body = request.get_json(silent=True) or {}
+    try:
+        target_id = int(body.get("targetOrderId") or 0)
+    except (TypeError, ValueError):
+        abort(400, description="합칠 대상 주문을 지정하세요.")
+    with tx(write=True) as conn:
+        src = _get_order_or_404(conn, oid)
+        if target_id == oid:
+            abort(400, description="같은 주문에는 합칠 수 없습니다.")
+        if src["cancelled_at"]:
+            abort(400, description="이미 취소된 주문입니다.")
+        if src["archived_at"]:
+            abort(400, description="보관된 주문입니다.")
+        if src["shipping_done"]:
+            abort(409, description="출고 확인된 주문은 합칠 수 없습니다.")
+        if conn.execute("SELECT 1 FROM order_assets WHERE order_id=? LIMIT 1", (oid,)).fetchone():
+            abort(409, description="자산이 매칭된 주문입니다 — 임시 결제창이 아니라 실물 주문으로 "
+                                   "보입니다. 정말 합치려면 자산 매칭을 먼저 해제하세요.")
+        wb = conn.execute(
+            "SELECT wid FROM waybills WHERE order_id=? AND type='forward' "
+            "AND status IN ('issued','test') LIMIT 1", (oid,)).fetchone()
+        if wb:
+            abort(409, description=f"발행된 송장({wb['wid']})이 있는 주문은 합칠 수 없습니다.")
+        amount = src["amount"] or 0
+        if amount <= 0:
+            abort(400, description="합칠 금액이 없습니다(주문 금액 0원).")
+        tgt = _get_order_or_404(conn, target_id)
+        if tgt["cancelled_at"]:
+            abort(400, description="대상 주문이 취소된 상태입니다.")
+        if tgt["archived_at"]:
+            abort(400, description="대상 주문이 보관된 상태입니다.")
+        if tgt["shipping_done"]:
+            abort(409, description="대상 주문이 이미 출고 확인됐습니다 — [↩ 되돌리기] 후 합치세요.")
+        # 수수료: 결제가 일어난 몰(임시 주문 채널)의 요율
+        cfg = settlement_settings(conn)
+        fee, rate = fee_for(cfg, src["channel"], amount)
+        now = config.now_iso()
+        note = (f"몰 결제 합침: {(src['product_name'] or '')[:60]} "
+                f"({src['order_no'] or '#' + str(oid)})")[:120]
+        conn.execute(
+            "INSERT INTO order_extras(order_id, amount, fee, method, rate, note, "
+            "created_by, created_at) VALUES(?,?,?,'mall',?,?,?,?)",
+            (target_id, amount, fee, rate, note, g.user["display_name"], now))
+        conn.execute("UPDATE orders SET amount = amount + ?, fee_amount = fee_amount + ?, "
+                     "updated_at=? WHERE id=?", (amount, fee, now, target_id))
+        conn.execute(
+            "UPDATE orders SET cancelled_at=?, cancelled_by=?, cancel_reason=?, preparing=0, "
+            "updated_at=? WHERE id=?",
+            (now, g.user["display_name"],
+             f"추가 결제로 합침 → {tgt['order_no'] or '#' + str(target_id)}", now, oid))
+        _log_order("order_merged_as_extra", src, {
+            "대상": tgt["order_no"] or f"#{target_id}", "금액": amount, "수수료": fee})
+        _log_order("order_extra_added", tgt, {
+            "금액": amount, "수수료": fee, "방법": "mall", "메모": note, "출처": "합치기"})
+        fresh = conn.execute("SELECT * FROM orders WHERE id=?", (target_id,)).fetchone()
+        return jsonify({"ok": True, "fee": fee, "rate": rate, "amount": amount,
+                        "order": order_payload(conn, fresh)}), 201
+
+
+@bp.delete("/orders/<int:oid>/extras/<int:xid>")
+def delete_extra(oid, xid):
+    """추가 결제 취소 — 합쳐 둔 금액·수수료를 그대로 되돌린다."""
+    require_any("orders.work", "orders.ship")
+    with tx(write=True) as conn:
+        row = _get_order_or_404(conn, oid)
+        if row["shipping_done"]:
+            abort(409, description="출고 확인된 주문입니다 — [↩ 되돌리기] 후 삭제하세요.")
+        x = conn.execute("SELECT * FROM order_extras WHERE id=? AND order_id=?",
+                         (xid, oid)).fetchone()
+        if x is None:
+            abort(404, description="해당 추가 결제가 없습니다.")
+        conn.execute("DELETE FROM order_extras WHERE id=?", (xid,))
+        conn.execute(
+            "UPDATE orders SET amount = MAX(0, amount - ?), "
+            "fee_amount = MAX(0, fee_amount - ?), updated_at=? WHERE id=?",
+            (x["amount"], x["fee"], config.now_iso(), oid))
+        _log_order("order_extra_removed", row,
+                   {"금액": x["amount"], "수수료": x["fee"], "메모": x["note"]})
+        fresh = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        return jsonify({"ok": True, "order": order_payload(conn, fresh)})
+
+
+# ---------------------------------------------------------------- 주문자 정보 수정·롤백
+#   (2026-08-24 대표) 셋팅 중 고객이 성함·연락처·주소를 바꾸는 경우 — 수정 전 값을
+#   스냅샷으로 남기고, 필요하면 그 스냅샷으로 되돌린다.
+
+# ★배송메모도 여기서 고친다(대표 2026-08-26 "배송메모도 수정 가능하게") — 같은 스냅샷·이력을 탄다
+_CONTACT_COLS = (("recipient", "recipient"), ("phone", "phone"),
+                 ("postalCode", "postal_code"), ("address", "address"),
+                 ("deliveryMessage", "delivery_message"))
+
+
+def _snapshot_contact(conn, row, reason):
+    conn.execute(
+        "INSERT INTO order_contact_log(order_id, recipient, phone, postal_code, address, "
+        "delivery_message, reason, created_by, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (row["id"], row["recipient"] or "", row["phone"] or "",
+         row["postal_code"] or "", row["address"] or "", row["delivery_message"] or "",
+         reason, g.user["display_name"], config.now_iso()))
+
+
+@bp.get("/orders/<int:oid>/contact-history")
+def contact_history(oid):
+    require_any("orders.work", "orders.ship", "orders.view")
+    conn = get_db()
+    row = _get_order_or_404(conn, oid)
+    rows = conn.execute(
+        "SELECT * FROM order_contact_log WHERE order_id=? ORDER BY id DESC LIMIT 30",
+        (oid,)).fetchall()
+    return jsonify({
+        "current": {"recipient": row["recipient"], "phone": row["phone"],
+                    "postalCode": row["postal_code"], "address": row["address"],
+                    "deliveryMessage": row["delivery_message"]},
+        "history": [
+            {"id": r["id"], "recipient": r["recipient"], "phone": r["phone"],
+             "postalCode": r["postal_code"], "address": r["address"],
+             "deliveryMessage": r["delivery_message"] or "",
+             "reason": r["reason"], "by": r["created_by"], "at": r["created_at"]}
+            for r in rows],
+        # 송장이 이미 나갔으면 종이에는 옛 주소가 찍혀 있다 — 화면이 경고한다
+        "hasWaybill": bool(conn.execute(
+            "SELECT 1 FROM waybills WHERE order_id=? AND type='forward' "
+            "AND status IN ('issued','test','pending') LIMIT 1", (oid,)).fetchone()),
+    })
+
+
+@bp.post("/orders/<int:oid>/contact")
+def update_contact(oid):
+    """성함·연락처·우편번호·주소 수정 — 수정 전 값을 스냅샷으로 남긴다."""
+    require_any("orders.work", "orders.ship", "orders.edit")
+    body = request.get_json(silent=True) or {}
+    with tx(write=True) as conn:
+        row = _get_order_or_404(conn, oid)
+        if row["cancelled_at"]:
+            abort(400, description="취소된 주문입니다.")
+        sets, params, changes = [], [], {}
+        for key, col in _CONTACT_COLS:
+            if key not in body:
+                continue
+            v = (body.get(key) or "").strip()
+            if key == "recipient" and not v:
+                abort(400, description="수취인 성함은 비울 수 없습니다.")
+            if len(v) > 200:
+                abort(400, description="입력이 너무 깁니다(200자 이내).")
+            if v != (row[col] or ""):
+                sets.append(f"{col}=?")
+                params.append(v)
+                changes[col] = {"from": row[col] or "", "to": v}
+        if not sets:
+            return jsonify({"ok": True, "changed": 0,
+                            "order": order_payload(conn, row)})
+        _snapshot_contact(conn, row, "수정 전")
+        conn.execute(f"UPDATE orders SET {', '.join(sets)}, updated_at=? WHERE id=?",
+                     params + [config.now_iso(), oid])
+        _log_order("order_contact_updated", row, changes)
+        fresh = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        return jsonify({"ok": True, "changed": len(changes),
+                        "order": order_payload(conn, fresh)})
+
+
+@bp.post("/orders/<int:oid>/contact-rollback")
+def rollback_contact(oid):
+    """스냅샷으로 복원. body: {historyId} — 복원 직전 현재 값도 스냅샷한다."""
+    require_any("orders.work", "orders.ship", "orders.edit")
+    body = request.get_json(silent=True) or {}
+    hid = _int_or_400(body.get("historyId"), "이력 ID")
+    with tx(write=True) as conn:
+        row = _get_order_or_404(conn, oid)
+        snap = conn.execute("SELECT * FROM order_contact_log WHERE id=? AND order_id=?",
+                            (hid, oid)).fetchone()
+        if snap is None:
+            abort(404, description="해당 이력이 없습니다.")
+        _snapshot_contact(conn, row, "롤백 전")
+        conn.execute(
+            "UPDATE orders SET recipient=?, phone=?, postal_code=?, address=?, "
+            "delivery_message=?, updated_at=? WHERE id=?",
+            (snap["recipient"], snap["phone"], snap["postal_code"], snap["address"],
+             snap["delivery_message"] or "", config.now_iso(), oid))
+        _log_order("order_contact_rollback", row,
+                   {"복원": f"{snap['created_at'][:16]} ({snap['created_by']}) 시점"})
+        fresh = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        return jsonify({"ok": True, "order": order_payload(conn, fresh)})
+
+
+@bp.post("/orders/<int:oid>/addr-check")
+def order_addr_check(oid):
+    """CJ 주소정제로 주소를 확인한다 — 송장 발급이 쓰는 것과 같은 API.
+
+    ★여기서 통과한 주소는 발급 때도 통과한다. 배송 예약이 생기지 않는 조회성 호출.
+      CJ 설정이 없으면 확인만 못 할 뿐 수정은 막지 않는다(ok:false 로 조용히).
+    """
+    require_any("orders.work", "orders.ship", "orders.view")
+    body = request.get_json(silent=True) or {}
+    addr = (body.get("address") or "").strip()
+    if not addr:
+        abort(400, description="확인할 주소를 입력하세요.")
+    conn = get_db()
+    _get_order_or_404(conn, oid)
+    cfg_row = conn.execute("SELECT value FROM settings WHERE key='cj'").fetchone()
+    try:
+        cfg = json.loads(cfg_row["value"]) if cfg_row else {}
+    except (ValueError, TypeError):
+        cfg = {}
+    from ..cj import cj2_addr_refine
+    try:
+        r = cj2_addr_refine(cfg, addr) or {}
+    except Exception as e:                                   # noqa: BLE001
+        return jsonify({"ok": False, "reason": f"CJ 확인 실패: {e}"})
+    clsf = (r.get("CLSFCD") or "").strip()
+    return jsonify({
+        "ok": bool(clsf),
+        "clsf": clsf, "clsfAddr": (r.get("CLSFADDR") or "").strip(),
+        "zip": (r.get("ZIPCD") or r.get("ZIP_CD") or "").strip(),
+        "reason": "" if clsf else "CJ 주소 시스템에서 분류코드를 받지 못했습니다 — 주소를 확인하세요.",
+    })
+
+
+@bp.post("/orders/<int:oid>/assets/<int:aid>/prepared")
+def toggle_asset_prepared(oid, aid):
+    """대별 준비 체크(2026-08-24 대표) — 2대 이상 주문에서 기계마다 셋팅 완료를 표시한다.
+
+    body: {value: true|false}. 주문 단계(제작완료)와 별개다 — 막지 않고 개수로 보여 준다.
+    """
+    require("orders.work")
+    body = request.get_json(silent=True) or {}
+    on = bool(body.get("value"))
+    with tx(write=True) as conn:
+        row = _get_order_or_404(conn, oid)
+        if row["cancelled_at"]:
+            abort(400, description="취소된 주문입니다.")
+        if row["shipping_done"]:
+            abort(409, description="출고 확인된 주문입니다 — 대별 체크를 바꾸려면 먼저 되돌리세요.")
+        link = conn.execute(
+            "SELECT * FROM order_assets WHERE order_id=? AND asset_id=?", (oid, aid)).fetchone()
+        if link is None:
+            abort(404, description="이 주문에 매칭돼 있지 않은 자산입니다.")
+        now = config.now_iso()
+        conn.execute(
+            "UPDATE order_assets SET prepared=?, prepared_by=?, prepared_at=? "
+            "WHERE order_id=? AND asset_id=?",
+            (1 if on else 0, g.user["display_name"] if on else "", now if on else "", oid, aid))
+        fresh = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        return jsonify({"ok": True, "order": order_payload(conn, fresh)})
+
+
 @bp.get("/orders/asset-search")
 def asset_search():
     """매칭 후보 자산 검색 — 자산번호/모델/시리얼로 매칭 가능 상태만."""
@@ -1374,14 +2097,31 @@ def asset_search():
     #   번호는 맞는데 이미 출고됐거나 다른 주문에 잡혀 있으면, 담당자는 번호를 잘못 친 줄 알고
     #   같은 번호를 계속 다시 찍는다(2026-07-30 대표: "자산번호를 적었는데 매칭이 안 된다").
     #   그래서 상태와 무관하게 찾아 주고, 쓸 수 있는지(available)와 사유를 함께 내려준다.
-    rows = get_db().execute(
+    conn = get_db()
+    order_for_spec = None
+    try:
+        order_id = int(request.args.get("orderId") or 0)
+    except (TypeError, ValueError):
+        order_id = 0
+    if order_id:
+        order_for_spec = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    allow_duplicate = _allow_duplicate_asset_matching(conn)
+    allow_rental = _allow_rental_asset_work(conn)
+    rows = conn.execute(
         "SELECT a.id, a.asset_no, a.maker, a.model, a.grade, a.status, a.cpu, a.ram, a.ssd, "
-        "a.location, a.received, a.tier, c.name AS category_name, "
+        "a.location, a.received, a.tier, a.division, c.name AS category_name, "
         "(SELECT o.order_no FROM order_assets oa JOIN orders o ON o.id=oa.order_id "
-        "  WHERE oa.asset_id=a.id LIMIT 1) AS held_by "
+        "  WHERE oa.asset_id=a.id LIMIT 1) AS held_by, "
+        # ★held_by(주문번호)는 수기 주문이면 빈 문자열이다. '잡은 주문이 있나'는
+        #   반드시 id 로 봐야 한다 — 빈 문자열을 '없음'으로 읽으면 이미 팔린 물건을
+        #   번호 충돌로 오인해 또 붙이게 된다.
+        "(SELECT oa.order_id FROM order_assets oa JOIN orders o ON o.id=oa.order_id "
+        "  WHERE oa.asset_id=a.id AND o.cancelled_at='' LIMIT 1) AS held_order_id "
         "FROM assets a LEFT JOIN categories c ON c.id=a.category_id "
         "WHERE (a.asset_no LIKE ? OR a.model LIKE ? OR a.serial LIKE ?) "
-        "ORDER BY (a.status IN (" + ",".join("?" * len(AVAILABLE_STATUSES)) + ") AND a.received=1) DESC, "
+        # ★렌탈 자산도 찾아서 보여 주되 아래로 내린다 — 숨기면 번호를 잘못 친 줄 알고 계속 다시 찍는다.
+        "ORDER BY (a.status IN (" + ",".join("?" * len(AVAILABLE_STATUSES)) +
+        ") AND a.received=1 AND a.division='sale') DESC, "
         "a.asset_no LIMIT 20",
         (*(("%" + q + "%",) * 3), *AVAILABLE_STATUSES),
     ).fetchall()
@@ -1390,12 +2130,16 @@ def asset_search():
         # ★가입고(V)로 들어와 아직 실물을 안 받은 자산 — 상태는 '입고'로 보이지만 쓰면 안 된다
         if not r["received"]:
             return "아직 입고확인이 안 된 자산입니다(가입고 상태). 입고확인 후 사용하세요."
+        if r["division"] == DIVISION_RENTAL and not allow_rental:
+            return ("렌탈 사업부 자산입니다 — 판매 주문에 매칭할 수 없습니다. "
+                    "설정 ▸ 운영에서 [렌탈 자산 제작·셋팅 허용]을 켜거나, "
+                    "판매로 넘기려면 RMS 자산관리에서 [↔ 사업부 이관]으로 넘기세요.")
         if r["status"] in AVAILABLE_STATUSES:
             # ★가재고는 매칭까지는 되지만 출고가 막힌다(2026-08-04). 스캔하는 순간
             #   알려 줘야 담당자가 나중에 송장 단계에서 막히고 되돌아오지 않는다.
             if r["tier"] == "가재고":
                 return ("가재고입니다 — 매칭은 되지만 출고할 수 없습니다. "
-                        "매입 화면에서 양품 또는 실재고로 바꾸세요.")
+                        "매입 화면에서 가용 또는 실재고로 바꾸세요.")
             return ""
         label = ASSET_STATUSES.get(r["status"], r["status"])
         where = f" (주문 {r['held_by']})" if r["held_by"] else ""
@@ -1405,16 +2149,43 @@ def asset_search():
             return "다른 주문에 이미 배정됨" + where
         return f"지금은 매칭할 수 없는 상태입니다({label})" + where
 
+    def _forceable(r):
+        """번호 충돌로 보고 강제 매칭할 수 있나(2026-08-18 대표 지시).
+
+        TMS에서 번호를 잘못 적어 '판매'로 찍힌 탓에 실물이 멀쩡한데 막히는 경우다.
+        ★OWS 주문이 잡고 있으면 아니다 — 그건 진짜로 나간 물건이라 두 번 팔면 안 된다.
+        """
+        return (bool(r["received"]) and r["status"] in FORCEABLE_STATUSES
+                and r["held_order_id"] is None)
+
+    prebuilds = {r["asset_id"]: r for r in conn.execute(
+        "SELECT * FROM asset_prebuilds WHERE cancelled_at='' AND asset_id IN (" + ",".join("?" * len(rows)) + ")",
+        [r["id"] for r in rows]).fetchall()} if rows else {}
     return jsonify([
         {"assetId": r["id"], "assetNo": r["asset_no"], "maker": r["maker"], "model": r["model"],
          "grade": r["grade"], "status": r["status"], "tier": r["tier"],
          "shippable": bool(r["received"]) and r["status"] in AVAILABLE_STATUSES
                       and r["tier"] != "가재고",
          "statusLabel": ASSET_STATUSES.get(r["status"], r["status"]),
-         "available": bool(r["received"]) and r["status"] in AVAILABLE_STATUSES,
+         "available": bool(r["received"])
+         and (r["division"] != DIVISION_RENTAL or allow_rental)
+         and (r["status"] in AVAILABLE_STATUSES
+              or (allow_duplicate and r["held_order_id"] is not None)),
          "reason": _why(r),
+         # 번호 충돌 — 화면이 [⚠ 실물 있음으로 붙이기]를 띄울지 판단한다
+         "forceable": _forceable(r),
          "spec": " / ".join(x for x in (r["cpu"], r["ram"], r["ssd"]) if x),
-         "location": r["location"], "categoryName": r["category_name"]}
+         "location": r["location"], "categoryName": r["category_name"],
+         "prebuild": ({"ready": bool(prebuilds[r["id"]]["ready_done"]),
+                       "productionBy": prebuilds[r["id"]]["production_by"],
+                       "inspectionBy": prebuilds[r["id"]]["inspection_by"],
+                       "usedOrderId": prebuilds[r["id"]]["used_order_id"]}
+                      if r["id"] in prebuilds else None),
+         "prebuildMismatch": (
+             _prebuild_spec_mismatch(order_for_spec, r, prebuilds[r["id"]])
+             if order_for_spec is not None and r["id"] in prebuilds
+             and prebuilds[r["id"]]["ready_done"]
+             and prebuilds[r["id"]]["used_order_id"] is None else "")}
         for r in rows
     ])
 
@@ -1441,7 +2212,7 @@ def notifications():
 
 
 # 서브모듈 라우트 등록 (bp 정의 이후에 import해야 함)
-from . import importing, product_info, waybill, recall  # noqa: E402,F401
+from . import importing, prebuild, product_info, waybill, recall  # noqa: E402,F401
 
 
 @bp.get("/orders/ship-today/preview")
@@ -1461,6 +2232,10 @@ def ship_today_preview():
             "FROM orders o WHERE o.cancelled_at='' AND o.archived_at='' "
             "  AND o.shipping_done=0 AND o.inspection_done=1" + scope,
             params).fetchall()
+        # ★자산 매칭이 없는 주문 — 이대로 마감하면 어느 기계가 나갔는지 이력이 안 남는다
+        #   (2026-08-10 대표 승인: 8월 출고의 87%가 미매칭으로 마감된 것이 실측돼 경고 추가).
+        matched_ids = {r2["order_id"] for r2 in conn.execute(
+            "SELECT DISTINCT order_id FROM order_assets").fetchall()}
         out = []
         for r in rows:
             out.append({
@@ -1473,9 +2248,11 @@ def ship_today_preview():
                 # 택배인데 송장이 없으면 알려 준다 — 송장 없이 내보내면 추적이 끊긴다
                 "noWaybill": (not (r["tracking_no"] or "").strip()
                               and (r["receive_method"] or "택배") == "택배"),
+                "noAsset": r["id"] not in matched_ids,
             })
     return jsonify({"orders": out, "count": len(out),
-                    "noWaybill": sum(1 for x in out if x["noWaybill"])})
+                    "noWaybill": sum(1 for x in out if x["noWaybill"]),
+                    "noAsset": sum(1 for x in out if x["noAsset"])})
 
 
 @bp.post("/orders/ship-today")
@@ -1485,22 +2262,61 @@ def ship_today():
     body = request.get_json(silent=True) or {}
     want = body.get("ids")
     want = {int(x) for x in want} if isinstance(want, list) else None
+    # ★화면이 보내 준 목록이 없으면 '지금 보이는 것'이 무엇인지 서버는 알 수 없다.
+    #   예전에는 그때 조건에 맞는 주문을 **전량** 마감했다 — 대표가 단계 카드나 검색으로
+    #   목록을 좁혀 놓고 눌러도 화면 밖의 건까지 함께 나갔다(옆의 [송장 일괄 인쇄]는
+    #   '보이는 목록'만 다루므로 같은 줄의 두 버튼이 정반대로 동작했다).
+    #   화면은 이제 항상 ids 를 보낸다(setup.js). 빈 목록이면 아무 것도 하지 않는다.
+    if isinstance(body.get("ids"), list) and not want:
+        return jsonify({"ok": True, "shipped": 0, "skipped": 0})
     ts = config.now_iso()
     done, skipped = 0, 0
+    to_push = []                 # 출고 확인된 것 중 송장이 있고 아직 몰에 안 보낸 주문(트랜잭션 밖에서 보낸다)
     with tx(write=True) as conn:
         scope, params = _order_scope_clause()
         rows = conn.execute(
-            "SELECT o.id, o.recipient, o.tracking_no, o.receive_method FROM orders o "
+            "SELECT o.id, o.order_no, o.channel, o.recipient, o.tracking_no, o.receive_method, "
+            "       o.mall_sent_at "
+            "FROM orders o "
             "WHERE o.cancelled_at='' AND o.archived_at='' AND o.shipping_done=0 "
             "  AND o.inspection_done=1" + scope, params).fetchall()
         for r in rows:
             if want is not None and r["id"] not in want:
                 skipped += 1
                 continue
+            if (r["tracking_no"] or "").strip() and not (r["mall_sent_at"] or ""):
+                to_push.append(r["id"])
+            # ★보관(archived_at)은 여기서 찍지 않는다(대표 2026-09-04:
+            #   "출고확인에서 배송완료가 되어야만 출고기록 조회로 넘어가게").
+            #   보관은 주문관리 상태 산식이 '배송완료'로 읽는다(mall_status_of) —
+            #   여기서 같이 찍으면 이제 막 나간 물건이 배송완료로 잡히고, 셋팅 보드에서도
+            #   즉시 사라져 [출고 확인] 칸에 머물지 못한다. 배송완료 도장+보관은
+            #   CJ 배달완료(91)에서 _auto_delivered 가 한다(recall.py) — 행 체크박스
+            #   경로(_stage_check)도 보관하지 않으므로 두 경로가 이제 같게 동작한다.
             conn.execute(
                 "UPDATE orders SET shipping_done=1, shipping_by=?, shipping_at=?, "
-                "  archived_at=?, updated_at=? WHERE id=?",
-                (g.user["display_name"], ts, ts, ts, r["id"]))
+                "  updated_at=? WHERE id=?",
+                (g.user["display_name"], ts, ts, r["id"]))
+            # ★자산도 함께 출고 처리한다(2026-08-09 전체 추적 검증에서 발견).
+            #   예전엔 주문만 마감해서 매칭된 자산이 '주문매칭' 상태로 영영 남았다 —
+            #   재고 대수·자산가치가 출고분만큼 부풀고, 자산 이력에 출고 기록·고객이
+            #   안 남았다. 건별 출고(PATCH action:shipping)와 똑같은 기록을 남긴다.
+            for a in conn.execute(
+                    "SELECT a.id, a.status FROM order_assets oa "
+                    "JOIN assets a ON a.id=oa.asset_id WHERE oa.order_id=?",
+                    (r["id"],)).fetchall():
+                if a["status"] != "shipped":
+                    conn.execute(
+                        "UPDATE assets SET status='shipped', updated_at=? WHERE id=?",
+                        (ts, a["id"]))
+                    asset_event(conn, a["id"], "출고", {
+                        "orderId": r["id"],
+                        "주문번호": r["order_no"] or "",
+                        "수취인": r["recipient"] or "",
+                        "채널": r["channel"] or "",
+                        "출고일": ts[:10],
+                    })
+                _unlist(conn, a["id"], "출고(금일 마감)")
             _log_order("ship_today", r,
                        detail={"trackingNumber": r["tracking_no"],
                                "receiveMethod": r["receive_method"] or "택배"})
@@ -1508,4 +2324,20 @@ def ship_today():
         if done:
             audit.log("ship_today", target=f"{done}건 출고 마감",
                       detail={"shipped": done, "skipped": skipped})
-    return jsonify({"ok": True, "shipped": done, "skipped": skipped})
+    # ★송장번호 몰 전송(2026-09-08 대표) — 출고 확인이 곧 '몰에 배송중으로 알릴 시점'이다.
+    #   행의 [출고 확인] 체크와 같은 규칙. 몰 호출은 트랜잭션 밖에서, 실패해도 마감은 그대로
+    #   (실패분은 배송/송장 화면 '몰 전송 대기' 목록에 사유와 함께 남는다).
+    mall = {"sent": 0, "failed": 0, "messages": []}
+    if to_push:
+        from flask import current_app
+        from ..malls.invoice_push import push_for_order
+        for oid in to_push:
+            try:
+                ok, msg = push_for_order(current_app, oid)
+            except Exception as e:                                # noqa: BLE001
+                ok, msg = False, str(e)
+                current_app.logger.exception("송장 몰 전송 실패 | order=%s", oid)
+            mall["sent" if ok else "failed"] += 1
+            if not ok and len(mall["messages"]) < 5:
+                mall["messages"].append(msg)
+    return jsonify({"ok": True, "shipped": done, "skipped": skipped, "mallPush": mall})

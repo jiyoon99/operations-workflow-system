@@ -218,7 +218,24 @@ def cj2_waybill_pdf(label: dict, mask: bool = True, ox: float = 0.0, oy: float =
 
     def wrap_mm(s, size, widths, maxlines=2, font=None):
         """실제 렌더 폭(mm) 기준 자동 줄바꿈 — 줄마다 허용 폭 다르게(widths[i], 부족하면 마지막 값 반복).
-        바코드 등 우측 요소와 부딪히기 전에 다음 줄로 넘긴다. 공백 경계 우선, 안 되면 강제 절단."""
+        바코드 등 우측 요소와 부딪히기 전에 다음 줄로 넘긴다. 공백 경계 우선, 안 되면 강제 절단.
+
+        ★줄바꿈 문자는 '여기서 줄을 바꿔라'는 뜻으로 살린다(대표 2026-08-24 승인: 자산번호를
+          그 줄에만 찍고 싶다). 예전에는 공백 정리와 함께 뭉개서 줄바꿈이 불가능했다.
+          ★좌표는 하나도 안 건드린다 — 줄 시작 위치·줄간격·글자크기 그대로다.
+        """
+        parts = [re.sub(r'[^\S\n]+', ' ', x).strip()
+                 for x in str(s or '').replace('\r', '').split('\n')]
+        parts = [x for x in parts if x]
+        if len(parts) > 1:
+            out = []
+            for i, part in enumerate(parts):
+                if len(out) >= maxlines:
+                    break
+                # 남은 줄을 나눠 쓴다 — 앞 조각이 다 먹으면 뒤가 통째로 사라진다
+                room = max(1, maxlines - len(out) - (len(parts) - i - 1))
+                out.extend(wrap_mm(part, size, widths[len(out):] or widths, room, font))
+            return out[:maxlines]
         s = re.sub(r'\s+', ' ', str(s or '')).strip()
         fnt = font or FB
         out = []
@@ -316,7 +333,15 @@ def cj2_waybill_pdf(label: dict, mask: bool = True, ox: float = 0.0, oy: float =
     txt(118, 50.6, (label.get('frt_dv_nm') or ''), 10, center=True)
 
     # ── 밴드5 (52~85): ⑯상품명(맨 왼쪽, 라벨 폭 내 자동 줄바꿈) ──
-    for i, ln in enumerate(wrap_mm(label.get('item_summary') or '', 9, [115], 2)):
+    #   ★줄수는 설정이 정한다(label['item_lines'], 기본 4 — 2026-08-24 대표 승인).
+    #     좌표는 그대로다: 55.4 + i*4.0 이라 4줄이면 67.4mm. 이 칸은 85mm까지고
+    #     아래 ⑰배송메세지는 87.2mm라 부딪히지 않는다.
+    #     ★인쇄가 어긋나면 설정에서 2로 되돌리면 예전과 똑같아진다(코드 수정 없이).
+    try:
+        _lines = max(1, min(int(label.get('item_lines') or 4), 4))
+    except (TypeError, ValueError):
+        _lines = 4
+    for i, ln in enumerate(wrap_mm(label.get('item_summary') or '', 9, [115], _lines)):
         txt(4, 55.4 + i * 4.0, ln, 9)
 
     # ── 밴드6 (85~100): ⑰배송메세지 ⑱배달점소-별칭(맨 아래) ⑧하단 운송장바코드+번호 ──
@@ -339,7 +364,7 @@ def cj2_waybill_pdf(label: dict, mask: bool = True, ox: float = 0.0, oy: float =
 
 def _cj_label_offset(offsets: dict = None):
     """표준라벨 정렬 보정 — 원본(rental-system)은 Flask request.args+설정을 읽었으나,
-    HMS에서는 순수 함수: offsets dict(키 ox/oy/sc/kx/ky/rot/media/rdir, 'label_' 접두 키도 허용)를 받는다.
+    OWS에서는 순수 함수: offsets dict(키 ox/oy/sc/kx/ky/rot/media/rdir, 'label_' 접두 키도 허용)를 받는다.
     클램프 범위·기본값은 원본 유지. sc=배율 보정 — 프린터 드라이버가 축소 인쇄할 때 역보정(예: 70%로 나오면 sc=143).
     반환: (ox, oy, sc, kx, ky, rot, media_w, media_l, rot_dir) — cj2_waybill_pdf 파라미터 순서."""
     o = offsets or {}

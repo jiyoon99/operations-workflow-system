@@ -1,190 +1,127 @@
-import json
+r"""Capture the public application with synthetic data in a temporary database.
+
+Requires playwright and a local Microsoft Edge installation.
+Run: .venv\Scripts\python.exe scripts/capture_real_ui.py
+"""
 import os
-import subprocess
+import secrets
 import sys
-import time
-import urllib.error
-import urllib.request
+import tempfile
+import threading
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent.parent
-EDGE = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
-PORT = int(os.getenv("HMS_PORT", "5110"))
-BASE = f"http://127.0.0.1:{PORT}"
-OUT = ROOT / "docs" / "assets"
-DB = ROOT / "data" / "portfolio-real-ui.db"
-
-
-def request(path, method="GET", body=None, cookie=None):
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(BASE + path, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
-    if cookie:
-        req.add_header("Cookie", cookie)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as res:
-            return res.status, res.read().decode("utf-8"), res.headers
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8"), e.headers
-
-
-def wait_server():
-    for _ in range(40):
-        try:
-            status, _, _ = request("/api/health")
-            if status == 200:
-                return
-        except Exception:
-            pass
-        time.sleep(0.25)
-    raise RuntimeError("server did not start")
-
-
-def ensure_login():
-    status, raw, _ = request("/api/auth/bootstrap")
-    if status != 200:
-        raise RuntimeError(raw)
-    if json.loads(raw).get("needsSetup"):
-        body = {
-            "username": "admin",
-            "displayName": "포트폴리오 관리자",
-            "password": "portfolio1234",
-        }
-        status, raw, headers = request("/api/auth/setup", "POST", body)
-        if status not in (200, 409):
-            raise RuntimeError(raw)
-        cookie = headers.get("Set-Cookie", "").split(";", 1)[0]
-        if cookie:
-            return cookie
-    status, raw, headers = request(
-        "/api/auth/login",
-        "POST",
-        {"username": "admin", "password": "portfolio1234"},
-    )
-    if status != 200:
-        raise RuntimeError(raw)
-    return headers.get("Set-Cookie", "").split(";", 1)[0]
-
-
-def seed_data(cookie):
-    # The screenshots are real UI captures. This optional seed uses fake data only;
-    # if an endpoint shape changes, the app screens are still captured without it.
-    attempts = [
-        ("/api/purchase/suppliers", {"name": "포트폴리오 거래처", "phone": "010-0000-0000"}),
-        ("/api/orders", {
-            "channel": "쿠팡",
-            "orderNo": "PORT-2026-0001",
-            "recipient": "샘플 고객",
-            "phone": "010-0000-0000",
-            "address": "서울시 포트폴리오구 샘플로 1",
-            "productName": "ThinkPad T14 샘플",
-            "optionName": "i5 / 16GB / 512GB",
-            "quantity": 1,
-            "amount": 459000,
-        }),
-    ]
-    for path, body in attempts:
-        status, raw, _ = request(path, "POST", body, cookie)
-        if status not in (200, 201, 400, 404, 409):
-            print(f"seed warning: {path} {status} {raw[:120]}")
-
-
-def edge_screenshot(name, url, cookie=None):
-    target = OUT / name
-    script = ""
-    if cookie:
-        script = (
-            "document.cookie = " + json.dumps(cookie + "; path=/") + "; "
-            "setTimeout(() => location.href = " + json.dumps(url) + ", 100);"
-        )
-        helper = OUT / f"cookie-{name}.html"
-        helper.write_text(f"<!doctype html><meta charset='utf-8'><script>{script}</script>", encoding="utf-8")
-        url = f"{BASE}/static/../docs/assets/{helper.name}"
-    cmd = [
-        str(EDGE),
-        "--headless=new",
-        "--disable-gpu",
-        "--disable-gpu-compositing",
-        "--use-angle=swiftshader",
-        "--window-size=1600,900",
-        f"--user-data-dir={os.environ.get('TEMP', str(ROOT))}\\hms-real-ui-{name}",
-        f"--screenshot={target}",
-        url,
-    ]
-    if cookie:
-        # Flask does not serve docs/. Use a data URL to set the cookie on the app domain is
-        # not possible, so fall back to a URL with JS only when served by the app root.
-        pass
-    subprocess.run(cmd, check=True)
-    if not target.exists() or target.stat().st_size < 10_000:
-        raise RuntimeError(f"screenshot failed: {target}")
-
-
-def edge_capture_with_login(name, view, cookie):
-    js = f"""
-      document.cookie = {json.dumps(cookie + "; path=/")};
-      history.replaceState(null, '', '/');
-      setTimeout(() => {{
-        const a = document.querySelector('nav a[data-view="{view}"]');
-        if (a) a.click();
-      }}, 1800);
-    """
-    # Use a temporary static copy of index.html with a tiny injected script.
-    # It is served by the real Flask app under /static/, so the actual app JS can call
-    # /api/* normally and the capture remains a real UI screenshot.
-    src = (ROOT / "static" / "index.html").read_text("utf-8")
-    src = src.replace("</body>", f"<script>{js}</script></body>")
-    tmp = ROOT / "static" / f"capture-{view}.html"
-    tmp.write_text(src, encoding="utf-8")
-    url = f"{BASE}/static/{tmp.name}"
-    target = OUT / name
-    cmd = [
-        str(EDGE),
-        "--headless=new",
-        "--disable-gpu",
-        "--disable-gpu-compositing",
-        "--use-angle=swiftshader",
-        "--allow-file-access-from-files",
-        "--window-size=1600,900",
-        f"--virtual-time-budget=5000",
-        f"--user-data-dir={os.environ.get('TEMP', str(ROOT))}\\hms-real-ui-{view}",
-        f"--screenshot={target}",
-        url,
-    ]
-    subprocess.run(cmd, check=True)
-    if not target.exists() or target.stat().st_size < 10_000:
-        raise RuntimeError(f"screenshot failed: {target}")
+sys.path.insert(0, str(ROOT))
 
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    env.update({
-        "HMS_NO_TRACKER": "1",
-        "HMS_NO_TMS_SYNC": "1",
-        "HMS_NO_FILE_LOG": "1",
-        "HMS_PORT": str(PORT),
-        "HMS_DB": str(DB),
-    })
-    proc = subprocess.Popen([str(ROOT / "venv" / "Scripts" / "python.exe"), "run.py"], cwd=ROOT, env=env)
-    try:
-        wait_server()
-        cookie = ensure_login()
-        seed_data(cookie)
-        edge_capture_with_login("portfolio-real-dashboard.png", "dashboard", cookie)
-        edge_capture_with_login("portfolio-real-purchase.png", "purchase", cookie)
-        edge_capture_with_login("portfolio-real-orders.png", "orders", cookie)
-        edge_capture_with_login("portfolio-real-shipping.png", "shipping", cookie)
-        edge_capture_with_login("portfolio-real-as.png", "as", cookie)
-        edge_capture_with_login("portfolio-real-reports.png", "reports", cookie)
-        edge_capture_with_login("portfolio-real-settings.png", "settings", cookie)
-    finally:
-        proc.terminate()
+    from playwright.sync_api import sync_playwright
+    from werkzeug.serving import make_server
+
+    with tempfile.TemporaryDirectory(prefix="ows-capture-") as temp:
+        os.environ.update({
+            "OWS_DB": str(Path(temp) / "demo.db"),
+            "OWS_NO_TRACKER": "1", "OWS_NO_TMS_SYNC": "1",
+            "OWS_NO_FILE_LOG": "1", "OWS_SMS_BLOCK": "1",
+        })
+        from app import config, create_app
+
+        app = create_app()
+        app.testing = True
+        client = app.test_client()
+
+        def post(url, body):
+            response = client.post(url, json=body)
+            if response.status_code not in (200, 201):
+                raise RuntimeError(f"Seed {url}: {response.status_code} {response.get_json()}")
+            return response.get_json()
+
+        post("/api/auth/setup", {
+            "username": "portfolio", "displayName": "데모 관리자",
+            "password": secrets.token_urlsafe(24),
+        })
+        categories = client.get("/api/categories").get_json()
+        supplier = post("/api/suppliers", {"name": "데모 거래처", "phone": "010-0000-0000"})
+        batch = post("/api/purchase-batches", {
+            "supplierId": supplier["id"], "purchaseDate": config.now().strftime("%Y-%m-%d"),
+            "totalAmount": 900000,
+        })
+        for i, (maker, model) in enumerate([
+            ("Lenovo", "ThinkPad T14"), ("Dell", "Latitude 5420"), ("HP", "EliteBook 840"),
+        ]):
+            post("/api/assets", {
+                "categoryId": categories[0]["id"], "maker": maker, "model": model,
+                "grade": "SA", "purchasePrice": 300000, "qty": 1,
+                "batchId": batch["id"],
+            })
+            post("/api/orders", {
+                "channel": "수기", "orderNo": f"DEMO-000{i + 1}",
+                "recipient": f"데모 고객 {i + 1}", "phone": "010-0000-0000",
+                "address": "서울특별시 예시구 예시로 1", "postalCode": "00000",
+                "productName": model, "productCode": f"DEMO{i + 1}_i5_내장",
+                "optionName": "16GB / 512GB", "quantity": 1, "amount": 450000,
+            })
+        for i, symptom in enumerate(["화면 점검", "충전 상태 점검", "키보드 점검"]):
+            ticket = post("/api/as-tickets", {
+                "customer": f"데모 고객 {i + 1}", "phone": "010-0000-0000",
+                "symptom": symptom, "chargeTo": "customer" if i == 0 else "company",
+                "intakeItems": "본체, 충전기", "intake": "visit" if i == 0 else "parcel",
+                "model": "ThinkPad T14",
+            })
+            if i == 0:
+                response = client.patch(f"/api/as-tickets/{ticket['id']}", json={"status": "done"})
+                assert response.status_code == 200, response.get_json()
+        cookie = client.get_cookie(config.COOKIE_NAME)
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        output = ROOT / "docs" / "assets"
+        output.mkdir(parents=True, exist_ok=True)
+        errors = []
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(channel="msedge", headless=True)
+                context = browser.new_context(viewport={"width": 1600, "height": 1000}, locale="ko-KR")
+                context.add_cookies([{"name": config.COOKIE_NAME, "value": cookie.value, "url": base}])
+                page = context.new_page()
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.goto(base)
+                page.locator("#app").wait_for(state="visible")
+                for view in ["dashboard", "purchase", "orders", "setup", "shipping", "as", "settings"]:
+                    page.locator(f'nav a[data-view="{view}"]').click()
+                    page.wait_for_load_state("networkidle")
+                    page.wait_for_timeout(500)
+                    assert "OWS" in page.locator(".sidebar .brand").inner_text()
+                    page.screenshot(path=str(output / f"portfolio-real-{view}.png"), full_page=True)
+                    print(f"Captured {view}", flush=True)
+                    if view == "as":
+                        page.locator('[data-atab="board"]').click()
+                        page.wait_for_load_state("networkidle")
+                        page.wait_for_timeout(500)
+                        assert "결제 전" in page.locator("#main").inner_text()
+                        page.screenshot(path=str(output / "portfolio-real-as-board.png"), full_page=True)
+                # Reports are part of the settings screen.
+                page.evaluate("state.settingsTab = 'sales'; state.salesView = 'period'; go('settings')")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(500)
+                page.screenshot(path=str(output / "portfolio-real-reports.png"), full_page=True)
+                page.evaluate("go('dashboard')")
+                page.wait_for_load_state("networkidle")
+                page.set_viewport_size({"width": 390, "height": 844})
+                page.reload()
+                page.locator("#app").wait_for(state="visible")
+                page.wait_for_load_state("networkidle")
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1"), "Mobile overflow"
+                page.screenshot(path=str(output / "portfolio-mobile-dashboard.png"), full_page=True)
+                browser.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        if errors:
+            raise RuntimeError("Browser errors: " + "; ".join(errors))
+        print("Desktop/mobile capture completed without JavaScript errors.")
 
 
 if __name__ == "__main__":

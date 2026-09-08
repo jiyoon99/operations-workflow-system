@@ -20,7 +20,7 @@ USER_PW = "user-pass-12"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-p123-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-p123-"))
         self.db_path = self.tmp / "test.db"
         self.app = create_app(db_path=self.db_path)
         self.app.testing = True
@@ -52,7 +52,7 @@ class Base(unittest.TestCase):
         return r.get_json()
 
     def make_order(self, **kw):
-        body = {"recipient": "홍길동", "productName": "하프북 노트북", "phone": "010-1234-5678",
+        body = {"recipient": "홍길동", "productName": "업무관리 노트북", "phone": "010-1234-5678",
                 "address": "서울시 강남구 테헤란로 1", "postalCode": "06000",
                 "productCode": "NT551-i5", "optionName": "가방+마우스", "quantity": 1, "amount": 450000}
         body.update(kw)
@@ -83,10 +83,10 @@ class TestAssets(Base):
     def test_auto_numbering_and_manual_tms(self):
         """관리번호 = YYMMDD-NNNN (TMS와 같은 형식).
 
-        ★2026-07-31부터 HMS는 5000번대부터 발번한다 — TMS와 함께 쓰는 동안
+        ★2026-07-31부터 OWS는 5000번대부터 발번한다 — TMS와 함께 쓰는 동안
           같은 번호가 서로 다른 물건에 붙지 않게 번호대를 나눴다.
         """
-        from app.purchase import HMS_ASSET_SEQ_START as START
+        from app.purchase import OWS_ASSET_SEQ_START as START
         a1 = self.make_asset()[0]
         a2 = self.make_asset()[0]
         today = config.now().strftime("%y%m%d")
@@ -135,7 +135,7 @@ class TestAssets(Base):
         self.assertEqual(r.status_code, 201)
         c = self.app.test_client()
         c.post("/api/auth/login", json={"username": "scoped1", "password": USER_PW})
-        rows = c.get("/api/assets").get_json()
+        rows = c.get("/api/assets").get_json()["rows"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["categoryId"], self.cats[0]["id"])
 
@@ -158,7 +158,7 @@ class TestSchemaUpgrade(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="hms-upg-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="ows-upg-"))
         self.db_path = self.tmp / "old.db"
 
     def tearDown(self):
@@ -210,9 +210,10 @@ class TestSchemaUpgrade(unittest.TestCase):
         self.assertEqual(b["stage"], "purchased")
         self.assertEqual(b["slip_no"], "")
         self.assertEqual(b["paid"], 1)
-        # 기존 카테고리는 유지(시드로 덮어쓰지 않음)
-        names = [r["name"] for r in conn.execute("SELECT name FROM categories").fetchall()]
-        self.assertEqual(names, ["노트북"])
+        # 기존 카테고리는 유지(시드로 덮어쓰지 않음) — A5(2026-09-03) 정합 시드는 '없는 이름만' 뒤에 붙인다
+        names = [r["name"] for r in conn.execute("SELECT name FROM categories ORDER BY sort, id").fetchall()]
+        self.assertEqual(names[0], "노트북")
+        self.assertEqual(names, ["노트북", "데스크탑", "태블릿", "모니터", "미니PC", "일체형PC", "주변기기", "웨어러블"])
         # 마이그레이션 후 인덱스가 실제로 만들어졌는지
         idx = {r["name"] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
@@ -307,8 +308,8 @@ class TestTmsPurchase(Base):
         self.assertFalse(unpaid[0]["paid"])
 
     def test_slip_numbering(self):
-        """전표번호도 HMS 몫(500번대)부터 — TMS와 겹치지 않게."""
-        from app.purchase import HMS_SLIP_SEQ_START as START
+        """전표번호도 OWS 몫(500번대)부터 — TMS와 겹치지 않게."""
+        from app.purchase import OWS_SLIP_SEQ_START as START
         s = self.make_supplier()
         b1 = self.make_batch(s["id"])
         b2 = self.make_batch(s["id"])
@@ -336,12 +337,12 @@ class TestTmsPurchase(Base):
                              content_type="multipart/form-data")
         self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         self.assertEqual(r.get_json()["toCreate"], 2)
-        self.assertEqual(len(self.client.get("/api/assets").get_json()), 0)  # 미리보기는 저장 안 함
+        self.assertEqual(len(self.client.get("/api/assets").get_json()["rows"]), 0)  # 미리보기는 저장 안 함
 
         data = {"files": (io.BytesIO(content), "tms.xlsx")}
         r = self.client.post("/api/assets/migrate", data=data, content_type="multipart/form-data")
         self.assertEqual(r.get_json()["created"], 2)
-        assets = {a["assetNo"]: a for a in self.client.get("/api/assets").get_json()}
+        assets = {a["assetNo"]: a for a in self.client.get("/api/assets").get_json()["rows"]}
         self.assertEqual(assets["260719-0027"]["grade"], "AA")
         self.assertEqual(assets["260719-0027"]["status"], "ready")
         self.assertEqual(assets["260719-0027"]["ram"], "D4 8G")
@@ -355,7 +356,7 @@ class TestTmsPurchase(Base):
         r = self.client.post("/api/assets/migrate", data=data, content_type="multipart/form-data")
         self.assertEqual(r.get_json()["created"], 0)
         self.assertEqual(r.get_json()["duplicates"], 2)
-        self.assertEqual(len(self.client.get("/api/assets").get_json()), 2)
+        self.assertEqual(len(self.client.get("/api/assets").get_json()["rows"]), 2)
 
     def test_asset_export(self):
         self.make_asset(cpu="i5", ram="8G")
@@ -404,6 +405,9 @@ class TestOrderStateMachine(Base):
         self.assertEqual(self.stage(o["id"], "preparing", False, self.client).status_code, 200)
 
     def test_asset_matching_and_conflicts(self):
+        # ★'중복 매칭 허용'(2026-08-31, 기본 켜짐)을 끄고 차단 모드의 안전핀을 검증한다
+        self.assertEqual(self.client.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": False}}).status_code, 200)
         o1 = self.make_order()
         o2 = self.make_order(recipient="김철수")
         aid = self.make_asset()[0]["id"]
@@ -458,8 +462,8 @@ class TestImport(Base):
 
     def test_import_and_dedupe(self):
         content = self._godo_xlsx([
-            ["G-1001", "하프북 NT551", "1", "450000", "홍길동", "010-1111-2222", "서울시 강남구"],
-            ["G-1002", "하프북 그램", "2", "900000", "김철수", "010-3333-4444", "부산시 해운대구"],
+            ["G-1001", "업무관리 NT551", "1", "450000", "홍길동", "010-1111-2222", "서울시 강남구"],
+            ["G-1002", "업무관리 그램", "2", "900000", "김철수", "010-3333-4444", "부산시 해운대구"],
         ])
         data = {"files": (io.BytesIO(content), "godo.xlsx")}
         r = self.client.post("/api/orders/import", data=data, content_type="multipart/form-data")
@@ -474,6 +478,52 @@ class TestImport(Base):
         orders = self.client.get("/api/orders").get_json()["orders"]
         self.assertEqual(len(orders), 2)
         self.assertEqual(orders[0]["channel"], "고도몰")
+
+    def _temu_xlsx(self, order_no="PO-9001", price="260,610원"):
+        # 테무 양식 판정에 필요한 최소 헤더 조합('주문 ID'+'SKU ID'+'제품 이름')
+        headers = ["주문 ID", "주문 상품 상태", "제품 이름", "SKU ID", "발송할 수량",
+                   "수령인 이름", "수령인 전화번호", "구매 날짜", "할인 후 기본 가격 총액"]
+        return write_xlsx(headers, [[order_no, "미발송", "삼성 리퍼노트북", "13099220760",
+                                     "1", "정재현", "+82 010 1234 5678",
+                                     "2026년 9월 1일 07:54 KST(UTC+9)", price]])
+
+    def test_테무_재업로드해도_금액이_두_번_곱해지지_않는다(self):
+        """★이 기능의 가장 위험한 실패다 — 정산 가산율(+10.75%)이 두 번 걸리면 매출이
+        조용히 부풀고 어느 화면에서도 안 걸린다. 임포트 왕복(파싱→중복판정→저장) 전
+        구간을 실제로 태워서 고정한다.
+        """
+        content = self._temu_xlsx()
+        r = self.client.post("/api/orders/import", data={"files": (io.BytesIO(content), "temu.xlsx")},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(r.get_json()["added"], 1)
+        o = self.client.get("/api/orders").get_json()["orders"][0]
+        self.assertEqual(o["channel"], "테무")
+        self.assertEqual(o["amount"], 288626, "260,610 × 1.1075 이 아니다")
+
+        # 같은 파일을 다시 올려도 금액이 그대로여야 한다
+        content = self._temu_xlsx()
+        r = self.client.post("/api/orders/import", data={"files": (io.BytesIO(content), "temu.xlsx")},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.get_json()["added"], 0)
+        self.assertEqual(r.get_json()["duplicates"], 1)
+        o = self.client.get("/api/orders").get_json()["orders"][0]
+        self.assertEqual(o["amount"], 288626, "재업로드에서 가산율이 한 번 더 걸렸다")
+
+    def test_주문수집_양식의_테무는_보정하지_않는다(self):
+        """★'주문수집' 엑셀은 플랫폼 칸이 '테무'라도 금액 축이 다르다 — 소비자가 낸
+        총 결제금액(부가세 포함)이라 여기에 +10.75%를 걸면 매출이 부풀어 버린다.
+        보정 기준은 '채널 이름'이 아니라 '테무 주문 내보내기 파일 형식'이다.
+        """
+        headers = ["플랫폼", "상품명 + 옵션명", "수취인 이름", "주문번호", "수량",
+                   "총 상품결제금액", "수취인 연락처", "주문일시"]
+        content = write_xlsx(headers, [["테무", "삼성 리퍼노트북", "정재현", "TC-1",
+                                        "1", "260610", "010-1111-2222", "2026-09-01 07:54"]])
+        r = self.client.post("/api/orders/import", data={"files": (io.BytesIO(content), "collect.xlsx")},
+                             content_type="multipart/form-data")
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        o = self.client.get("/api/orders").get_json()["orders"][0]
+        self.assertEqual(o["amount"], 260610, "부가세 포함 금액에 가산율이 또 걸렸다")
 
     def test_import_preview_no_write(self):
         content = self._godo_xlsx([["G-2001", "노트북", "1", "1000", "박영희", "010-5555-6666", "대구"]])
@@ -508,18 +558,39 @@ class TestWaybill(Base):
         self.stage(o["id"], "softwareInspection")
         return o, aid
 
-    def test_waybill_requires_qc_and_assets(self):
+    def _shippable(self):
+        """송장을 뽑을 수 있는 상태까지 — ★출고 확인이 송장의 선행 조건이다(대표 2026-09-03).
+        (예전에는 제작 완료만으로 송장이 나갔다)"""
+        o, aid = self._ready_order()
+        self.stage(o["id"], "shipping")
+        return o, aid
+
+    def test_waybill_requires_inspection_and_assets(self):
+        """★송장은 'SW 검수 완료'부터 뽑는다(대표 2026-09-04 정정: "SW 검수완료 탭에서
+        송장 일괄 출력이 가능해야 함"). 제작 대기~제작 완료는 여전히 막힌다 —
+        아직 어떤 기계가 나갈지 확정되지 않은 단계다.
+        (2026-09-03에는 '출고 확인부터'였다가 하루 만에 한 단계 앞으로 당겨졌다)"""
         o = self.make_order()
         r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
-        self.assertEqual(r.status_code, 400)  # QC 미완료
+        self.assertEqual(r.status_code, 400)                       # 아무 단계도 아님
+        self.assertIn("SW 검수", r.get_json()["error"])
         self.stage(o["id"], "production")
+        r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
+        self.assertEqual(r.status_code, 400, "제작 완료만으로 송장이 나갔다")
+        self.assertIn("SW 검수", r.get_json()["error"])
+        # SW 검수를 켜면 그때부터 — 다만 자산이 없으면 여전히 막힌다(구성품 대조용)
         self.stage(o["id"], "softwareInspection")
         r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
-        self.assertEqual(r.status_code, 400)  # 자산 미매칭
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("자산", r.get_json()["error"], "SW 검수 완료인데 단계에서 막힌다")
+        # 출고 확인까지 간 건도 당연히 된다
+        self.stage(o["id"], "shipping")
+        r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
+        self.assertEqual(r.status_code, 400)
         self.assertIn("자산", r.get_json()["error"])
 
     def test_waybill_test_issue_contains_asset_no(self):
-        o, aid = self._ready_order()
+        o, aid = self._shippable()
         r = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         self.assertEqual(r.status_code, 201, r.get_data(as_text=True))
         res = r.get_json()
@@ -538,7 +609,7 @@ class TestWaybill(Base):
         self.assertEqual(od["trackingNumber"], res["invoiceNo"])
 
     def test_waybill_pdf_renders(self):
-        o, _ = self._ready_order()
+        o, _ = self._shippable()
         wid = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()["wid"]
         r = self.client.get(f"/api/waybills/{wid}/pdf")
         self.assertEqual(r.status_code, 200)
@@ -547,7 +618,7 @@ class TestWaybill(Base):
         self.assertTrue(r.data.startswith(b"%PDF"))
 
     def test_waybill_cancel_test(self):
-        o, _ = self._ready_order()
+        o, _ = self._shippable()
         res = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()
         r = self.client.post(f"/api/waybills/{res['wid']}/cancel")
         self.assertEqual(r.status_code, 200)
@@ -566,6 +637,12 @@ class TestReviewFixesP123(Base):
         self.stage(o["id"], "softwareInspection")
         return o, a
 
+    def _shippable(self, **asset_kw):
+        """송장 발급 가능 상태 — 출고 확인까지 켠다(대표 2026-09-03 규칙)."""
+        o, a = self._ready_order(**asset_kw)
+        self.stage(o["id"], "shipping")
+        return o, a
+
     def test_inspection_uncheck_reverts_shipped_asset(self):
         """검수 해제 → 출고 연쇄 해제 시 자산도 reserved로 원복(shipped 고착 방지)."""
         o, a = self._ready_order()
@@ -580,6 +657,9 @@ class TestReviewFixesP123(Base):
 
     def test_match_failure_is_all_or_nothing(self):
         """매칭 중 하나라도 실패하면 409 + 아무것도 반영되지 않아야 한다."""
+        # ★'중복 매칭 허용'(2026-08-31, 기본 켜짐)을 끄고 차단 모드의 안전핀을 검증한다
+        self.assertEqual(self.client.put("/api/settings", json={
+            "order_asset_duplicate": {"enabled": False}}).status_code, 200)
         o1 = self.make_order()
         o2 = self.make_order(recipient="김철수")
         good = self.make_asset()[0]
@@ -601,27 +681,45 @@ class TestReviewFixesP123(Base):
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": []})
         self.assertEqual(self.client.get(f"/api/assets/{a['id']}").get_json()["status"], "refurbishing")
 
-    def test_cancel_blocked_while_shipped_or_waybill_active(self):
-        """출고 확인·발행 송장이 남은 채로 취소하면 출고된 자산이 재고로 둔갑 → 차단."""
+    def test_출고확인_뒤에도_취소하면_자산이_빠진다(self):
+        """★대표 2026-09-03: "출고확인까지 갔는데 취소한 경우는 자산이 빠져야 한다".
+
+        예전에는 출고 확인된 주문의 취소를 아예 막고(출고 확인부터 해제하라고) 있었다.
+        이제는 바로 취소되고, 그 주문이 잡고 있던 자산이 재고로 돌아온다.
+        (택배로 나갔다가 반품받는 경우도 사람이 같은 방법으로 수기 취소한다)
+        """
         o, a = self._ready_order()
         self.stage(o["id"], "shipping")
         r = self.client.patch(f"/api/orders/{o['id']}", json={"action": "cancel", "reason": "테스트"})
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("출고 확인", r.get_json()["error"])
-        self.stage(o["id"], "shipping", False)
-        # 송장 발행 후에도 차단
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
+        self.assertEqual(self.client.get(f"/api/assets/{a['id']}").get_json()["status"], "in_stock",
+                         "취소했는데 자산이 그 주문에 묶인 채로 남았다")
+
+    def test_집화_전_송장이_있으면_한_번_물어본다(self):
+        """기사가 헛걸음하지 않게 — 아직 안 움직인 송장이 있으면 409로 되묻고,
+        force 로 다시 부르면 그때 취소한다(송장은 배송/송장 화면에서 따로 취소)."""
+        o, a = self._shippable()
         wb = self.client.post(f"/api/orders/{o['id']}/waybill", json={}).get_json()
         r = self.client.patch(f"/api/orders/{o['id']}", json={"action": "cancel", "reason": "테스트"})
-        self.assertEqual(r.status_code, 400)
-        self.assertIn(wb["wid"], r.get_json()["error"])
-        # 송장 취소 후에는 취소 가능하고 자산도 복귀
-        self.client.post(f"/api/waybills/{wb['wid']}/cancel")
-        r = self.client.patch(f"/api/orders/{o['id']}", json={"action": "cancel", "reason": "테스트"})
-        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.get_json().get("code"), "waybill_open")
+        self.assertIn("집화 전", r.get_json()["error"])
+        # 그래도 취소하겠다고 하면 취소되고 자산도 돌아온다
+        r = self.client.patch(f"/api/orders/{o['id']}",
+                              json={"action": "cancel", "reason": "테스트", "force": True})
+        self.assertEqual(r.status_code, 200, r.get_data(as_text=True))
         self.assertEqual(self.client.get(f"/api/assets/{a['id']}").get_json()["status"], "in_stock")
+        # 송장을 먼저 취소한 경우에는 묻지 않고 바로 취소된다
+        o2, a2 = self._shippable()
+        wb2 = self.client.post(f"/api/orders/{o2['id']}/waybill", json={}).get_json()
+        self.client.post(f"/api/waybills/{wb2['wid']}/cancel")
+        r = self.client.patch(f"/api/orders/{o2['id']}", json={"action": "cancel", "reason": "테스트"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.client.get(f"/api/assets/{a2['id']}").get_json()["status"], "in_stock")
+        self.assertTrue(wb["wid"])
 
     def test_duplicate_waybill_blocked(self):
-        o, _ = self._ready_order()
+        o, _ = self._shippable()
         r1 = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         self.assertEqual(r1.status_code, 201)
         r2 = self.client.post(f"/api/orders/{o['id']}/waybill", json={})
@@ -639,6 +737,7 @@ class TestReviewFixesP123(Base):
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": [a["id"]]})
         self.stage(o["id"], "production")
         self.stage(o["id"], "softwareInspection")
+        self.stage(o["id"], "shipping")   # ★송장은 출고 확인 뒤에만(2026-09-03)
         self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         items = self.client.get("/api/waybills").get_json()[0]["items"]
         # 동결 렌더러는 item_summary의 x숫자를 전부 더해 수량 칸에 인쇄한다
@@ -664,6 +763,7 @@ class TestReviewFixesP123(Base):
             "action": "assets", "assetIds": [a1["id"], a2["id"]]})
         self.stage(o["id"], "production")
         self.stage(o["id"], "softwareInspection")
+        self.stage(o["id"], "shipping")   # ★송장은 출고 확인 뒤에만(2026-09-03)
         self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         items = self.client.get("/api/waybills").get_json()[0]["items"]
 
@@ -683,6 +783,7 @@ class TestReviewFixesP123(Base):
         self.client.patch(f"/api/orders/{o['id']}", json={"action": "assets", "assetIds": [a["id"]]})
         self.stage(o["id"], "production")
         self.stage(o["id"], "softwareInspection")
+        self.stage(o["id"], "shipping")   # ★송장은 출고 확인 뒤에만(2026-09-03)
         self.client.post(f"/api/orders/{o['id']}/waybill", json={})
         conn = self.db()
         raw = conn.execute(
@@ -693,10 +794,10 @@ class TestReviewFixesP123(Base):
 
     def test_ids_unique_after_cancel_and_gap(self):
         """취소된 송장이 있어도 wid·테스트 송장번호가 재사용되지 않는다(MAX 기준)."""
-        o1, _ = self._ready_order()
+        o1, _ = self._shippable()
         w1 = self.client.post(f"/api/orders/{o1['id']}/waybill", json={}).get_json()
         self.client.post(f"/api/waybills/{w1['wid']}/cancel")
-        o2, _ = self._ready_order()
+        o2, _ = self._shippable()
         w2 = self.client.post(f"/api/orders/{o2['id']}/waybill", json={}).get_json()
         self.assertNotEqual(w1["invoiceNo"], w2["invoiceNo"])
         self.assertNotEqual(w1["wid"], w2["wid"])
@@ -705,7 +806,7 @@ class TestReviewFixesP123(Base):
         conn.execute("DELETE FROM waybills WHERE wid=?", (w1["wid"],))
         conn.commit()
         conn.close()
-        o3, _ = self._ready_order()
+        o3, _ = self._shippable()
         w3 = self.client.post(f"/api/orders/{o3['id']}/waybill", json={})
         self.assertEqual(w3.status_code, 201)
         self.assertNotIn(w3.get_json()["wid"], (w1["wid"], w2["wid"]))
@@ -729,7 +830,7 @@ class TestReviewFixesP123(Base):
         self.assertEqual(self.client.get(f"/api/assets/{a['id']}").get_json()["status"], "in_stock")
 
     def test_waybill_box_qty_recorded(self):
-        o, _ = self._ready_order()
+        o, _ = self._shippable()
         self.client.post(f"/api/orders/{o['id']}/waybill", json={"boxQty": 3})
         self.assertEqual(self.client.get("/api/waybills").get_json()[0]["boxQty"], 3)
 
