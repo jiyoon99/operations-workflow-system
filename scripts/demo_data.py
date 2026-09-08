@@ -1,7 +1,7 @@
 """Synthetic interview fixtures created through the application's APIs."""
 
-DEMO_USER = "demo"
-DEMO_PASSWORD = "Demo-2026!"
+DEMO_USER = "admin"
+DEMO_PASSWORD = "12345678"
 
 
 def seed_demo(app):

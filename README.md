@@ -28,8 +28,8 @@ AI 활용 경험은 요구사항을 구체화하고 결과를 확인한 사례�
 
 로컬 환경을 설치한 Windows PC에서는 `DEMO-START.bat`을 더블클릭하면 가상 데이터가 채워진 데모가 열립니다.
 
-- 관리자: `demo` / `Demo-2026!`
-- 제한 계정: `viewer` / `Demo-2026!`
+- 관리자: `admin` / `12345678`
+- 제한 계정: `viewer` / `12345678`
 - 처음 상태로 복구: `DEMO-RESET.bat`
 - 종료: `DEMO-STOP.bat`
 
